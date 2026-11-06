@@ -32,18 +32,32 @@ pub enum Edge {
 }
 
 /// Where and how big the window should be for the next open.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Placement {
-    /// Window rectangle in physical pixels (menu + shadow margin).
+    /// Window rectangle in physical pixels (menu + shadow margin, cut off
+    /// where the taskbar starts so the window never covers it).
     pub x: i32,
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// The menu's rectangle inside the window, in physical pixels.
+    pub menu_x: i32,
+    pub menu_y: i32,
+    pub menu_width: i32,
+    pub menu_height: i32,
     /// DPI scale (1.0 = 100%, 1.5 = 150%, ...).
     pub scale: f32,
-    /// Read in milestone 2: the open animation grows out of this edge.
-    #[allow(dead_code)]
+    /// The open animation grows out of this edge.
     pub edge: Edge,
+}
+
+impl Placement {
+    /// True if a point in window (client) coordinates is on the menu itself
+    /// rather than on the transparent shadow margin around it.
+    pub fn menu_contains(&self, x: i32, y: i32) -> bool {
+        (self.menu_x..self.menu_x + self.menu_width).contains(&x)
+            && (self.menu_y..self.menu_y + self.menu_height).contains(&y)
+    }
 }
 
 pub fn create(wndproc: WNDPROC) -> Result<HWND> {
@@ -133,11 +147,22 @@ fn compute_placement(monitor: RECT, work: RECT, scale: f32, menu_w: f32, menu_h:
         Edge::Right => (work.right - gap - mw, work.top + gap),
     };
 
+    // Menu + shadow margin, but never over the taskbar (so taskbar clicks
+    // still work while the menu is open).
+    let left = (menu_x - margin).max(work.left);
+    let top = (menu_y - margin).max(work.top);
+    let right = (menu_x + mw + margin).min(work.right);
+    let bottom = (menu_y + mh + margin).min(work.bottom);
+
     Placement {
-        x: menu_x - margin,
-        y: menu_y - margin,
-        width: mw + 2 * margin,
-        height: mh + 2 * margin,
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+        menu_x: menu_x - left,
+        menu_y: menu_y - top,
+        menu_width: mw,
+        menu_height: mh,
         scale,
         edge,
     }
@@ -194,6 +219,51 @@ pub fn take_focus(hwnd: HWND) -> bool {
     }
 }
 
+/// The exe name of the process that owns `hwnd` (for diagnostics).
+pub fn process_name(hwnd: HWND) -> String {
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    use windows::core::PWSTR;
+
+    if hwnd.is_invalid() {
+        return "(no window)".into();
+    }
+    let mut pid = 0u32;
+    let mut buf = [0u16; 260];
+    let mut len = buf.len() as u32;
+    // SAFETY: valid out-pointers to locals; the handle is closed below.
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return format!("pid {pid}");
+        };
+        let ok = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(process);
+        if !ok {
+            return format!("pid {pid}");
+        }
+    }
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    path.rsplit('\\').next().unwrap_or(&path).to_string()
+}
+
+/// The window class name of `hwnd` (for diagnostics).
+pub fn class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 128];
+    // SAFETY: valid buffer; GetClassNameW writes at most buf.len() chars.
+    let len = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut buf) };
+    String::from_utf16_lossy(&buf[..len.max(0) as usize])
+}
+
 fn alt_input(up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
@@ -239,10 +309,13 @@ mod tests {
             320.0,
         );
         assert_eq!(p.edge, Edge::Bottom);
-        // Menu bottom = 1032 - 12 = 1020; window adds the 32 px margin.
-        assert_eq!(p.y + p.height, 1020 + 32);
+        // Menu bottom = 1032 - 12 = 1020. The window stops at the taskbar.
+        assert_eq!(p.y + p.menu_y + p.menu_height, 1020);
+        assert_eq!(p.y + p.height, 1032);
         assert_eq!(p.width, 360 + 64);
         assert_eq!(p.x + p.width / 2, 960);
+        assert_eq!((p.menu_x, p.menu_y), (32, 32));
+        assert!(p.menu_contains(32, 32) && !p.menu_contains(10, 100));
     }
 
     #[test]
@@ -255,7 +328,8 @@ mod tests {
             320.0,
         );
         assert_eq!(p.width, 540 + 96);
-        assert_eq!(p.y + p.height, 1548 - 18 + 48);
+        assert_eq!(p.y + p.menu_y + p.menu_height, 1548 - 18);
+        assert_eq!(p.y + p.height, 1548);
     }
 
     #[test]
@@ -265,10 +339,11 @@ mod tests {
             compute_placement(m, rect(0, 48, 1920, 1080), 1.0, 360.0, 320.0).edge,
             Edge::Top
         );
-        assert_eq!(
-            compute_placement(m, rect(60, 0, 1920, 1080), 1.0, 360.0, 320.0).edge,
-            Edge::Left
-        );
+        let left = compute_placement(m, rect(60, 0, 1920, 1080), 1.0, 360.0, 320.0);
+        assert_eq!(left.edge, Edge::Left);
+        // The window never reaches into the taskbar on the left.
+        assert_eq!(left.x, 60);
+        assert_eq!(left.x + left.menu_x, 60 + 12);
         assert_eq!(
             compute_placement(m, rect(0, 0, 1860, 1080), 1.0, 360.0, 320.0).edge,
             Edge::Right
