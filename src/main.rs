@@ -1,16 +1,19 @@
-﻿//! Glint: a tiny, smooth Start menu for Windows 11.
+//! Glint: a tiny, smooth Start menu for Windows 11.
 //!
-//! Startup order: single-instance check â†’ DPI awareness â†’ WinRT + dispatcher
-//! queue â†’ hidden window â†’ composition tree â†’ tray icon â†’ keyboard hook â†’
-//! message loop.
+//! Startup order: single-instance check → DPI awareness → WinRT + dispatcher
+//! queue → hidden window → composition tree (and painting the content) →
+//! tray icon → keyboard hook → message loop.
 
 // Release builds have no console window.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[macro_use]
 mod log;
+mod apps;
 mod config;
 mod hook;
+mod icons;
+mod power;
 mod settings_watch;
 mod tray;
 mod ui;
@@ -29,7 +32,9 @@ use windows::Win32::System::RemoteDesktop::{
     NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
 };
 use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize,
+};
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT, DispatcherQueueOptions,
     RO_INIT_SINGLETHREADED, RoInitialize,
@@ -37,28 +42,39 @@ use windows::Win32::System::WinRT::{
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows::Win32::UI::Input::Ime::ISC_SHOWUICOMPOSITIONWINDOW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_SHIFT,
+};
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, MSG, PBT_APMRESUMEAUTOMATIC,
-    PBT_POWERSETTINGCHANGE, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SC_KEYMENU,
-    TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_DPICHANGED, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_POWERBROADCAST, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK,
+    DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW, HTCLIENT,
+    IDC_IBEAM, LoadCursorW, MSG, PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE, PostMessageW,
+    PostQuitMessage, RegisterWindowMessageW, SC_KEYMENU, SW_SHOWNORMAL, SetCursor,
+    TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_DPICHANGED,
+    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_POWERBROADCAST,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND,
+    WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK,
 };
 use windows::core::{Result, w};
-use windows_numerics::Vector2;
 
 use config::Config;
 use hook::{HookThread, WM_APP_TOGGLE};
 use settings_watch::{SettingsWatch, WM_APP_SETTINGS_CHANGED};
 use tray::{Tray, TrayCommand, WM_APP_TRAY};
+use ui::Action;
+use ui::gfx::WM_APP_REDRAW;
 use window::Placement;
-
-/// Placeholder size of the menu until the content arrives (DIPs).
-const MENU_SIZE: Vector2 = Vector2 { X: 360.0, Y: 320.0 };
 
 /// Posted when a close animation finished; wParam = its generation.
 const WM_APP_CLOSE_DONE: u32 = WM_APP + 4;
+/// Posted when taking the keyboard focus failed right after opening; we try
+/// once more when the current message is done.
+const WM_APP_FOCUS_RETRY: u32 = WM_APP + 6;
+/// Sent when the mouse leaves the window (after `TrackMouseEvent`). Defined
+/// here so we don't pull in the whole `Win32_UI_Controls` feature for it.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// A tray click right after the menu closed (because the click took focus
 /// away) should not reopen it.
@@ -85,6 +101,22 @@ struct App {
     opened_at: Cell<u64>,
     last_background_log: RefCell<String>,
     msg_taskbar_created: u32,
+    /// We asked Windows for a WM_MOUSELEAVE (it sends one per request).
+    tracking_mouse: Cell<bool>,
+}
+
+/// Is this key held down right now (as of the current message)?
+fn key_held(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> bool {
+    // SAFETY: GetKeyState has no preconditions.
+    unsafe { GetKeyState(i32::from(vk.0)) < 0 }
+}
+
+/// The x, y packed into a mouse message's lParam (client pixels).
+fn mouse_xy(lparam: LPARAM) -> (i32, i32) {
+    (
+        i32::from((lparam.0 & 0xFFFF) as u16 as i16),
+        i32::from(((lparam.0 >> 16) & 0xFFFF) as u16 as i16),
+    )
 }
 
 thread_local! {
@@ -121,12 +153,18 @@ impl App {
         !self.settings.animations_enabled()
     }
 
+    fn placement(&self) -> Placement {
+        let size = self.ui.size();
+        window::placement(size.X, size.Y)
+    }
+
     fn open(&self) {
         self.generation.set(self.generation.get() + 1);
-        if !self.is_visible.get() {
+        let fresh = !self.is_visible.get();
+        if fresh {
             // Fully hidden: pick the monitor and position fresh. (If we are
             // interrupting a close, stay where we are and just reverse.)
-            let p = window::placement(MENU_SIZE.X, MENU_SIZE.Y);
+            let p = self.placement();
             log_err("layout", self.ui.set_layout(&p));
             log_err("reset", self.ui.reset_closed());
             window::show(self.hwnd, &p);
@@ -137,9 +175,82 @@ impl App {
         self.opened_at.set(now_ms());
         log_err(
             "open animation",
-            self.ui.animate_open(self.reduced_motion()),
+            self.ui.animate_open(fresh, self.reduced_motion()),
         );
-        window::take_focus(self.hwnd);
+        if !window::take_focus(self.hwnd) {
+            // SAFETY: posts a plain message (no pointers) to our window.
+            let _ =
+                unsafe { PostMessageW(Some(self.hwnd), WM_APP_FOCUS_RETRY, WPARAM(0), LPARAM(0)) };
+        }
+    }
+
+    /// Second try at taking the keyboard, a moment after opening.
+    fn retry_focus(&self) {
+        // SAFETY: GetForegroundWindow has no preconditions.
+        if !self.is_open.get() || unsafe { GetForegroundWindow() } == self.hwnd {
+            return;
+        }
+        let ok = window::take_focus(self.hwnd);
+        log_info!("focus retry {}", if ok { "worked" } else { "failed too" });
+    }
+
+    /// Carries out what a key press or click asked for.
+    fn run(&self, action: Result<Action>) {
+        let action = match action {
+            Ok(a) => a,
+            Err(e) => {
+                log_error!("input handling failed: {e}");
+                return;
+            }
+        };
+        match action {
+            Action::None => {}
+            Action::Close => self.close(),
+            Action::OpenAccountSettings => {
+                self.close();
+                // SAFETY: opens a static URI; no pointers are kept.
+                let result = unsafe {
+                    ShellExecuteW(
+                        None,
+                        w!("open"),
+                        w!("ms-settings:accounts"),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    )
+                };
+                // ShellExecute returns a value > 32 on success.
+                if result.0 as isize <= 32 {
+                    log_error!("opening account settings failed ({})", result.0 as isize);
+                }
+            }
+            Action::Power(power_action) => {
+                self.close();
+                power::run(power_action);
+            }
+            Action::Launch(i) => {
+                // Launching apps arrives in milestone 4.
+                log_info!(
+                    "launch requested: {} (not yet, milestone 4)",
+                    self.ui.app_name(i)
+                );
+            }
+        }
+    }
+
+    /// Asks Windows for one WM_MOUSELEAVE when the mouse leaves the window.
+    fn track_mouse(&self) {
+        if self.tracking_mouse.replace(true) {
+            return;
+        }
+        let mut tme = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: self.hwnd,
+            dwHoverTime: 0,
+        };
+        // SAFETY: valid, correctly sized struct for our own window.
+        let _ = unsafe { TrackMouseEvent(&mut tme) };
     }
 
     fn close(&self) {
@@ -199,7 +310,7 @@ impl App {
         if !self.is_open.get() {
             return;
         }
-        let p = window::placement(MENU_SIZE.X, MENU_SIZE.Y);
+        let p = self.placement();
         if self.placement.get() != Some(p) {
             log_err("layout", self.ui.set_layout(&p));
             window::show(self.hwnd, &p);
@@ -271,14 +382,19 @@ impl App {
         }
     }
 
-    /// A click on the transparent margin around the menu counts as "outside".
-    fn on_click(&self, lparam: LPARAM) {
-        let x = i32::from((lparam.0 & 0xFFFF) as u16 as i16);
-        let y = i32::from(((lparam.0 >> 16) & 0xFFFF) as u16 as i16);
-        if let Some(p) = self.placement.get()
-            && !p.menu_contains(x, y)
-        {
+    /// A mouse button went down. A click on the transparent margin around
+    /// the menu counts as "outside" and closes it; a left click on the menu
+    /// goes to the UI.
+    fn on_button_down(&self, msg: u32, lparam: LPARAM) {
+        if !self.is_open.get() {
+            return;
+        }
+        let (x, y) = mouse_xy(lparam);
+        let on_menu = self.placement.get().is_some_and(|p| p.menu_contains(x, y));
+        if !on_menu {
             self.close();
+        } else if msg == WM_LBUTTONDOWN {
+            self.run(self.ui.mouse_down(x, y, key_held(VK_SHIFT)));
         }
     }
 
@@ -318,10 +434,75 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_APP_SETTINGS_CHANGED | WM_SETTINGCHANGE => app.apply_background(),
             WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => app.on_deactivate(lparam),
-            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => app.on_click(lparam),
-            // Esc closes the menu (milestone 3: only when the search is empty).
-            WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
-                app.close();
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => app.on_button_down(msg, lparam),
+            WM_LBUTTONUP if app.is_open.get() => {
+                let (x, y) = mouse_xy(lparam);
+                app.run(app.ui.mouse_up(x, y));
+            }
+            WM_MOUSEMOVE if app.is_open.get() => {
+                app.track_mouse();
+                let (x, y) = mouse_xy(lparam);
+                log_err("hover", app.ui.mouse_move(x, y));
+            }
+            WM_MOUSELEAVE => {
+                app.tracking_mouse.set(false);
+                log_err("hover", app.ui.mouse_leave());
+            }
+            // An I-beam cursor over the search box.
+            WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT && app.is_open.get() => {
+                let mut pt = windows::Win32::Foundation::POINT::default();
+                // SAFETY: valid out-pointer; converts to our own window's
+                // client coordinates. The I-beam is a shared system cursor.
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+                    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+                    if app.ui.over_text(pt.x, pt.y)
+                        && let Ok(cursor) = LoadCursorW(None, IDC_IBEAM)
+                    {
+                        SetCursor(Some(cursor));
+                        return LRESULT(1);
+                    }
+                }
+            }
+            // Keys: editing, Esc, arrows, Tab, Enter (see ui::Ui::key_down).
+            WM_KEYDOWN if app.is_open.get() => {
+                let action =
+                    app.ui
+                        .key_down(wparam.0 as u16, key_held(VK_CONTROL), key_held(VK_SHIFT));
+                app.run(action);
+                return LRESULT(0);
+            }
+            // Typed text (one UTF-16 unit at a time).
+            WM_CHAR if app.is_open.get() => {
+                log_err("typing", app.ui.char_typed(wparam.0 as u16));
+                return LRESULT(0);
+            }
+            // IME: we draw the composition ourselves, so hide Windows' own
+            // composition window, then let the default handling continue.
+            WM_IME_SETCONTEXT => {
+                let lparam = LPARAM(lparam.0 & !(ISC_SHOWUICOMPOSITIONWINDOW as isize));
+                // SAFETY: default handling with a modified flag set.
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            WM_IME_STARTCOMPOSITION => {
+                log_err("IME", app.ui.ime_start());
+                return LRESULT(0);
+            }
+            WM_IME_COMPOSITION => {
+                log_err("IME", app.ui.ime_composition(lparam.0 as u32));
+                return LRESULT(0);
+            }
+            WM_IME_ENDCOMPOSITION => {
+                log_err("IME", app.ui.ime_end());
+                return LRESULT(0);
+            }
+            WM_APP_FOCUS_RETRY => {
+                app.retry_focus();
+                return LRESULT(0);
+            }
+            WM_APP_REDRAW => {
+                log_warn!("graphics device replaced; repainting");
+                log_err("repaint", app.ui.device_replaced());
                 return LRESULT(0);
             }
             // Alt+F4 must hide the menu, never destroy the window.
@@ -357,6 +538,20 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     }
     // SAFETY: default handling with the unchanged arguments.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// Startup touches a lot of memory only once: creating the GPU device,
+/// loading fonts, asking the shell for icons. Measured (milestone 3): about
+/// 21 MB right after startup, but an open/close cycle afterwards needs only
+/// about 5 MB. Handing the rest back to Windows keeps idle RAM low.
+/// (Not done after every close: that would only make each open fault the
+/// same 5 MB back in.)
+fn trim_startup_memory() {
+    // SAFETY: (-1, -1) = "trim what you can" for our own process.
+    if let Err(e) = unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) }
+    {
+        log_warn!("SetProcessWorkingSetSize failed: {e}");
+    }
 }
 
 /// Returns the mutex handle if we are the first instance, None otherwise.
@@ -401,7 +596,10 @@ fn run() -> Result<()> {
 
     let config = Config::from_args(std::env::args().skip(1));
     let hwnd = window::create(Some(wndproc))?;
-    let ui = ui::Ui::new(hwnd, MENU_SIZE, &config)?;
+    // Paint the content now, at the DPI of the monitor it will most likely
+    // open on, so the first open is instant.
+    let scale = window::placement(1.0, 1.0).scale;
+    let ui = ui::Ui::new(hwnd, &config, scale)?;
     let settings = SettingsWatch::new(hwnd)?;
     let tray = Tray::add(hwnd)?;
     let hook = HookThread::start(hwnd)?;
@@ -428,10 +626,12 @@ fn run() -> Result<()> {
         last_background_log: RefCell::new(String::new()),
         // SAFETY: registers (or looks up) a well-known message name.
         msg_taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+        tracking_mouse: Cell::new(false),
     });
     app.apply_background();
     APP.with(|a| *a.borrow_mut() = Some(app));
     log_info!("Glint started (pid {})", std::process::id());
+    trim_startup_memory();
 
     let mut msg = MSG::default();
     // SAFETY: standard message loop with a valid MSG out-pointer.

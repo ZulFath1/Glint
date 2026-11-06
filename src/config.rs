@@ -189,8 +189,7 @@ impl Background {
 pub struct Animation {
     pub open_ms: u32,
     pub close_ms: u32,
-    /// Used for the icon stagger in milestone 3.
-    #[allow(dead_code)]
+    /// Delay between one pinned icon's pop-in and the next.
     pub stagger_ms: u32,
     /// 2nd control-point y of the open easing (1.0 = no bounce).
     pub overshoot: f32,
@@ -207,16 +206,51 @@ impl Default for Animation {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+/// The pins on a fresh install (CLAUDE.md section 10). Pins that aren't
+/// installed on this PC are skipped when the menu is built.
+pub const DEFAULT_PINS: [&str; 6] = [
+    "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+    "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App",
+    "Microsoft.Windows.Explorer",
+    "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel",
+    "Microsoft.Paint_8wekyb3d8bbwe!App",
+    "Microsoft.Windows.Photos_8wekyb3d8bbwe!App",
+];
+
+/// The default accent color (#8fa8ff).
+pub const DEFAULT_ACCENT: Rgb = Rgb::new(0x8f, 0xa8, 0xff);
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    /// Pinned apps, as AppUserModelIDs, in grid order.
+    pub pinned: Vec<String>,
+    /// Caret, focus ring and focused search border.
+    pub accent: Rgb,
+    /// The grid never gets wider than this many columns.
+    pub max_columns: usize,
     pub background: Background,
     pub animation: Animation,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            pinned: DEFAULT_PINS.map(String::from).to_vec(),
+            accent: DEFAULT_ACCENT,
+            max_columns: 4,
+            background: Background::default(),
+            animation: Animation::default(),
+        }
+    }
 }
 
 impl Config {
     /// Defaults, plus test flags: `--bg <mode>`, `--preset <name>`,
     /// `--overlay <0..0.6>`, `--tint <0..1>`, `--angle <deg>`,
-    /// `--colors "#a,#b,#c"`.
+    /// `--colors "#a,#b,#c"`, `--pins <count>`.
+    ///
+    /// `--pins N` keeps the first N default pins, so you can see the menu
+    /// size follow the pin count. Above 6 it repeats them (test only).
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Self {
         let mut config = Self::default();
         let mut args = args.into_iter();
@@ -224,6 +258,15 @@ impl Config {
             let Some(value) = args.next() else { break };
             let bg = &mut config.background;
             match flag.as_str() {
+                "--pins" => {
+                    let n: usize = value.parse().unwrap_or(DEFAULT_PINS.len());
+                    config.pinned = DEFAULT_PINS
+                        .iter()
+                        .cycle()
+                        .take(n.min(24))
+                        .map(|s| s.to_string())
+                        .collect();
+                }
                 "--bg" => bg.mode = BackgroundMode::parse(&value).unwrap_or(bg.mode),
                 "--preset" => bg.preset = Preset::parse(&value).unwrap_or(bg.preset),
                 "--overlay" => bg.overlay = value.parse().unwrap_or(bg.overlay),
@@ -288,5 +331,15 @@ mod tests {
         assert_eq!(c.background.mode, BackgroundMode::Solid);
         assert_eq!(c.background.preset, Preset::Ocean);
         assert_eq!(c.background.overlay, 0.6); // clamped
+    }
+
+    #[test]
+    fn pins_flag_picks_the_first_n_defaults() {
+        let c = Config::from_args(["--pins", "2"].map(String::from));
+        assert_eq!(c.pinned, DEFAULT_PINS[..2]);
+        let c = Config::from_args(["--pins", "9"].map(String::from));
+        assert_eq!(c.pinned.len(), 9);
+        assert_eq!(c.pinned[6], DEFAULT_PINS[0]);
+        assert_eq!(Config::default().pinned.len(), 6);
     }
 }

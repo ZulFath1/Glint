@@ -10,8 +10,9 @@
 
 use windows::Foundation::TimeSpan;
 use windows::UI::Composition::{
-    CompositionBatchTypes, CompositionEasingFunction, CompositionScopedBatch, Compositor,
-    ScalarKeyFrameAnimation, Vector3KeyFrameAnimation, Visual,
+    AnimationDelayBehavior, AnimationIterationBehavior, CompositionBatchTypes,
+    CompositionEasingFunction, CompositionScopedBatch, Compositor, ScalarKeyFrameAnimation,
+    Vector3KeyFrameAnimation, Visual,
 };
 use windows::core::{Interface, Result, h};
 use windows_numerics::{Vector2, Vector3};
@@ -44,6 +45,9 @@ pub struct Animator {
     close_opacity: ScalarKeyFrameAnimation,
     fade_in: ScalarKeyFrameAnimation,
     fade_out: ScalarKeyFrameAnimation,
+    stagger: Stagger,
+    pop: Pop,
+    caret_blink: ScalarKeyFrameAnimation,
 }
 
 fn ms(value: u32) -> TimeSpan {
@@ -110,6 +114,9 @@ impl Animator {
             close_opacity,
             fade_in: fade(1.0)?,
             fade_out: fade(0.0)?,
+            stagger: Stagger::new(c, &overshoot, &linear, cfg.stagger_ms)?,
+            pop: Pop::new(c, &overshoot, &ease_in, &linear)?,
+            caret_blink: caret_blink(c, &linear)?,
         })
     }
 
@@ -146,4 +153,215 @@ impl Animator {
         batch.End()?;
         Ok(batch)
     }
+
+    /// Pops the pinned icons in, one after another. `visuals` are the inner
+    /// (animated) visual of each icon, in order.
+    pub fn stagger_in(&self, visuals: &[Visual]) -> Result<()> {
+        let s = &self.stagger;
+        for (i, v) in visuals.iter().enumerate() {
+            let delay = ms(STAGGER_FIRST_MS + i as u32 * s.step_ms);
+            s.opacity.SetDelayTime(delay)?;
+            s.offset.SetDelayTime(delay)?;
+            s.scale.SetDelayTime(delay)?;
+            v.StartAnimation(h!("Opacity"), &s.opacity)?;
+            v.StartAnimation(h!("Offset"), &s.offset)?;
+            v.StartAnimation(h!("Scale"), &s.scale)?;
+        }
+        Ok(())
+    }
+
+    /// Shows the icons at rest, with no animation (reduced motion).
+    pub fn stagger_done(visuals: &[Visual]) -> Result<()> {
+        for v in visuals {
+            v.StopAnimation(h!("Opacity"))?;
+            v.StopAnimation(h!("Offset"))?;
+            v.StopAnimation(h!("Scale"))?;
+            v.SetOpacity(1.0)?;
+            v.SetOffset(Vector3::zero())?;
+            v.SetScale(ONE)?;
+        }
+        Ok(())
+    }
+
+    /// Pops a small popup in from wherever it is now.
+    pub fn pop_in(&self, visual: &Visual, reduced_motion: bool) -> Result<()> {
+        if reduced_motion {
+            visual.StopAnimation(h!("Scale"))?;
+            visual.SetScale(ONE)?;
+            return visual.StartAnimation(h!("Opacity"), &self.fade_in);
+        }
+        visual.StartAnimation(h!("Scale"), &self.pop.in_scale)?;
+        visual.StartAnimation(h!("Opacity"), &self.pop.in_opacity)
+    }
+
+    /// Shrinks and fades a small popup out, from wherever it is now.
+    pub fn pop_out(&self, visual: &Visual, reduced_motion: bool) -> Result<()> {
+        if reduced_motion {
+            return visual.StartAnimation(h!("Opacity"), &self.fade_out);
+        }
+        visual.StartAnimation(h!("Scale"), &self.pop.out_scale)?;
+        visual.StartAnimation(h!("Opacity"), &self.pop.out_opacity)
+    }
+
+    /// Restarts the caret blink, beginning "on" (call after each keystroke).
+    pub fn blink(&self, caret: &Visual) -> Result<()> {
+        caret.StartAnimation(h!("Opacity"), &self.caret_blink)
+    }
+
+    /// Stops the blink (menu hidden, or focus elsewhere): no work for DWM.
+    pub fn stop_blink(caret: &Visual, visible: bool) -> Result<()> {
+        caret.StopAnimation(h!("Opacity"))?;
+        caret.SetOpacity(if visible { 1.0 } else { 0.0 })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pinned icons: the staggered pop-in
+// ---------------------------------------------------------------------------
+
+/// The first icon starts this long after the menu starts opening.
+const STAGGER_FIRST_MS: u32 = 70;
+/// Each icon's own animation.
+const STAGGER_MS: u32 = 300;
+const STAGGER_FADE_MS: u32 = 160;
+/// Icons rise this far (DIPs) and grow from this scale.
+const STAGGER_RISE: f32 = 10.0;
+const STAGGER_FROM_SCALE: f32 = 0.85;
+
+/// Three animations reused for every icon. Composition copies an animation
+/// when it starts, so changing `DelayTime` for the next icon is safe.
+struct Stagger {
+    opacity: ScalarKeyFrameAnimation,
+    offset: Vector3KeyFrameAnimation,
+    scale: Vector3KeyFrameAnimation,
+    step_ms: u32,
+}
+
+impl Stagger {
+    fn new(
+        c: &Compositor,
+        overshoot: &CompositionEasingFunction,
+        linear: &CompositionEasingFunction,
+        step_ms: u32,
+    ) -> Result<Self> {
+        let opacity = c.CreateScalarKeyFrameAnimation()?;
+        opacity.InsertKeyFrame(0.0, 0.0)?;
+        opacity.InsertKeyFrameWithEasingFunction(1.0, 1.0, linear)?;
+        opacity.SetDuration(ms(STAGGER_FADE_MS))?;
+
+        let offset = c.CreateVector3KeyFrameAnimation()?;
+        offset.InsertKeyFrame(
+            0.0,
+            Vector3 {
+                X: 0.0,
+                Y: STAGGER_RISE,
+                Z: 0.0,
+            },
+        )?;
+        offset.InsertKeyFrameWithEasingFunction(1.0, Vector3::zero(), overshoot)?;
+        offset.SetDuration(ms(STAGGER_MS))?;
+
+        let scale = c.CreateVector3KeyFrameAnimation()?;
+        scale.InsertKeyFrame(
+            0.0,
+            Vector3 {
+                X: STAGGER_FROM_SCALE,
+                Y: STAGGER_FROM_SCALE,
+                Z: 1.0,
+            },
+        )?;
+        scale.InsertKeyFrameWithEasingFunction(1.0, ONE, overshoot)?;
+        scale.SetDuration(ms(STAGGER_MS))?;
+
+        // Hold the "before" values during the delay, so icons that have not
+        // started yet stay hidden instead of showing at full size.
+        opacity.SetDelayBehavior(AnimationDelayBehavior::SetInitialValueBeforeDelay)?;
+        offset.SetDelayBehavior(AnimationDelayBehavior::SetInitialValueBeforeDelay)?;
+        scale.SetDelayBehavior(AnimationDelayBehavior::SetInitialValueBeforeDelay)?;
+        Ok(Self {
+            opacity,
+            offset,
+            scale,
+            step_ms,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small popups (the power strip): pop in / pop out
+// ---------------------------------------------------------------------------
+
+const POP_IN_MS: u32 = 220;
+const POP_IN_FADE_MS: u32 = 90;
+const POP_OUT_MS: u32 = 120;
+/// A popup grows from (and shrinks back to) this scale.
+pub const POP_FROM_SCALE: f32 = 0.9;
+
+struct Pop {
+    in_scale: Vector3KeyFrameAnimation,
+    in_opacity: ScalarKeyFrameAnimation,
+    out_scale: Vector3KeyFrameAnimation,
+    out_opacity: ScalarKeyFrameAnimation,
+}
+
+impl Pop {
+    fn new(
+        c: &Compositor,
+        overshoot: &CompositionEasingFunction,
+        ease_in: &CompositionEasingFunction,
+        linear: &CompositionEasingFunction,
+    ) -> Result<Self> {
+        let small = Vector3 {
+            X: POP_FROM_SCALE,
+            Y: POP_FROM_SCALE,
+            Z: 1.0,
+        };
+        let in_scale = c.CreateVector3KeyFrameAnimation()?;
+        in_scale.InsertExpressionKeyFrame(0.0, h!("this.StartingValue"))?;
+        in_scale.InsertKeyFrameWithEasingFunction(1.0, ONE, overshoot)?;
+        in_scale.SetDuration(ms(POP_IN_MS))?;
+
+        let in_opacity = c.CreateScalarKeyFrameAnimation()?;
+        in_opacity.InsertExpressionKeyFrame(0.0, h!("this.StartingValue"))?;
+        in_opacity.InsertKeyFrameWithEasingFunction(1.0, 1.0, linear)?;
+        in_opacity.SetDuration(ms(POP_IN_FADE_MS))?;
+
+        let out_scale = c.CreateVector3KeyFrameAnimation()?;
+        out_scale.InsertExpressionKeyFrame(0.0, h!("this.StartingValue"))?;
+        out_scale.InsertKeyFrameWithEasingFunction(1.0, small, ease_in)?;
+        out_scale.SetDuration(ms(POP_OUT_MS))?;
+
+        let out_opacity = c.CreateScalarKeyFrameAnimation()?;
+        out_opacity.InsertExpressionKeyFrame(0.0, h!("this.StartingValue"))?;
+        out_opacity.InsertKeyFrameWithEasingFunction(1.0, 0.0, linear)?;
+        out_opacity.SetDuration(ms(POP_OUT_MS))?;
+        Ok(Self {
+            in_scale,
+            in_opacity,
+            out_scale,
+            out_opacity,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The search box caret: 530 ms on, 530 ms off, forever
+// ---------------------------------------------------------------------------
+
+const CARET_HALF_MS: u32 = 530;
+
+fn caret_blink(
+    c: &Compositor,
+    linear: &CompositionEasingFunction,
+) -> Result<ScalarKeyFrameAnimation> {
+    // On for the first half, off for the second. The tiny 0.5 → 0.501 step
+    // lasts about 1 ms, less than a frame, so it looks like an instant blink.
+    let a = c.CreateScalarKeyFrameAnimation()?;
+    a.InsertKeyFrame(0.0, 1.0)?;
+    a.InsertKeyFrameWithEasingFunction(0.5, 1.0, linear)?;
+    a.InsertKeyFrameWithEasingFunction(0.501, 0.0, linear)?;
+    a.InsertKeyFrameWithEasingFunction(1.0, 0.0, linear)?;
+    a.SetDuration(ms(2 * CARET_HALF_MS))?;
+    a.SetIterationBehavior(AnimationIterationBehavior::Forever)?;
+    Ok(a)
 }

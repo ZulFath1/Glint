@@ -19,7 +19,7 @@ use windows::UI::Color;
 use windows::UI::Composition::{
     CompositionBackdropBrush, CompositionColorBrush, CompositionLinearGradientBrush,
     CompositionMappingMode, CompositionRoundedRectangleGeometry, CompositionSpriteShape,
-    Compositor, ContainerVisual, SpriteVisual,
+    Compositor, ContainerVisual, ShapeVisual, SpriteVisual,
 };
 use windows::core::Result;
 use windows_numerics::Vector2;
@@ -60,11 +60,16 @@ pub struct Applied {
 
 pub struct Background {
     compositor: Compositor,
-    size: Vector2,
+    size: Cell<Vector2>,
     corner_radius: f32,
     backdrop: SpriteVisual,
     tint: SpriteVisual,
+    overlay: SpriteVisual,
     sheen: SpriteVisual,
+    sheen_brush: CompositionLinearGradientBrush,
+    border_visual: ShapeVisual,
+    border_width: Cell<f32>,
+    angle: Cell<f32>,
     tint_color: CompositionColorBrush,
     gradient: CompositionLinearGradientBrush,
     overlay_color: CompositionColorBrush,
@@ -147,11 +152,16 @@ impl Background {
 
         Ok(Self {
             compositor: compositor.clone(),
-            size,
+            size: Cell::new(size),
             corner_radius,
             backdrop,
             tint,
+            overlay,
             sheen,
+            sheen_brush,
+            border_visual,
+            border_width: Cell::new(BORDER_WIDTH),
+            angle: Cell::new(0.0),
             tint_color,
             gradient,
             overlay_color,
@@ -179,7 +189,8 @@ impl Background {
         let alpha = if glass { cfg.tint } else { 1.0 };
         let use_gradient = cfg.mode.uses_gradient() && colors.len() > 1;
         if use_gradient {
-            let (start, end) = gradient_points(self.size, cfg.angle);
+            self.angle.set(cfg.angle);
+            let (start, end) = gradient_points(self.size.get(), cfg.angle);
             self.gradient.SetStartPoint(start)?;
             self.gradient.SetEndPoint(end)?;
             let stops = self.gradient.ColorStops()?;
@@ -235,14 +246,40 @@ impl Background {
         Ok(Applied { glass, overlay })
     }
 
+    /// The menu changed size: resize every layer. The colors stay.
+    pub fn set_size(&self, size: Vector2) -> Result<()> {
+        self.size.set(size);
+        for layer in [&self.backdrop, &self.tint, &self.overlay, &self.sheen] {
+            layer.SetSize(size)?;
+        }
+        self.border_visual.SetSize(size)?;
+        self.sheen_brush.SetEndPoint(Vector2 {
+            X: 0.0,
+            Y: size.Y * SHEEN_DEPTH,
+        })?;
+        self.rim.SetEndPoint(size)?;
+        let (start, end) = gradient_points(size, self.angle.get());
+        self.gradient.SetStartPoint(start)?;
+        self.gradient.SetEndPoint(end)?;
+        self.set_border(self.border_width.get())
+    }
+
+    /// The top layer (border / glass rim). The menu's content goes just
+    /// below it.
+    pub fn border_visual(&self) -> &ShapeVisual {
+        &self.border_visual
+    }
+
     /// Sizes the stroke so it sits fully inside the rounded clip.
     fn set_border(&self, width: f32) -> Result<()> {
+        self.border_width.set(width);
+        let size = self.size.get();
         let inset = width / 2.0;
         self.border_geometry
             .SetOffset(Vector2 { X: inset, Y: inset })?;
         self.border_geometry.SetSize(Vector2 {
-            X: self.size.X - width,
-            Y: self.size.Y - width,
+            X: size.X - width,
+            Y: size.Y - width,
         })?;
         let r = self.corner_radius - inset;
         self.border_geometry

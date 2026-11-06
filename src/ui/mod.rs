@@ -1,26 +1,100 @@
-//! Composition setup: Compositor + DesktopWindowTarget hosted in our HWND.
+//! The menu's visuals and how they react to keys and the mouse.
 //!
+//! Composition setup: a Compositor + DesktopWindowTarget hosted in our HWND.
 //! Everything inside the root visual is laid out in DIPs; the root visual is
-//! scaled by the monitor's DPI factor. The D3D/D2D devices for text and icons
-//! arrive in milestone 3.
+//! scaled by the monitor's DPI factor.
+//!
+//! Inside the menu body, bottom to top:
+//! ```text
+//! back    footer fill + divider
+//! hover   the mouse-hover highlight (one, moved around)
+//! front   search box, pinned grid, avatar / name / power icon
+//! popup   the power strip
+//! top     the keyboard focus ring (one, moved around)
+//! ```
+//!
+//! Input methods never call anything that could run a message loop (like
+//! ShellExecute). Instead they return an [`Action`] for main.rs to carry
+//! out, so the window procedure can't re-enter us halfway through.
 
 pub mod anim;
 pub mod background;
+pub mod footer;
+pub mod gfx;
+pub mod grid;
+pub mod layout;
+pub mod search_box;
+pub mod shape;
 pub mod shell;
+
+use std::cell::{Cell, RefCell};
 
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{CompositionScopedBatch, Compositor, ContainerVisual, Visual};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+    VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP,
+};
 use windows::core::{Interface, Result};
 use windows_numerics::{Vector2, Vector3};
 
-use crate::config::Config;
+use crate::config::{Config, Rgb};
+use crate::icons::IconCache;
+use crate::power::PowerAction;
 use crate::window::{Edge, Placement};
 use anim::Animator;
 use background::{Applied, SystemEffects};
+use footer::{Footer, PowerStrip, StripState};
+use gfx::Gfx;
+use grid::Grid;
+use layout::{Layout, Rect};
+use search_box::SearchBox;
+use shape::RoundRect;
+
+/// Something main.rs should do after an input event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    None,
+    Close,
+    OpenAccountSettings,
+    Power(PowerAction),
+    /// Launch the pinned app with this index (milestone 4).
+    Launch(usize),
+}
+
+/// Who has the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Search,
+    Cell(usize),
+    Profile,
+    Power,
+    /// A button of the power strip.
+    Strip(usize),
+}
+
+/// What is under the mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Nothing,
+    Search,
+    Cell(usize),
+    Profile,
+    Power,
+    Strip(usize),
+    /// The power strip, but not on a button.
+    StripPanel,
+}
+
+const HOVER_ALPHA: f32 = 0.08;
+const CELL_RADIUS: f32 = 12.0;
+const BUTTON_RADIUS: f32 = 10.0;
+const RING_WIDTH: f32 = 2.0;
 
 pub struct Ui {
+    hwnd: HWND,
     _compositor: Compositor,
     // Keeps our visual tree attached to the window.
     _target: DesktopWindowTarget,
@@ -28,10 +102,34 @@ pub struct Ui {
     shell: shell::Shell,
     menu: Visual,
     animator: Animator,
+    gfx: Gfx,
+    icons: IconCache,
+    layout: RefCell<Layout>,
+    search: SearchBox,
+    grid: Grid,
+    footer: Footer,
+    strip: PowerStrip,
+    hover: RoundRect,
+    ring: RoundRect,
+    focus: Cell<Focus>,
+    /// The focus ring shows only after keyboard navigation (like CSS
+    /// `:focus-visible`); the mouse hides it again.
+    keyboard_nav: Cell<bool>,
+    hovered: Cell<Target>,
+    pressed: Cell<Target>,
+    /// Selecting text in the search box with the mouse.
+    dragging: Cell<bool>,
+    placement: Cell<Option<Placement>>,
+    is_open: Cell<bool>,
+    reduced_motion: Cell<bool>,
+}
+
+fn white(alpha: f32) -> windows::UI::Color {
+    gfx::color(Rgb::new(255, 255, 255), alpha)
 }
 
 impl Ui {
-    pub fn new(hwnd: HWND, menu_size: Vector2, config: &Config) -> Result<Self> {
+    pub fn new(hwnd: HWND, config: &Config, scale: f32) -> Result<Self> {
         let compositor = Compositor::new()?;
         let interop: ICompositorDesktopInterop = compositor.cast()?;
         // SAFETY: `hwnd` is our live top-level window, created on this thread.
@@ -40,26 +138,114 @@ impl Ui {
         let root = compositor.CreateContainerVisual()?;
         target.SetRoot(&root)?;
 
-        let shell = shell::Shell::new(&compositor, menu_size)?;
+        // Pinned apps that aren't installed are skipped; the layout follows
+        // the number that is left.
+        let apps: Vec<crate::apps::App> = config
+            .pinned
+            .iter()
+            .filter_map(|aumid| crate::apps::find(aumid))
+            .collect();
+        let layout = layout::layout(apps.len(), config.max_columns);
+
+        let shell = shell::Shell::new(&compositor, layout.size)?;
         root.Children()?.InsertAtTop(shell.host())?;
         let menu = shell.host_visual()?;
         Animator::reset_closed(&menu)?;
-
         let animator = Animator::new(&compositor, &config.animation)?;
+        let gfx = Gfx::new(&compositor, hwnd, scale)?;
 
-        Ok(Self {
+        let new_layer = || -> Result<ContainerVisual> {
+            let v = compositor.CreateContainerVisual()?;
+            shell.body().Children()?.InsertAtTop(&v)?;
+            Ok(v)
+        };
+        let back = new_layer()?;
+        let hover_layer = new_layer()?;
+        let front = new_layer()?;
+        let popup = new_layer()?;
+        let top = new_layer()?;
+
+        let footer = Footer::new(&compositor, &gfx, &back, &front, &layout)?;
+        let hover = RoundRect::new(&compositor, CELL_RADIUS, 0.0)?;
+        hover.set_fill(white(HOVER_ALPHA))?;
+        hover.show(false)?;
+        hover_layer.Children()?.InsertAtTop(&hover.visual)?;
+        let search = SearchBox::new(&compositor, &gfx, &front, layout.search, config.accent)?;
+        let grid = Grid::new(&compositor, &gfx, &front, apps)?;
+        let strip = PowerStrip::new(&compositor, &gfx, &popup, layout.strip)?;
+        let ring = RoundRect::new(&compositor, CELL_RADIUS, RING_WIDTH)?;
+        ring.set_stroke(gfx::color(config.accent, 1.0))?;
+        ring.show(false)?;
+        top.Children()?.InsertAtTop(&ring.visual)?;
+
+        let ui = Self {
+            hwnd,
             _compositor: compositor,
             _target: target,
             root,
             shell,
             menu,
             animator,
-        })
+            gfx,
+            icons: IconCache::default(),
+            layout: RefCell::new(layout),
+            search,
+            grid,
+            footer,
+            strip,
+            hover,
+            ring,
+            focus: Cell::new(Focus::Search),
+            keyboard_nav: Cell::new(false),
+            hovered: Cell::new(Target::Nothing),
+            pressed: Cell::new(Target::Nothing),
+            dragging: Cell::new(false),
+            placement: Cell::new(None),
+            is_open: Cell::new(false),
+            reduced_motion: Cell::new(false),
+        };
+        ui.refresh()?;
+        Ok(ui)
+    }
+
+    /// The menu's size in DIPs (it follows the content).
+    pub fn size(&self) -> Vector2 {
+        self.layout.borrow().size
+    }
+
+    /// Positions and paints everything at the current DPI scale.
+    fn refresh(&self) -> Result<()> {
+        let l = self.layout.borrow().clone();
+        self.shell.set_size(l.size)?;
+        self.search.set_rect(&self.gfx, l.search)?;
+        self.grid.set_rects(&self.gfx, &l.cells)?;
+        self.grid.redraw(&self.gfx, &self.icons)?;
+        self.footer.refresh(&self.gfx, &l)?;
+        let power = l.power;
+        let grow_from = Vector2 {
+            X: power.x + power.w / 2.0,
+            Y: power.y,
+        };
+        self.strip.refresh(&self.gfx, l.strip, grow_from)?;
+        self.update_focus_visuals()
+    }
+
+    /// The GPU device was replaced: every surface is empty, every cached
+    /// bitmap useless. Paint it all again.
+    pub fn device_replaced(&self) -> Result<()> {
+        self.icons.clear();
+        self.refresh()
     }
 
     /// Applies the DPI scale and the menu's position inside the window, and
     /// puts the scale origin on the edge nearest the taskbar.
     pub fn set_layout(&self, p: &Placement) -> Result<()> {
+        if (p.scale - self.gfx.scale()).abs() > 0.001 {
+            log_info!("DPI scale {} -> {}: repainting", self.gfx.scale(), p.scale);
+            self.gfx.set_scale(p.scale);
+            self.refresh()?;
+        }
+        self.placement.set(Some(*p));
         self.root.SetScale(Vector3 {
             X: p.scale,
             Y: p.scale,
@@ -90,11 +276,561 @@ impl Ui {
         Animator::reset_closed(&self.menu)
     }
 
-    pub fn animate_open(&self, reduced_motion: bool) -> Result<()> {
+    /// Gets the content ready and starts the open animation. `fresh` = the
+    /// window was hidden (not a reopen that interrupts a close).
+    pub fn animate_open(&self, fresh: bool, reduced_motion: bool) -> Result<()> {
+        self.reduced_motion.set(reduced_motion);
+        self.is_open.set(true);
+        if fresh {
+            // A fresh start: empty search with the keyboard, nothing hovered.
+            self.search.editor.borrow_mut().clear();
+            self.search.redraw_text(&self.gfx)?;
+            self.strip.reset()?;
+            self.keyboard_nav.set(false);
+            self.pressed.set(Target::Nothing);
+            self.dragging.set(false);
+            self.hovered.set(Target::Nothing);
+            self.hover.show(false)?;
+            self.focus.set(Focus::Search);
+            let icons = self.grid.animated_visuals()?;
+            if reduced_motion {
+                Animator::stagger_done(&icons)?;
+            } else {
+                self.animator.stagger_in(&icons)?;
+            }
+        }
+        self.update_focus_visuals()?;
         self.animator.open(&self.menu, reduced_motion)
     }
 
     pub fn animate_close(&self, reduced_motion: bool) -> Result<CompositionScopedBatch> {
+        self.is_open.set(false);
+        // No blinking caret while hidden: zero work for DWM.
+        Animator::stop_blink(&self.search.caret_visual()?, true)?;
+        search_box::ime_cancel(self.hwnd);
+        if self.dragging.replace(false) {
+            // SAFETY: releases the mouse capture we took; no pointers.
+            let _ = unsafe { ReleaseCapture() };
+        }
         self.animator.close(&self.menu, reduced_motion)
+    }
+
+    /// The display name of pinned app `i` (for logging).
+    pub fn app_name(&self, i: usize) -> String {
+        self.grid.name(i).unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
+    // Focus, hover, ring
+    // -----------------------------------------------------------------------
+
+    fn set_focus(&self, focus: Focus) -> Result<()> {
+        self.focus.set(focus);
+        self.update_focus_visuals()
+    }
+
+    fn focus_rect(&self, focus: Focus) -> Option<(Rect, f32)> {
+        match focus {
+            Focus::Search => None, // the search box shows focus with its border
+            Focus::Cell(i) => self.grid.rect(i).map(|r| (r, CELL_RADIUS)),
+            Focus::Profile => Some((self.footer.profile_rect(), BUTTON_RADIUS)),
+            Focus::Power => Some((self.footer.power_rect(), BUTTON_RADIUS)),
+            Focus::Strip(i) => self.strip.buttons().get(i).map(|&r| (r, BUTTON_RADIUS)),
+        }
+    }
+
+    fn update_focus_visuals(&self) -> Result<()> {
+        let focus = self.focus.get();
+        let in_search = focus == Focus::Search;
+        self.search.set_focused(in_search)?;
+        let caret = self.search.caret_visual()?;
+        if in_search && self.is_open.get() {
+            self.animator.blink(&caret)?;
+        } else {
+            Animator::stop_blink(&caret, in_search)?;
+        }
+        match self.focus_rect(focus) {
+            Some((r, radius)) if self.keyboard_nav.get() => {
+                self.ring.set_radius(radius);
+                self.ring.set_rect(r)?;
+                self.ring.show(true)
+            }
+            _ => self.ring.show(false),
+        }
+    }
+
+    fn set_hovered(&self, target: Target) -> Result<()> {
+        if self.hovered.replace(target) == target {
+            return Ok(());
+        }
+        let strip_button = match target {
+            Target::Strip(i) => Some(i),
+            _ => None,
+        };
+        self.strip.set_hover(strip_button)?;
+        let highlight = match target {
+            Target::Cell(i) => self.grid.rect(i).map(|r| (r, CELL_RADIUS)),
+            Target::Profile => Some((self.footer.profile_rect(), BUTTON_RADIUS)),
+            Target::Power => Some((self.footer.power_rect(), BUTTON_RADIUS)),
+            _ => None,
+        };
+        match highlight {
+            Some((r, radius)) => {
+                self.hover.set_radius(radius);
+                self.hover.set_rect(r)?;
+                self.hover.show(true)
+            }
+            None => self.hover.show(false),
+        }
+    }
+
+    fn hit(&self, p: Vector2) -> Target {
+        if self.strip.is_open() {
+            if let Some(i) = self.strip.hit(p) {
+                return Target::Strip(i);
+            }
+            if self.strip.rect().contains(p) {
+                return Target::StripPanel;
+            }
+        }
+        if self.search.rect().contains(p) {
+            Target::Search
+        } else if let Some(i) = self.grid.hit(p) {
+            Target::Cell(i)
+        } else if self.footer.profile_rect().contains(p) {
+            Target::Profile
+        } else if self.footer.power_rect().contains(p) {
+            Target::Power
+        } else {
+            Target::Nothing
+        }
+    }
+
+    /// Window (client) pixels → menu DIPs.
+    fn to_menu(&self, x: i32, y: i32) -> Option<Vector2> {
+        let p = self.placement.get()?;
+        Some(Vector2 {
+            X: (x - p.menu_x) as f32 / p.scale,
+            Y: (y - p.menu_y) as f32 / p.scale,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Power strip
+    // -----------------------------------------------------------------------
+
+    fn open_strip(&self) -> Result<()> {
+        self.strip
+            .open(&self.gfx, &self.animator, self.reduced_motion.get())?;
+        self.set_focus(Focus::Strip(0))
+    }
+
+    fn close_strip(&self, focus_after: Focus) -> Result<()> {
+        self.strip
+            .close(&self.animator, self.reduced_motion.get())?;
+        if matches!(self.hovered.get(), Target::Strip(_) | Target::StripPanel) {
+            self.set_hovered(Target::Nothing)?;
+        }
+        self.set_focus(focus_after)
+    }
+
+    /// A strip button was clicked or Enter was pressed on it.
+    fn press_strip(&self, i: usize) -> Result<Action> {
+        match self.strip.state() {
+            StripState::Closed => Ok(Action::None),
+            StripState::Buttons => {
+                let Some(&action) = PowerAction::ALL.get(i) else {
+                    return Ok(Action::None);
+                };
+                if !action.needs_confirm() {
+                    return Ok(Action::Power(action));
+                }
+                // "Are you sure?": focus starts on Cancel.
+                self.strip
+                    .set_state(&self.gfx, StripState::Confirm(action))?;
+                self.hovered.set(Target::Nothing);
+                self.set_focus(Focus::Strip(0))?;
+                Ok(Action::None)
+            }
+            StripState::Confirm(action) => {
+                if i == 1 {
+                    return Ok(Action::Power(action));
+                }
+                // Cancel: back to the buttons, focus on the one we came from.
+                self.strip.set_state(&self.gfx, StripState::Buttons)?;
+                self.hovered.set(Target::Nothing);
+                let back = PowerAction::ALL.iter().position(|&a| a == action);
+                self.set_focus(Focus::Strip(back.unwrap_or(0)))?;
+                Ok(Action::None)
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Keyboard
+    // -----------------------------------------------------------------------
+
+    /// WM_KEYDOWN. `ctrl` / `shift` = those keys are held.
+    pub fn key_down(&self, vk: u16, ctrl: bool, shift: bool) -> Result<Action> {
+        let vk = VIRTUAL_KEY(vk);
+        if vk == VK_ESCAPE {
+            // Esc closes the innermost thing: strip, then text, then menu.
+            if self.strip.is_open() {
+                // Back to where the strip was opened from: the power button
+                // when using the keyboard, else the search box.
+                let back = if self.keyboard_nav.get() {
+                    Focus::Power
+                } else {
+                    Focus::Search
+                };
+                self.close_strip(back)?;
+                return Ok(Action::None);
+            }
+            if !self.search.editor.borrow().is_empty() {
+                self.search.editor.borrow_mut().clear();
+                self.after_edit()?;
+                self.set_focus(Focus::Search)?;
+                return Ok(Action::None);
+            }
+            return Ok(Action::Close);
+        }
+
+        let focus = self.focus.get();
+        let is_nav = matches!(vk, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_TAB);
+        if focus != Focus::Search && is_nav {
+            self.keyboard_nav.set(true);
+        }
+        match focus {
+            Focus::Search => self.search_key(vk, ctrl, shift),
+            Focus::Cell(i) => self.grid_key(i, vk, shift),
+            Focus::Profile | Focus::Power => self.footer_key(focus, vk, shift),
+            Focus::Strip(i) => self.strip_key(i, vk, shift),
+        }
+    }
+
+    fn search_key(&self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool) -> Result<Action> {
+        const KEY_A: VIRTUAL_KEY = VIRTUAL_KEY(b'A' as u16);
+        const KEY_C: VIRTUAL_KEY = VIRTUAL_KEY(b'C' as u16);
+        const KEY_V: VIRTUAL_KEY = VIRTUAL_KEY(b'V' as u16);
+        const KEY_X: VIRTUAL_KEY = VIRTUAL_KEY(b'X' as u16);
+
+        // Leaving the search box.
+        match vk {
+            VK_DOWN | VK_TAB if !shift => {
+                self.keyboard_nav.set(true);
+                let next = if self.grid.len() > 0 {
+                    Focus::Cell(0)
+                } else {
+                    Focus::Profile
+                };
+                return self.set_focus(next).map(|()| Action::None);
+            }
+            VK_TAB => {
+                self.keyboard_nav.set(true);
+                return self.set_focus(Focus::Power).map(|()| Action::None);
+            }
+            // Enter launches the top search result in milestone 4.
+            VK_RETURN => return Ok(Action::None),
+            _ => {}
+        }
+
+        // The clipboard is read before borrowing the editor.
+        let paste = if ctrl && vk == KEY_V {
+            search_box::clipboard_text(self.hwnd)
+        } else {
+            None
+        };
+        let mut copy = None;
+        let changed = {
+            let mut e = self.search.editor.borrow_mut();
+            match vk {
+                VK_BACK => e.backspace(ctrl),
+                VK_DELETE => e.delete(ctrl),
+                VK_LEFT => {
+                    e.left(ctrl, shift);
+                    true
+                }
+                VK_RIGHT => {
+                    e.right(ctrl, shift);
+                    true
+                }
+                VK_HOME => {
+                    e.home(shift);
+                    true
+                }
+                VK_END => {
+                    e.end(shift);
+                    true
+                }
+                KEY_A if ctrl => {
+                    e.select_all();
+                    true
+                }
+                KEY_C if ctrl => {
+                    copy = e.has_selection().then(|| e.selected_text().to_string());
+                    false
+                }
+                KEY_X if ctrl => {
+                    copy = e.cut();
+                    copy.is_some()
+                }
+                KEY_V if ctrl => paste.is_some_and(|text| e.insert(&text)),
+                _ => false,
+            }
+        };
+        if let Some(text) = copy {
+            search_box::set_clipboard_text(self.hwnd, &text);
+        }
+        if changed {
+            self.after_edit()?;
+        }
+        Ok(Action::None)
+    }
+
+    fn grid_key(&self, i: usize, vk: VIRTUAL_KEY, shift: bool) -> Result<Action> {
+        let n = self.grid.len();
+        let cols = self.layout.borrow().columns.max(1);
+        let last_row = (n - 1) / cols;
+        let next = match vk {
+            VK_LEFT => Focus::Cell(i.saturating_sub(1)),
+            VK_RIGHT => Focus::Cell((i + 1).min(n - 1)),
+            VK_UP if i < cols => Focus::Search,
+            VK_UP => Focus::Cell(i - cols),
+            VK_DOWN if i + cols < n => Focus::Cell(i + cols),
+            // The row below is shorter: go to its last icon.
+            VK_DOWN if i / cols < last_row => Focus::Cell(n - 1),
+            VK_DOWN => Focus::Profile,
+            VK_HOME => Focus::Cell(0),
+            VK_END => Focus::Cell(n - 1),
+            VK_TAB if shift && i == 0 => Focus::Search,
+            VK_TAB if shift => Focus::Cell(i - 1),
+            VK_TAB if i + 1 < n => Focus::Cell(i + 1),
+            VK_TAB => Focus::Profile,
+            VK_RETURN => return Ok(Action::Launch(i)),
+            _ => return Ok(Action::None),
+        };
+        self.set_focus(next)?;
+        Ok(Action::None)
+    }
+
+    fn footer_key(&self, focus: Focus, vk: VIRTUAL_KEY, shift: bool) -> Result<Action> {
+        let n = self.grid.len();
+        let above = if n > 0 {
+            Focus::Cell(n - 1)
+        } else {
+            Focus::Search
+        };
+        let next = match (focus, vk) {
+            (Focus::Profile, VK_RETURN) => return Ok(Action::OpenAccountSettings),
+            (Focus::Power, VK_RETURN) => {
+                self.keyboard_nav.set(true);
+                self.open_strip()?;
+                return Ok(Action::None);
+            }
+            (_, VK_UP) => above,
+            (Focus::Profile, VK_TAB) if shift => above,
+            (Focus::Profile, VK_RIGHT | VK_TAB) => Focus::Power,
+            (Focus::Power, VK_LEFT) => Focus::Profile,
+            (Focus::Power, VK_TAB) if shift => Focus::Profile,
+            (Focus::Power, VK_TAB) => Focus::Search,
+            _ => return Ok(Action::None),
+        };
+        self.set_focus(next)?;
+        Ok(Action::None)
+    }
+
+    fn strip_key(&self, i: usize, vk: VIRTUAL_KEY, shift: bool) -> Result<Action> {
+        let n = self.strip.buttons().len();
+        let next = match vk {
+            VK_LEFT => i.saturating_sub(1),
+            VK_RIGHT => (i + 1).min(n - 1),
+            VK_TAB if shift => (i + n - 1) % n,
+            VK_TAB => (i + 1) % n,
+            VK_RETURN => {
+                self.keyboard_nav.set(true);
+                return self.press_strip(i);
+            }
+            _ => return Ok(Action::None),
+        };
+        self.set_focus(Focus::Strip(next))?;
+        Ok(Action::None)
+    }
+
+    /// WM_CHAR: typing always goes to the search box.
+    pub fn char_typed(&self, unit: u16) -> Result<()> {
+        // Control characters (Backspace, Tab, Enter, Esc, Ctrl+letters...)
+        // are handled as keys in `key_down`.
+        let is_text = unit >= 0x20 && unit != 0x7F;
+        if !is_text {
+            return Ok(());
+        }
+        if self.focus.get() != Focus::Search {
+            if self.strip.is_open() {
+                self.close_strip(Focus::Search)?;
+            }
+            self.keyboard_nav.set(false);
+            self.set_focus(Focus::Search)?;
+        }
+        if self.search.editor.borrow_mut().type_unit(unit) {
+            self.after_edit()?;
+        }
+        Ok(())
+    }
+
+    /// The text or caret changed: repaint, restart the blink (solid while
+    /// typing), and keep the IME windows next to the caret.
+    fn after_edit(&self) -> Result<()> {
+        self.search.redraw_text(&self.gfx)?;
+        if self.is_open.get() && self.focus.get() == Focus::Search {
+            self.animator.blink(&self.search.caret_visual()?)?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // IME
+    // -----------------------------------------------------------------------
+
+    /// The caret in window pixels.
+    fn caret_px(&self) -> Option<RECT> {
+        let p = self.placement.get()?;
+        let r = self.search.caret_rect();
+        let s = p.scale;
+        let left = p.menu_x + (r.x * s).round() as i32;
+        let top = p.menu_y + (r.y * s).round() as i32;
+        Some(RECT {
+            left,
+            top,
+            right: left + (r.w * s).ceil().max(1.0) as i32,
+            bottom: p.menu_y + (r.bottom() * s).round() as i32,
+        })
+    }
+
+    fn place_ime(&self) {
+        if let Some(caret) = self.caret_px() {
+            search_box::ime_place(self.hwnd, caret);
+        }
+    }
+
+    pub fn ime_start(&self) -> Result<()> {
+        if self.focus.get() != Focus::Search {
+            if self.strip.is_open() {
+                self.close_strip(Focus::Search)?;
+            }
+            self.set_focus(Focus::Search)?;
+        }
+        self.place_ime();
+        Ok(())
+    }
+
+    /// WM_IME_COMPOSITION. `flags` says which strings changed.
+    pub fn ime_composition(&self, flags: u32) -> Result<()> {
+        if flags & search_box::IME_RESULT.0 != 0
+            && let Some(result) = search_box::ime_string(self.hwnd, search_box::IME_RESULT)
+        {
+            let mut e = self.search.editor.borrow_mut();
+            e.set_composition("");
+            e.insert(&result);
+        }
+        let composing = if flags & search_box::IME_COMPOSITION.0 != 0 {
+            search_box::ime_string(self.hwnd, search_box::IME_COMPOSITION).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        self.search.editor.borrow_mut().set_composition(&composing);
+        self.after_edit()?;
+        self.place_ime();
+        Ok(())
+    }
+
+    pub fn ime_end(&self) -> Result<()> {
+        self.search.editor.borrow_mut().set_composition("");
+        self.after_edit()
+    }
+
+    // -----------------------------------------------------------------------
+    // Mouse (window pixels)
+    // -----------------------------------------------------------------------
+
+    pub fn mouse_move(&self, x: i32, y: i32) -> Result<()> {
+        let Some(p) = self.to_menu(x, y) else {
+            return Ok(());
+        };
+        if self.dragging.get() {
+            if let Some(pos) = self.search.position_at(p) {
+                self.search.editor.borrow_mut().set_caret_utf16(pos, true);
+                self.after_edit()?;
+            }
+            return Ok(());
+        }
+        self.set_hovered(self.hit(p))
+    }
+
+    pub fn mouse_leave(&self) -> Result<()> {
+        self.set_hovered(Target::Nothing)
+    }
+
+    /// True when the mouse is over the search box (show the I-beam cursor).
+    pub fn over_text(&self, x: i32, y: i32) -> bool {
+        self.to_menu(x, y)
+            .is_some_and(|p| self.hit(p) == Target::Search)
+    }
+
+    pub fn mouse_down(&self, x: i32, y: i32, shift: bool) -> Result<Action> {
+        let Some(p) = self.to_menu(x, y) else {
+            return Ok(Action::None);
+        };
+        // The mouse is in charge now: hide the focus ring.
+        self.keyboard_nav.set(false);
+        let target = self.hit(p);
+        if self.strip.is_open() && !matches!(target, Target::Strip(_) | Target::StripPanel) {
+            // A click outside the strip only closes the strip.
+            self.close_strip(Focus::Search)?;
+            self.pressed.set(Target::Nothing);
+            return Ok(Action::None);
+        }
+        self.pressed.set(target);
+        if target == Target::Search {
+            self.set_focus(Focus::Search)?;
+            if let Some(pos) = self.search.position_at(p) {
+                self.search.editor.borrow_mut().set_caret_utf16(pos, shift);
+                self.after_edit()?;
+            }
+            self.dragging.set(true);
+            // SAFETY: captures the mouse for our own window while selecting.
+            unsafe { SetCapture(self.hwnd) };
+        } else {
+            self.update_focus_visuals()?;
+        }
+        Ok(Action::None)
+    }
+
+    pub fn mouse_up(&self, x: i32, y: i32) -> Result<Action> {
+        if self.dragging.replace(false) {
+            // SAFETY: releases the capture taken in `mouse_down`.
+            let _ = unsafe { ReleaseCapture() };
+        }
+        let pressed = self.pressed.replace(Target::Nothing);
+        let Some(p) = self.to_menu(x, y) else {
+            return Ok(Action::None);
+        };
+        // A click = pressed and released on the same thing.
+        if self.hit(p) != pressed {
+            return Ok(Action::None);
+        }
+        match pressed {
+            Target::Cell(i) => Ok(Action::Launch(i)),
+            Target::Profile => Ok(Action::OpenAccountSettings),
+            Target::Power if self.strip.is_open() => {
+                self.close_strip(Focus::Search)?;
+                Ok(Action::None)
+            }
+            Target::Power => {
+                self.open_strip()?;
+                Ok(Action::None)
+            }
+            Target::Strip(i) => self.press_strip(i),
+            _ => Ok(Action::None),
+        }
     }
 }

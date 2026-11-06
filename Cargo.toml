@@ -16,17 +16,37 @@ version = "0.62"
 # Only the API areas we actually use (keeps compile time and binary size down).
 features = [
   "Foundation",
+  "Graphics",
+  "Graphics_DirectX",
   "System",
   "UI",
   "UI_Composition",
   "UI_Composition_Desktop",
   "UI_ViewManagement",
   "Win32_Foundation",
+  # Milestone 3: drawing text and icons (Direct2D + DirectWrite + WIC).
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_DirectWrite",
   "Win32_Graphics_Dwm",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_Gdi",
+  "Win32_Graphics_Imaging",
   "Win32_Security",
+  # Display name (GetUserNameExW) and the account picture lookup.
+  "Win32_Security_Authentication_Identity",
+  "Win32_Security_Authorization",
+  "Win32_System_Com",
+  # Clipboard for the search box.
+  "Win32_System_DataExchange",
   "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
   "Win32_System_Power",
+  "Win32_System_Registry",
   "Win32_System_RemoteDesktop",
   "Win32_System_Shutdown",
   "Win32_System_SystemInformation",
@@ -35,8 +55,11 @@ features = [
   "Win32_System_WinRT",
   "Win32_System_WinRT_Composition",
   "Win32_UI_HiDpi",
+  # IME (Chinese/Japanese/Korean/Vietnamese input) in the search box.
+  "Win32_UI_Input_Ime",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
   "Win32_UI_WindowsAndMessaging",
 ]
 
