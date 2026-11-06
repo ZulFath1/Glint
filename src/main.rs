@@ -1,7 +1,7 @@
-//! Glint: a tiny, smooth Start menu for Windows 11.
+﻿//! Glint: a tiny, smooth Start menu for Windows 11.
 //!
-//! Startup order: single-instance check → DPI awareness → WinRT + dispatcher
-//! queue → hidden window → composition tree → tray icon → keyboard hook →
+//! Startup order: single-instance check â†’ DPI awareness â†’ WinRT + dispatcher
+//! queue â†’ hidden window â†’ composition tree â†’ tray icon â†’ keyboard hook â†’
 //! message loop.
 
 // Release builds have no console window.
@@ -214,9 +214,10 @@ impl App {
             Ok(applied) => {
                 let bg = &config.background;
                 let line = format!(
-                    "background: {} / {} (blur: {}, overlay {:.2}; transparency effects {}, battery saver {})",
+                    "background: {} / {} / tint {:.0}% (blur: {}, overlay {:.2}; transparency effects {}, energy saver {})",
                     bg.mode.name(),
                     bg.preset.name(),
+                    bg.tint * 100.0,
                     if applied.glass { "on" } else { "off" },
                     applied.overlay,
                     if effects.transparency { "on" } else { "off" },
@@ -242,31 +243,35 @@ impl App {
             }
             WM_RBUTTONUP => {
                 self.close();
-                let (mode, preset) = {
-                    let c = self.config.borrow();
-                    (c.background.mode, c.background.preset)
+                let (mode, preset, tint) = {
+                    let c = &self.config.borrow().background;
+                    (c.mode, c.preset, c.tint)
                 };
-                match self.tray.show_menu(mode, preset) {
-                    Some(TrayCommand::Quit) => {
-                        // SAFETY: posts WM_QUIT to this (the UI) thread.
-                        unsafe { PostQuitMessage(0) };
+                let Some(command) = self.tray.show_menu(mode, preset, tint) else {
+                    return;
+                };
+                {
+                    let bg = &mut self.config.borrow_mut().background;
+                    match command {
+                        TrayCommand::Quit => {
+                            // SAFETY: posts WM_QUIT to this (the UI) thread.
+                            unsafe { PostQuitMessage(0) };
+                            return;
+                        }
+                        TrayCommand::SetMode(m) => bg.mode = m,
+                        TrayCommand::SetPreset(p) => bg.preset = p,
+                        TrayCommand::SetTint(t) => bg.tint = t,
                     }
-                    Some(TrayCommand::SetMode(m)) => {
-                        self.config.borrow_mut().background.mode = m;
-                        self.apply_background();
-                    }
-                    Some(TrayCommand::SetPreset(p)) => {
-                        self.config.borrow_mut().background.preset = p;
-                        self.apply_background();
-                    }
-                    None => {}
                 }
+                // Show the new look right away.
+                self.apply_background();
+                self.open();
             }
             _ => {}
         }
     }
 
-    /// A click on the transparent shadow margin counts as "outside".
+    /// A click on the transparent margin around the menu counts as "outside".
     fn on_click(&self, lparam: LPARAM) {
         let x = i32::from((lparam.0 & 0xFFFF) as u16 as i16);
         let y = i32::from(((lparam.0 >> 16) & 0xFFFF) as u16 as i16);

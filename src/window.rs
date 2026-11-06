@@ -17,8 +17,9 @@ use windows::core::{Result, w};
 
 use crate::hook;
 
-/// Space around the menu for the drop shadow (DIPs).
-pub const SHADOW_MARGIN: f32 = 32.0;
+/// Space around the menu so the open overshoot (the little bounce past
+/// full size) is never cut off by the window edge (DIPs).
+pub const MARGIN: f32 = 32.0;
 /// Gap between the menu and the taskbar (DIPs).
 const TASKBAR_GAP: f32 = 12.0;
 
@@ -34,7 +35,7 @@ pub enum Edge {
 /// Where and how big the window should be for the next open.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Placement {
-    /// Window rectangle in physical pixels (menu + shadow margin, cut off
+    /// Window rectangle in physical pixels (menu + margin, cut off
     /// where the taskbar starts so the window never covers it).
     pub x: i32,
     pub y: i32,
@@ -53,7 +54,7 @@ pub struct Placement {
 
 impl Placement {
     /// True if a point in window (client) coordinates is on the menu itself
-    /// rather than on the transparent shadow margin around it.
+    /// rather than on the transparent margin around it.
     pub fn menu_contains(&self, x: i32, y: i32) -> bool {
         (self.menu_x..self.menu_x + self.menu_width).contains(&x)
             && (self.menu_y..self.menu_y + self.menu_height).contains(&y)
@@ -80,7 +81,7 @@ pub fn create(wndproc: WNDPROC) -> Result<HWND> {
         // TOOLWINDOW: no taskbar button. TOPMOST: above normal windows.
         let ex_style: WINDOW_EX_STYLE =
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
-        CreateWindowExW(
+        let hwnd = CreateWindowExW(
             ex_style,
             class_name,
             w!("Glint"),
@@ -93,7 +94,29 @@ pub fn create(wndproc: WNDPROC) -> Result<HWND> {
             None,
             Some(instance.into()),
             None,
+        )?;
+        allow_host_backdrop(hwnd);
+        Ok(hwnd)
+    }
+}
+
+/// A plain Win32 window must opt in before DWM fills a HostBackdropBrush
+/// with the blurred view of what's behind it. Without this the "glass" is
+/// just a dark, empty panel.
+fn allow_host_backdrop(hwnd: HWND) {
+    use windows::Win32::Graphics::Dwm::{DWMWA_USE_HOSTBACKDROPBRUSH, DwmSetWindowAttribute};
+    let enable: i32 = 1; // Win32 BOOL
+    // SAFETY: passes a pointer to a local 4-byte BOOL with its exact size.
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_HOSTBACKDROPBRUSH,
+            (&raw const enable).cast(),
+            std::mem::size_of::<i32>() as u32,
         )
+    };
+    if let Err(e) = result {
+        log_warn!("DWMWA_USE_HOSTBACKDROPBRUSH failed (glass will look flat): {e}");
     }
 }
 
@@ -113,18 +136,75 @@ pub fn placement(menu_width: f32, menu_height: f32) -> Placement {
         let _ = GetMonitorInfoW(monitor, &mut info);
         let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
     }
+    let mut work = info.rcWork;
+    if work == info.rcMonitor
+        && let Some((edge, thickness)) = auto_hide_taskbar()
+    {
+        work = reserve_taskbar(work, edge, thickness);
+    }
     compute_placement(
         info.rcMonitor,
-        info.rcWork,
+        work,
         dpi_x as f32 / 96.0,
         menu_width,
         menu_height,
     )
 }
 
+/// With an auto-hiding taskbar, Windows reports a work area that covers the
+/// whole screen. Then we ask where the taskbar is and how thick it is.
+/// Returns None if the taskbar is not set to auto-hide.
+fn auto_hide_taskbar() -> Option<(Edge, i32)> {
+    use windows::Win32::UI::Shell::{
+        ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETSTATE, ABM_GETTASKBARPOS, ABS_AUTOHIDE,
+        APPBARDATA, SHAppBarMessage,
+    };
+    let mut data = APPBARDATA {
+        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `data` is a valid, correctly sized APPBARDATA.
+    let state = unsafe { SHAppBarMessage(ABM_GETSTATE, &mut data) };
+    if state as u32 & ABS_AUTOHIDE == 0 {
+        return None;
+    }
+    // SAFETY: as above. The rect is the taskbar's full size even while it is
+    // slid out of view, so its short side is the thickness.
+    if unsafe { SHAppBarMessage(ABM_GETTASKBARPOS, &mut data) } == 0 {
+        return None;
+    }
+    let r = data.rc;
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    let edge = match data.uEdge {
+        ABE_TOP => Edge::Top,
+        ABE_LEFT => Edge::Left,
+        ABE_RIGHT => Edge::Right,
+        ABE_BOTTOM => Edge::Bottom,
+        _ => Edge::Bottom,
+    };
+    let thickness = if matches!(edge, Edge::Top | Edge::Bottom) {
+        h
+    } else {
+        w
+    };
+    Some((edge, thickness))
+}
+
+/// Shrinks the work area by the taskbar's thickness on its edge.
+fn reserve_taskbar(work: RECT, edge: Edge, thickness: i32) -> RECT {
+    let mut r = work;
+    match edge {
+        Edge::Bottom => r.bottom -= thickness,
+        Edge::Top => r.top += thickness,
+        Edge::Left => r.left += thickness,
+        Edge::Right => r.right -= thickness,
+    }
+    r
+}
+
 fn compute_placement(monitor: RECT, work: RECT, scale: f32, menu_w: f32, menu_h: f32) -> Placement {
     let px = |dip: f32| (dip * scale).round() as i32;
-    let (mw, mh, margin, gap) = (px(menu_w), px(menu_h), px(SHADOW_MARGIN), px(TASKBAR_GAP));
+    let (mw, mh, margin, gap) = (px(menu_w), px(menu_h), px(MARGIN), px(TASKBAR_GAP));
 
     let edge = if work.bottom < monitor.bottom {
         Edge::Bottom
@@ -147,7 +227,7 @@ fn compute_placement(monitor: RECT, work: RECT, scale: f32, menu_w: f32, menu_h:
         Edge::Right => (work.right - gap - mw, work.top + gap),
     };
 
-    // Menu + shadow margin, but never over the taskbar (so taskbar clicks
+    // Menu + margin, but never over the taskbar (so taskbar clicks
     // still work while the menu is open).
     let left = (menu_x - margin).max(work.left);
     let top = (menu_y - margin).max(work.top);
@@ -330,6 +410,17 @@ mod tests {
         assert_eq!(p.width, 540 + 96);
         assert_eq!(p.y + p.menu_y + p.menu_height, 1548 - 18);
         assert_eq!(p.y + p.height, 1548);
+    }
+
+    #[test]
+    fn auto_hide_taskbar_keeps_the_menu_above_it() {
+        // Auto-hide: Windows says the work area is the whole 1920x1200 screen.
+        let m = rect(0, 0, 1920, 1200);
+        let work = reserve_taskbar(m, Edge::Bottom, 48);
+        let p = compute_placement(m, work, 1.0, 360.0, 320.0);
+        assert_eq!(p.edge, Edge::Bottom);
+        assert_eq!(p.y + p.menu_y + p.menu_height, 1200 - 48 - 12);
+        assert_eq!(reserve_taskbar(m, Edge::Left, 60).left, 60);
     }
 
     #[test]

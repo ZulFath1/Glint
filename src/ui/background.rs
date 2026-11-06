@@ -1,8 +1,14 @@
-//! Menu background: solid / acrylic / gradient / acrylic-gradient, with the
+//! Menu background: solid / gradient / glass / glass-gradient, with the
 //! black overlay, the readability (contrast) guard and the fallbacks.
 //!
 //! Layers inside the menu's rounded clip, bottom to top:
-//! backdrop (blur of what is behind the window) → tint or gradient → overlay.
+//! backdrop (blur of what is behind the window) → tint or gradient →
+//! overlay → sheen (glass only) → border / glass rim.
+//!
+//! "Glass" is our take on a liquid-glass look within what Windows offers:
+//! the system's blurred backdrop, a tint whose strength is configurable
+//! (0 = colorless), a bright rim that catches light at the top-left corner,
+//! and a soft sheen fading down from the top edge.
 //!
 //! All brushes are created once and only re-colored afterwards, so switching
 //! modes costs nothing and nothing is redrawn per frame.
@@ -12,22 +18,32 @@ use std::cell::{Cell, RefCell};
 use windows::UI::Color;
 use windows::UI::Composition::{
     CompositionBackdropBrush, CompositionColorBrush, CompositionLinearGradientBrush,
-    CompositionMappingMode, Compositor, ContainerVisual, SpriteVisual,
+    CompositionMappingMode, CompositionRoundedRectangleGeometry, CompositionSpriteShape,
+    Compositor, ContainerVisual, SpriteVisual,
 };
 use windows::core::Result;
 use windows_numerics::Vector2;
 
-use crate::config::{self, BackgroundMode, Rgb};
+use crate::config::{self, Rgb};
 
 /// Primary text color (#f4f4f5) that must stay readable on the background.
 pub const TEXT: Rgb = Rgb::new(0xf4, 0xf4, 0xf5);
 const MIN_CONTRAST: f32 = 4.5;
-/// Alpha of the tint/gradient over the blurred backdrop.
-const GLASS_TINT_ALPHA: f32 = 0.55;
 const GUARD_STEP: f32 = 0.05;
 const GUARD_MAX: f32 = 0.9;
 
-/// The Windows settings that can force acrylic off.
+/// Plain border for the non-glass modes: rgba(255,255,255,0.10), 1 px.
+const BORDER_ALPHA: f32 = 0.10;
+const BORDER_WIDTH: f32 = 1.0;
+/// Glass rim: thicker, with light catching the corners.
+const RIM_WIDTH: f32 = 1.5;
+/// (offset along the top-left → bottom-right diagonal, white alpha)
+const RIM_STOPS: [(f32, f32); 4] = [(0.0, 0.60), (0.3, 0.16), (0.7, 0.06), (1.0, 0.30)];
+/// Sheen: white at the top edge fading out by this fraction of the height.
+const SHEEN_ALPHA: f32 = 0.14;
+const SHEEN_DEPTH: f32 = 0.5;
+
+/// The Windows settings that can force the glass off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SystemEffects {
     /// Settings > Personalization > Colors > Transparency effects.
@@ -45,19 +61,39 @@ pub struct Applied {
 pub struct Background {
     compositor: Compositor,
     size: Vector2,
+    corner_radius: f32,
     backdrop: SpriteVisual,
     tint: SpriteVisual,
+    sheen: SpriteVisual,
     tint_color: CompositionColorBrush,
     gradient: CompositionLinearGradientBrush,
     overlay_color: CompositionColorBrush,
+    border_geometry: CompositionRoundedRectangleGeometry,
+    border: CompositionSpriteShape,
+    border_color: CompositionColorBrush,
+    rim: CompositionLinearGradientBrush,
     /// Created on first use; reused after that.
     host_backdrop: RefCell<Option<CompositionBackdropBrush>>,
     host_backdrop_failed: Cell<bool>,
 }
 
+fn white(alpha: f32) -> Color {
+    Color {
+        A: alpha_byte(alpha),
+        R: 255,
+        G: 255,
+        B: 255,
+    }
+}
+
 impl Background {
-    /// Creates the three layers and adds them to `parent` (bottom to top).
-    pub fn new(compositor: &Compositor, parent: &ContainerVisual, size: Vector2) -> Result<Self> {
+    /// Creates the layers and adds them to `parent` (bottom to top).
+    pub fn new(
+        compositor: &Compositor,
+        parent: &ContainerVisual,
+        size: Vector2,
+        corner_radius: f32,
+    ) -> Result<Self> {
         let layer = || -> Result<SpriteVisual> {
             let v = compositor.CreateSpriteVisual()?;
             v.SetSize(size)?;
@@ -67,6 +103,7 @@ impl Background {
         let backdrop = layer()?;
         let tint = layer()?;
         let overlay = layer()?;
+        let sheen = layer()?;
 
         let tint_color = compositor.CreateColorBrush()?;
         let gradient = compositor.CreateLinearGradientBrush()?;
@@ -74,14 +111,54 @@ impl Background {
         let overlay_color = compositor.CreateColorBrush()?;
         overlay.SetBrush(&overlay_color)?;
 
+        // Sheen: white at the top, fading to nothing.
+        let sheen_brush = compositor.CreateLinearGradientBrush()?;
+        sheen_brush.SetMappingMode(CompositionMappingMode::Absolute)?;
+        sheen_brush.SetStartPoint(Vector2 { X: 0.0, Y: 0.0 })?;
+        sheen_brush.SetEndPoint(Vector2 {
+            X: 0.0,
+            Y: size.Y * SHEEN_DEPTH,
+        })?;
+        let stops = sheen_brush.ColorStops()?;
+        stops.Append(
+            &compositor.CreateColorGradientStopWithOffsetAndColor(0.0, white(SHEEN_ALPHA))?,
+        )?;
+        stops.Append(&compositor.CreateColorGradientStopWithOffsetAndColor(1.0, white(0.0))?)?;
+        sheen.SetBrush(&sheen_brush)?;
+
+        // Border / rim: one rounded stroke whose brush and width change.
+        let rim = compositor.CreateLinearGradientBrush()?;
+        rim.SetMappingMode(CompositionMappingMode::Absolute)?;
+        rim.SetStartPoint(Vector2 { X: 0.0, Y: 0.0 })?;
+        rim.SetEndPoint(size)?;
+        let stops = rim.ColorStops()?;
+        for (offset, alpha) in RIM_STOPS {
+            stops.Append(
+                &compositor.CreateColorGradientStopWithOffsetAndColor(offset, white(alpha))?,
+            )?;
+        }
+        let border_color = compositor.CreateColorBrushWithColor(white(BORDER_ALPHA))?;
+        let border_geometry = compositor.CreateRoundedRectangleGeometry()?;
+        let border = compositor.CreateSpriteShapeWithGeometry(&border_geometry)?;
+        let border_visual = compositor.CreateShapeVisual()?;
+        border_visual.SetSize(size)?;
+        border_visual.Shapes()?.Append(&border)?;
+        parent.Children()?.InsertAtTop(&border_visual)?;
+
         Ok(Self {
             compositor: compositor.clone(),
             size,
+            corner_radius,
             backdrop,
             tint,
+            sheen,
             tint_color,
             gradient,
             overlay_color,
+            border_geometry,
+            border,
+            border_color,
+            rim,
             host_backdrop: RefCell::new(None),
             host_backdrop_failed: Cell::new(false),
         })
@@ -96,13 +173,11 @@ impl Background {
             cfg.mode.uses_backdrop() && effects.transparency && !effects.battery_saver;
         let glass = wants_glass && self.attach_host_backdrop()?;
         self.backdrop.SetIsVisible(glass)?;
+        self.sheen.SetIsVisible(glass)?;
 
-        // Without blur, the tint is drawn fully opaque (the "solid" fallback).
-        let alpha = if glass { GLASS_TINT_ALPHA } else { 1.0 };
-        let use_gradient = matches!(
-            cfg.mode,
-            BackgroundMode::Gradient | BackgroundMode::AcrylicGradient
-        ) && colors.len() > 1;
+        // Without blur, the tint is drawn fully opaque (the solid fallback).
+        let alpha = if glass { cfg.tint } else { 1.0 };
+        let use_gradient = cfg.mode.uses_gradient() && colors.len() > 1;
         if use_gradient {
             let (start, end) = gradient_points(self.size, cfg.angle);
             self.gradient.SetStartPoint(start)?;
@@ -123,9 +198,12 @@ impl Background {
             self.tint.SetBrush(&self.tint_color)?;
         }
 
-        // Readability guard: check only the colors that are actually shown.
-        let shown = if use_gradient {
-            &colors[..]
+        // Readability guard: check the colors that are actually shown.
+        // Colorless glass has no color to check.
+        let shown: &[Rgb] = if glass && cfg.tint < 0.01 {
+            &[]
+        } else if use_gradient {
+            &colors
         } else {
             &colors[..1]
         };
@@ -143,10 +221,33 @@ impl Background {
             B: 0,
         })?;
 
+        if glass {
+            self.set_border(RIM_WIDTH)?;
+            self.border.SetStrokeBrush(&self.rim)?;
+        } else {
+            self.set_border(BORDER_WIDTH)?;
+            self.border.SetStrokeBrush(&self.border_color)?;
+        }
+
         if wants_glass && !glass {
-            log_warn!("acrylic unavailable; using the solid fallback");
+            log_warn!("glass unavailable; using the solid fallback");
         }
         Ok(Applied { glass, overlay })
+    }
+
+    /// Sizes the stroke so it sits fully inside the rounded clip.
+    fn set_border(&self, width: f32) -> Result<()> {
+        let inset = width / 2.0;
+        self.border_geometry
+            .SetOffset(Vector2 { X: inset, Y: inset })?;
+        self.border_geometry.SetSize(Vector2 {
+            X: self.size.X - width,
+            Y: self.size.Y - width,
+        })?;
+        let r = self.corner_radius - inset;
+        self.border_geometry
+            .SetCornerRadius(Vector2 { X: r, Y: r })?;
+        self.border.SetStrokeThickness(width)
     }
 
     /// Puts the HostBackdropBrush on the backdrop layer. Returns false if it
@@ -286,6 +387,11 @@ mod tests {
         }
         // The user's overlay is kept when it is already high enough.
         assert!(close(guard_overlay(&bright, 0.6), 0.6));
+    }
+
+    #[test]
+    fn colorless_glass_keeps_the_user_overlay() {
+        assert!(close(guard_overlay(&[], 0.2), 0.2));
     }
 
     #[test]

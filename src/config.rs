@@ -28,35 +28,46 @@ impl Rgb {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundMode {
     Solid,
-    Acrylic,
     Gradient,
-    AcrylicGradient,
+    /// Frosted glass: blur of what's behind, tinted with the first color.
+    Glass,
+    /// Frosted glass tinted with the gradient.
+    GlassGradient,
 }
 
 impl BackgroundMode {
     pub const ALL: [Self; 4] = [
         Self::Solid,
-        Self::Acrylic,
         Self::Gradient,
-        Self::AcrylicGradient,
+        Self::Glass,
+        Self::GlassGradient,
     ];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Solid => "solid",
-            Self::Acrylic => "acrylic",
             Self::Gradient => "gradient",
-            Self::AcrylicGradient => "acrylic-gradient",
+            Self::Glass => "glass",
+            Self::GlassGradient => "glass-gradient",
         }
     }
 
+    /// Also accepts the older names "acrylic" and "acrylic-gradient".
     pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|m| m.name() == s)
+        match s {
+            "acrylic" => Some(Self::Glass),
+            "acrylic-gradient" => Some(Self::GlassGradient),
+            _ => Self::ALL.into_iter().find(|m| m.name() == s),
+        }
     }
 
     /// True for the modes that blur what is behind the window.
     pub fn uses_backdrop(self) -> bool {
-        matches!(self, Self::Acrylic | Self::AcrylicGradient)
+        matches!(self, Self::Glass | Self::GlassGradient)
+    }
+
+    pub fn uses_gradient(self) -> bool {
+        matches!(self, Self::Gradient | Self::GlassGradient)
     }
 }
 
@@ -134,12 +145,19 @@ pub struct Background {
     pub angle: f32,
     /// Black overlay alpha, 0.0–0.6.
     pub overlay: f32,
+    /// Glass modes: how strongly the color tints the glass.
+    /// 0.0 = colorless glass, 1.0 = no see-through at all.
+    pub tint: f32,
 }
+
+/// Tint strengths offered in the tray menu.
+pub const TINT_STEPS: [f32; 5] = [0.0, 0.2, 0.35, 0.55, 0.8];
 
 impl Default for Background {
     fn default() -> Self {
         Self {
-            mode: BackgroundMode::AcrylicGradient,
+            mode: BackgroundMode::GlassGradient,
+            tint: 0.35,
             preset: Preset::Aurora,
             colors: vec![
                 Rgb::new(0x2b, 0x1a, 0x4a),
@@ -197,7 +215,8 @@ pub struct Config {
 
 impl Config {
     /// Defaults, plus test flags: `--bg <mode>`, `--preset <name>`,
-    /// `--overlay <0..0.6>`, `--angle <deg>`, `--colors "#a,#b,#c"`.
+    /// `--overlay <0..0.6>`, `--tint <0..1>`, `--angle <deg>`,
+    /// `--colors "#a,#b,#c"`.
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Self {
         let mut config = Self::default();
         let mut args = args.into_iter();
@@ -208,6 +227,7 @@ impl Config {
                 "--bg" => bg.mode = BackgroundMode::parse(&value).unwrap_or(bg.mode),
                 "--preset" => bg.preset = Preset::parse(&value).unwrap_or(bg.preset),
                 "--overlay" => bg.overlay = value.parse().unwrap_or(bg.overlay),
+                "--tint" => bg.tint = value.parse().unwrap_or(bg.tint),
                 "--angle" => bg.angle = value.parse().unwrap_or(bg.angle),
                 "--colors" => {
                     bg.colors = value.split(',').filter_map(Rgb::parse).take(3).collect();
@@ -217,6 +237,7 @@ impl Config {
             }
         }
         config.background.overlay = config.background.overlay.clamp(0.0, 0.6);
+        config.background.tint = config.background.tint.clamp(0.0, 1.0);
         config
     }
 }
@@ -241,6 +262,23 @@ mod tests {
         assert_eq!(bg.resolved_colors()[0], Rgb::new(0x2b, 0x1a, 0x4a));
         bg.colors.clear();
         assert_eq!(bg.resolved_colors(), [Rgb::new(0x1e, 0x20, 0x26)]);
+    }
+
+    #[test]
+    fn glass_modes_and_old_names() {
+        assert_eq!(BackgroundMode::parse("glass"), Some(BackgroundMode::Glass));
+        assert_eq!(
+            BackgroundMode::parse("acrylic"),
+            Some(BackgroundMode::Glass)
+        );
+        assert_eq!(
+            BackgroundMode::parse("acrylic-gradient"),
+            Some(BackgroundMode::GlassGradient)
+        );
+        let c = Config::from_args(["--tint", "0", "--bg", "glass"].map(String::from));
+        assert_eq!(c.background.tint, 0.0);
+        let c = Config::from_args(["--tint", "5"].map(String::from));
+        assert_eq!(c.background.tint, 1.0); // clamped
     }
 
     #[test]
