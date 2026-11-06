@@ -1,0 +1,23 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Logs
+*.log
+log.txt
+
+# The owner's real config (never commit)
+config.toml
+
+# Editor / environment
+.vscode/
+.idea/
+.env
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+CLAUDE.mdCLAUDE.md
