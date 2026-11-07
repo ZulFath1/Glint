@@ -40,6 +40,8 @@ const GUARD_MAX: f32 = 0.9;
 /// Plain border for the non-glass modes: rgba(255,255,255,0.10), 1 px.
 const BORDER_ALPHA: f32 = 0.10;
 const BORDER_WIDTH: f32 = 1.0;
+/// High contrast border: thicker, so the menu's edge is easy to see.
+const HC_BORDER_WIDTH: f32 = 2.0;
 /// Glass rim: thicker, with light catching the corners.
 const RIM_WIDTH: f32 = 1.5;
 /// (offset along the top-left → bottom-right diagonal, white alpha)
@@ -54,6 +56,20 @@ pub struct SystemEffects {
     /// Settings > Personalization > Colors > Transparency effects.
     pub transparency: bool,
     pub battery_saver: bool,
+    /// Windows high contrast theme is on: its colors replace ours.
+    pub high_contrast: Option<HighContrast>,
+}
+
+/// The colors of the active Windows high contrast theme
+/// (`GetSysColor`), used instead of the configured background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HighContrast {
+    /// `COLOR_WINDOW`: the menu background.
+    pub window: Rgb,
+    /// `COLOR_WINDOWTEXT`: text and the border.
+    pub text: Rgb,
+    /// `COLOR_HIGHLIGHT`: caret, focus ring, focused search border.
+    pub highlight: Rgb,
 }
 
 /// What `apply` ended up doing (for logging and testing).
@@ -233,6 +249,9 @@ impl Background {
         fade: bool,
     ) -> Result<Applied> {
         *self.last.borrow_mut() = Some((cfg.clone(), effects));
+        if let Some(hc) = effects.high_contrast {
+            return self.apply_high_contrast(hc);
+        }
         let mut colors = cfg.resolved_colors();
         if let Some(album) = self.album.get() {
             colors[0] = album_tint(album, cfg.overlay);
@@ -308,12 +327,31 @@ impl Background {
         } else {
             self.set_border(BORDER_WIDTH)?;
             self.border.SetStrokeBrush(&self.border_color)?;
+            self.border_color.SetColor(white(BORDER_ALPHA))?;
         }
 
         if wants_glass && !glass {
             log_warn!("glass unavailable; using the solid fallback");
         }
         Ok(Applied { glass, overlay })
+    }
+
+    /// High contrast: one flat system color, a full-strength border in the
+    /// text color, no blur, no gradient, no sheen, no overlay.
+    fn apply_high_contrast(&self, hc: HighContrast) -> Result<Applied> {
+        self.backdrop.SetIsVisible(false)?;
+        self.sheen.SetIsVisible(false)?;
+        self.tint_color.StopAnimation(h!("Color"))?;
+        self.tint_color.SetColor(to_color(hc.window, 1.0))?;
+        self.tint.SetBrush(&self.tint_color)?;
+        self.overlay_color.SetColor(Color::default())?;
+        self.set_border(HC_BORDER_WIDTH)?;
+        self.border_color.SetColor(to_color(hc.text, 1.0))?;
+        self.border.SetStrokeBrush(&self.border_color)?;
+        Ok(Applied {
+            glass: false,
+            overlay: 0.0,
+        })
     }
 
     /// The menu changed size: resize every layer. The colors stay.

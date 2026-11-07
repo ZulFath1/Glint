@@ -16,7 +16,7 @@ use windows_numerics::{Vector2, Vector3};
 
 use super::anim::{Animator, POP_FROM_SCALE};
 use super::footer::draw_text;
-use super::gfx::{self, Canvas, Gfx, TEXT_PRIMARY};
+use super::gfx::{self, Canvas, Gfx, text_primary};
 use super::layout::Rect;
 use super::shape::RoundRect;
 use crate::config::Rgb;
@@ -208,7 +208,7 @@ impl ContextMenu {
                     &self.glyph_format,
                     Rect::new(row.x + 6.0, row.y, 24.0, row.h),
                     DWRITE_TEXT_ALIGNMENT_CENTER,
-                    TEXT_PRIMARY,
+                    text_primary(),
                 )?;
                 draw_text(
                     ctx,
@@ -217,7 +217,7 @@ impl ContextMenu {
                     &self.label_format,
                     Rect::new(row.x + 38.0, row.y, row.w - 44.0, row.h),
                     DWRITE_TEXT_ALIGNMENT_LEADING,
-                    TEXT_PRIMARY,
+                    text_primary(),
                 )
             })
         })

@@ -17,6 +17,11 @@
 //! removes low-level hooks that answer too slowly; a thread that only runs
 //! this tiny callback never is. The UI thread can still ask for a reinstall.
 //!
+//! Windows can still drop the hook without telling us (for example after a
+//! very slow moment of the whole PC). We notice it the only way that costs
+//! nothing while idle: if the *stock* Start menu ever comes to the front, our
+//! hook didn't get that Win press, so it is put back right away.
+//!
 //! The decision logic lives in [`WinKeyState`], which has no Windows calls in
 //! it, so it can be unit tested.
 
@@ -31,16 +36,18 @@ use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::System::Threading::{
     GetCurrentThreadId, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput, VIRTUAL_KEY, VK_LWIN, VK_RWIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HC_ACTION, HHOOK,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, PM_NOREMOVE, PeekMessageW, PostMessageW,
-    PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_APP, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_QUIT,
-    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_USER, WM_XBUTTONDOWN,
+    CallNextHookEx, EVENT_SYSTEM_FOREGROUND, GetForegroundWindow, GetMessageW,
+    GetWindowThreadProcessId, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, OBJID_WINDOW,
+    PM_NOREMOVE, PeekMessageW, PostMessageW, PostThreadMessageW, SetWindowsHookExW,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEHWHEEL,
+    WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_USER, WM_XBUTTONDOWN,
 };
 
 /// Marks input that Glint injected itself ("GLNT" in ASCII).
@@ -51,6 +58,10 @@ pub const WM_APP_TOGGLE: u32 = WM_APP + 1;
 
 /// Hook-thread messages.
 const WM_HOOK_REINSTALL: u32 = WM_APP + 50;
+
+/// A hook callback slower than this is logged: Windows drops hooks that
+/// answer too slowly (`LowLevelHooksTimeout`), so we want to know early.
+const SLOW_CALLBACK_MS: u128 = 50;
 
 const VK_L: u16 = 0x4C;
 
@@ -312,6 +323,7 @@ fn hook_thread_main(target: isize, ready: mpsc::Sender<windows::core::Result<u32
     CTX.with(|c| c.target.set(target));
 
     let installed = install_keyboard_hook();
+    let foreground_watch = watch_foreground();
     // SAFETY: GetCurrentThreadId has no preconditions.
     let thread_id = unsafe { GetCurrentThreadId() };
     let ok = installed.is_ok();
@@ -340,6 +352,65 @@ fn hook_thread_main(target: isize, ready: mpsc::Sender<windows::core::Result<u32
 
     remove_mouse_hook();
     remove_keyboard_hook();
+    if let Some(hook) = foreground_watch {
+        // SAFETY: the handle came from SetWinEventHook on this thread.
+        let _ = unsafe { UnhookWinEvent(hook) };
+    }
+}
+
+/// Asks Windows to tell this thread whenever another window comes to the
+/// front (see the module notes). Out-of-context: Windows queues the event to
+/// this thread's message loop, so nothing runs inside other processes.
+fn watch_foreground() -> Option<HWINEVENTHOOK> {
+    // SAFETY: the callback is a plain function in this binary.
+    let hook = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            Some(foreground_changed),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        )
+    };
+    if hook.is_invalid() {
+        log_warn!("can't watch the foreground window (hook loss won't be noticed)");
+        return None;
+    }
+    Some(hook)
+}
+
+/// Another window came to the front. The stock Start menu means the Win
+/// key got past us: put the keyboard hook back. (Harmless if the user
+/// clicked the real Start button, or an admin window was in front, which we
+/// pass through on purpose.)
+extern "system" fn foreground_changed(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    object: i32,
+    _child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if object != OBJID_WINDOW.0 || hwnd.is_invalid() {
+        return;
+    }
+    // The cheap test first; the process name only for likely candidates.
+    if crate::window::class_name(hwnd) != "Windows.UI.Core.CoreWindow" {
+        return;
+    }
+    if !crate::window::process_name(hwnd).eq_ignore_ascii_case("StartMenuExperienceHost.exe") {
+        return;
+    }
+    log_warn!(
+        "the Windows Start menu opened; reinstalling the keyboard hook in case it was dropped"
+    );
+    remove_keyboard_hook();
+    if let Err(e) = install_keyboard_hook() {
+        log_error!("keyboard hook reinstall failed: {e}");
+    }
 }
 
 fn install_keyboard_hook() -> windows::core::Result<()> {
@@ -385,6 +456,16 @@ fn remove_mouse_hook() {
 }
 
 extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let started = std::time::Instant::now();
+    let result = keyboard_event(code, wparam, lparam);
+    let took = started.elapsed().as_millis();
+    if took > SLOW_CALLBACK_MS {
+        log_warn!("keyboard hook callback took {took} ms (Windows drops slow hooks)");
+    }
+    result
+}
+
+fn keyboard_event(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         // SAFETY: for HC_ACTION, lparam points to a KBDLLHOOKSTRUCT that is
         // valid for the duration of this call (WH_KEYBOARD_LL contract).
@@ -720,5 +801,83 @@ mod tests {
         assert_eq!(run(&[(E, true, 0), (E, false, 50)]), [Pass, Pass]);
         // A stray Win up (we never saw the down) passes.
         assert_eq!(run(&[(LWIN, false, 0)]), [Pass]);
+    }
+
+    /// Win + one key, tapped: the key is replayed with Win, the rest passes,
+    /// and the menu does not toggle.
+    fn assert_plain_combo(key: u16) {
+        assert_eq!(
+            run(&[
+                (LWIN, true, 0),
+                (key, true, 60),
+                (key, false, 100),
+                (LWIN, false, 140)
+            ]),
+            [Swallow, ReplayWithWin { win_vk: LWIN }, Pass, Pass],
+            "Win + vk {key:#x}"
+        );
+    }
+
+    #[test]
+    fn common_win_shortcuts_never_toggle() {
+        const D: u16 = 0x44;
+        const V: u16 = 0x56;
+        const TAB: u16 = 0x09;
+        const LEFT: u16 = 0x25;
+        const UP: u16 = 0x26;
+        const RIGHT: u16 = 0x27;
+        const DOWN: u16 = 0x28;
+        const PERIOD: u16 = 0xBE;
+        for key in [E, D, V, TAB, LEFT, UP, RIGHT, DOWN, PERIOD, RWIN] {
+            assert_plain_combo(key);
+        }
+    }
+
+    #[test]
+    fn win_arrows_held_and_repeated_go_to_windows() {
+        // Win+Left held: Left auto-repeats, Win+Up after it. Everything after
+        // the first key passes, so window snapping works normally.
+        const LEFT: u16 = 0x25;
+        const UP: u16 = 0x26;
+        let out = run(&[
+            (LWIN, true, 0),
+            (LEFT, true, 50),
+            (LEFT, true, 550),
+            (LEFT, true, 583),
+            (LEFT, false, 600),
+            (UP, true, 700),
+            (UP, false, 750),
+            (LWIN, false, 800),
+        ]);
+        assert_eq!(out[1], ReplayWithWin { win_vk: LWIN });
+        assert!(out[2..].iter().all(|d| *d == Pass), "{out:?}");
+    }
+
+    #[test]
+    fn ten_second_hold_alone_still_toggles() {
+        let mut events = vec![(LWIN, true, 0)];
+        for t in (500..10_000).step_by(33) {
+            events.push((LWIN, true, t));
+        }
+        events.push((LWIN, false, 10_020));
+        let out = run(&events);
+        assert!(out[..out.len() - 1].iter().all(|d| *d == Swallow));
+        assert_eq!(*out.last().unwrap(), Toggle);
+    }
+
+    #[test]
+    fn win_held_then_mouse_wheel_does_not_toggle() {
+        let mut s = WinKeyState::default();
+        assert_eq!(s.on_key(LWIN, true, 0, false, || false), Swallow);
+        assert!(
+            s.watching_mouse(),
+            "the mouse hook is needed while Win is held"
+        );
+        s.on_mouse();
+        assert_eq!(s.on_key(LWIN, false, 400, false, || false), Swallow);
+        assert!(!s.watching_mouse(), "and removed again afterwards");
+        // The next tap works normally.
+        assert_eq!(s.on_key(LWIN, true, 900, false, || false), Swallow);
+        assert_eq!(s.on_key(LWIN, false, 950, false, || false), Toggle);
     }
 }

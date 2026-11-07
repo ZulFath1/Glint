@@ -15,7 +15,7 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::core::{Interface, Result};
 use windows_numerics::{Vector2, Vector3};
 
-use super::gfx::{self, Canvas, Gfx, TEXT_PRIMARY};
+use super::gfx::{self, Canvas, Gfx, text_primary};
 use super::layout::{CELL, Rect};
 use crate::apps::App;
 use crate::icons::IconCache;
@@ -216,7 +216,7 @@ impl Grid {
                 true,
             )?;
             cell.canvas.draw(gfx, |ctx| {
-                let brush = gfx::brush(ctx, TEXT_PRIMARY, 1.0)?;
+                let brush = gfx::brush(ctx, text_primary(), 1.0)?;
                 gfx::with_glow(ctx, |ctx| {
                     let left = (CELL - ICON) / 2.0;
                     let dest = gfx::d2d_rect(Rect::new(left, ICON_TOP, ICON, ICON));

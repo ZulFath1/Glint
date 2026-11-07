@@ -31,7 +31,7 @@ use windows::Win32::UI::Input::Ime::{
 use windows::core::{Interface, Result};
 use windows_numerics::{Vector2, Vector3};
 
-use super::gfx::{self, Canvas, Gfx, TEXT_PRIMARY, TEXT_SECONDARY};
+use super::gfx::{self, Canvas, Gfx, text_primary, text_secondary};
 use super::layout::Rect;
 use super::shape::RoundRect;
 use crate::config::Rgb;
@@ -88,8 +88,7 @@ fn utf16_len(s: &str) -> u32 {
 }
 
 impl Editor {
-    /// The typed text (the search in milestone 4 filters apps with it).
-    #[allow(dead_code)]
+    /// The typed text (what search filters the apps with).
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -539,7 +538,7 @@ impl SearchBox {
                 DWRITE_TEXT_ALIGNMENT_LEADING,
                 false,
             )?;
-            let brush = gfx::brush(ctx, TEXT_SECONDARY, 0.9)?;
+            let brush = gfx::brush(ctx, text_secondary(), 0.9)?;
             // SAFETY: draws a live text layout with a live brush.
             unsafe { ctx.DrawTextLayout(Vector2::zero(), &layout, &brush, gfx::TEXT_OPTIONS) };
             Ok(())
@@ -605,9 +604,9 @@ impl SearchBox {
                 unsafe { ctx.FillRectangle(&gfx::d2d_rect(r), &brush) };
             }
             let (color, alpha) = if empty {
-                (TEXT_SECONDARY, 0.75)
+                (text_secondary(), 0.75)
             } else {
-                (TEXT_PRIMARY, 1.0)
+                (text_primary(), 1.0)
             };
             let brush = gfx::brush(ctx, color, alpha)?;
             gfx::with_glow(ctx, |ctx| {

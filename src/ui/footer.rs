@@ -27,7 +27,7 @@ use windows::core::{HSTRING, Interface, PWSTR, Result};
 use windows_numerics::{Vector2, Vector3};
 
 use super::anim::{Animator, Kind, POP_FROM_SCALE};
-use super::gfx::{self, Canvas, Gfx, TEXT_PRIMARY, TEXT_SECONDARY};
+use super::gfx::{self, Canvas, Gfx, text_primary, text_secondary};
 use super::layout::{self, AVATAR, Layout, POWER_BUTTON, Rect};
 use super::shape::RoundRect;
 use crate::config::Rgb;
@@ -321,7 +321,7 @@ impl Footer {
                 &self.avatar_glyph_format,
                 Rect::new(0.0, 0.0, AVATAR, AVATAR),
                 DWRITE_TEXT_ALIGNMENT_CENTER,
-                TEXT_PRIMARY,
+                text_primary(),
             )
         })?;
 
@@ -338,7 +338,7 @@ impl Footer {
         unsafe { layout.GetMetrics(&mut m)? };
         self.name_width.set(m.width.min(name_size.X));
         self.name.draw(gfx, |ctx| {
-            let brush = gfx::brush(ctx, TEXT_PRIMARY, 1.0)?;
+            let brush = gfx::brush(ctx, text_primary(), 1.0)?;
             gfx::with_glow(ctx, |ctx| {
                 // SAFETY: draws a live text layout with a live brush.
                 unsafe { ctx.DrawTextLayout(Vector2::zero(), &layout, &brush, gfx::TEXT_OPTIONS) };
@@ -355,7 +355,7 @@ impl Footer {
                     &self.glyph_format,
                     Rect::new(0.0, 0.0, POWER_BUTTON, POWER_BUTTON),
                     DWRITE_TEXT_ALIGNMENT_CENTER,
-                    TEXT_PRIMARY,
+                    text_primary(),
                 )
             })
         })
@@ -515,7 +515,7 @@ impl PowerStrip {
                     &self.question_format,
                     Rect::new(16.0, 0.0, cancel.x - 24.0, r.h),
                     DWRITE_TEXT_ALIGNMENT_LEADING,
-                    TEXT_PRIMARY,
+                    text_primary(),
                 )?;
                 for (b, fill, alpha, label) in [
                     (cancel, Rgb::new(255, 255, 255), 0.10, "Cancel"),
@@ -540,7 +540,7 @@ impl PowerStrip {
                         &self.label_format,
                         b,
                         DWRITE_TEXT_ALIGNMENT_CENTER,
-                        TEXT_PRIMARY,
+                        text_primary(),
                     )?;
                 }
                 Ok(())
@@ -556,7 +556,7 @@ impl PowerStrip {
                         &self.glyph_format,
                         glyph,
                         DWRITE_TEXT_ALIGNMENT_CENTER,
-                        TEXT_PRIMARY,
+                        text_primary(),
                     )?;
                     draw_text(
                         ctx,
@@ -565,7 +565,7 @@ impl PowerStrip {
                         &self.label_format,
                         label,
                         DWRITE_TEXT_ALIGNMENT_CENTER,
-                        TEXT_SECONDARY,
+                        text_secondary(),
                     )?;
                 }
                 Ok(())

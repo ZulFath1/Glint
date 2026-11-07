@@ -149,6 +149,11 @@ pub fn placement(menu_width: f32, menu_height: f32) -> Placement {
         let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
     }
     let mut work = info.rcWork;
+    if let Some(edge) = fake_taskbar() {
+        // `--taskbar-edge`: pretend a 48 px taskbar sits on that edge.
+        let thickness = (48.0 * dpi_x as f32 / 96.0).round() as i32;
+        work = reserve_taskbar(info.rcMonitor, edge, thickness);
+    }
     if work == info.rcMonitor
         && let Some((edge, thickness)) = auto_hide_taskbar()
     {
@@ -161,6 +166,37 @@ pub fn placement(menu_width: f32, menu_height: f32) -> Placement {
         menu_width,
         menu_height,
     )
+}
+
+/// Debug flag `--taskbar-edge top|left|right|bottom`: 0 = off, else the
+/// edge + 1. Windows 11 only puts the taskbar at the bottom, so this lets the
+/// other edges be seen without a taskbar mod.
+static FAKE_EDGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const EDGES: [Edge; 4] = [Edge::Bottom, Edge::Top, Edge::Left, Edge::Right];
+
+pub fn set_fake_taskbar(edge: Edge) {
+    let i = EDGES.iter().position(|e| *e == edge).unwrap_or(0) as u8;
+    FAKE_EDGE.store(i + 1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn fake_taskbar() -> Option<Edge> {
+    match FAKE_EDGE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => EDGES.get(usize::from(n - 1)).copied(),
+    }
+}
+
+impl Edge {
+    /// "bottom" / "top" / "left" / "right" (for `--taskbar-edge`).
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "bottom" => Some(Self::Bottom),
+            "top" => Some(Self::Top),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
 }
 
 /// With an auto-hiding taskbar, Windows reports a work area that covers the
@@ -468,5 +504,56 @@ mod tests {
             compute_placement(m, rect(0, 0, 1860, 1080), 1.0, 360.0, 320.0).edge,
             Edge::Right
         );
+    }
+
+    /// Every edge at every common scale: the window stays inside the work
+    /// area (never over the taskbar), and the menu keeps the 12 DIP gap on
+    /// the taskbar's side.
+    #[test]
+    fn every_edge_and_scale_stays_off_the_taskbar() {
+        for scale in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            let px = |dip: f32| (dip * scale).round() as i32;
+            let m = rect(0, 0, px(1920.0), px(1080.0));
+            let bar = px(48.0);
+            for edge in [Edge::Bottom, Edge::Top, Edge::Left, Edge::Right] {
+                let work = reserve_taskbar(m, edge, bar);
+                let p = compute_placement(m, work, scale, 360.0, 420.0);
+                assert_eq!(p.edge, edge, "{edge:?} at {scale}");
+                assert!(p.x >= work.left && p.y >= work.top, "{edge:?} at {scale}");
+                assert!(p.x + p.width <= work.right, "{edge:?} at {scale}");
+                assert!(p.y + p.height <= work.bottom, "{edge:?} at {scale}");
+                let (mx, my) = (p.x + p.menu_x, p.y + p.menu_y);
+                let gap = px(12.0);
+                match edge {
+                    Edge::Bottom => assert_eq!(work.bottom - (my + p.menu_height), gap),
+                    Edge::Top => assert_eq!(my - work.top, gap),
+                    Edge::Left => assert_eq!(mx - work.left, gap),
+                    Edge::Right => assert_eq!(work.right - (mx + p.menu_width), gap),
+                }
+                assert_eq!(p.menu_width, px(360.0));
+                assert_eq!(p.menu_height, px(420.0));
+            }
+        }
+    }
+
+    #[test]
+    fn second_monitor_left_of_the_main_one() {
+        // A 125% monitor placed left of the main screen has negative x.
+        let m = rect(-2400, 0, 0, 1350);
+        let work = rect(-2400, 0, 0, 1290);
+        let p = compute_placement(m, work, 1.25, 360.0, 320.0);
+        assert_eq!(p.edge, Edge::Bottom);
+        assert_eq!(p.x + p.width / 2, -1200);
+        assert!(p.x >= -2400 && p.x + p.width <= 0);
+        assert_eq!(p.y + p.menu_y + p.menu_height, 1290 - 15);
+    }
+
+    #[test]
+    fn taskbar_edge_names() {
+        assert_eq!(Edge::parse("Top"), Some(Edge::Top));
+        assert_eq!(Edge::parse("left"), Some(Edge::Left));
+        assert_eq!(Edge::parse("RIGHT"), Some(Edge::Right));
+        assert_eq!(Edge::parse("bottom"), Some(Edge::Bottom));
+        assert_eq!(Edge::parse("middle"), None);
     }
 }

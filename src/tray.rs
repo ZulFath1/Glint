@@ -9,8 +9,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, IDI_APPLICATION, LoadIconW,
-    MF_SEPARATOR, MF_STRING, PostMessageW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_NULL,
+    MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW, SetForegroundWindow,
+    TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_NULL,
 };
 use windows::core::{Result, w};
 
@@ -21,11 +21,17 @@ const ICON_ID: u32 = 1;
 const CMD_QUIT: usize = 1;
 const CMD_OPEN_CONFIG: usize = 2;
 const CMD_RELOAD_CONFIG: usize = 3;
+const CMD_AUTOSTART: usize = 4;
+const CMD_GPU_RESET: usize = 5;
 
 pub enum TrayCommand {
     Quit,
     OpenConfig,
     ReloadConfig,
+    /// "Start with Windows" was clicked (flip it).
+    ToggleAutostart,
+    /// Debug item (Shift + right-click only): pretend the GPU was reset.
+    SimulateGpuReset,
 }
 
 pub struct Tray {
@@ -92,7 +98,9 @@ impl Tray {
     }
 
     /// Shows the right-click menu at the cursor and returns the chosen item.
-    pub fn show_menu(&self) -> Option<TrayCommand> {
+    /// `autostart` puts a check mark on "Start with Windows"; `debug` adds
+    /// the hidden test items.
+    pub fn show_menu(&self, autostart: bool, debug: bool) -> Option<TrayCommand> {
         // SAFETY: creates, shows and destroys a menu owned by this function.
         // The labels are static strings. The SetForegroundWindow / WM_NULL
         // dance is the documented way to make tray menus close when the user
@@ -101,6 +109,22 @@ impl Tray {
             let menu = CreatePopupMenu().ok()?;
             let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_CONFIG, w!("Open config file"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_RELOAD_CONFIG, w!("Reload config"));
+            let check = if autostart { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING | check,
+                CMD_AUTOSTART,
+                w!("Start with Windows"),
+            );
+            if debug {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    CMD_GPU_RESET,
+                    w!("Debug: simulate GPU reset"),
+                );
+            }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit Glint"));
 
@@ -122,6 +146,8 @@ impl Tray {
                 CMD_QUIT => Some(TrayCommand::Quit),
                 CMD_OPEN_CONFIG => Some(TrayCommand::OpenConfig),
                 CMD_RELOAD_CONFIG => Some(TrayCommand::ReloadConfig),
+                CMD_AUTOSTART => Some(TrayCommand::ToggleAutostart),
+                CMD_GPU_RESET => Some(TrayCommand::SimulateGpuReset),
                 _ => None,
             }
         }

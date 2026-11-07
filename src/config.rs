@@ -495,6 +495,8 @@ pub struct Config {
     /// The grid never gets wider than this many columns.
     #[serde(deserialize_with = "columns")]
     pub max_columns: usize,
+    /// Start Glint when you sign in to Windows (the HKCU `Run` key).
+    pub autostart: bool,
     pub background: Background,
     pub music: Music,
     pub animation: Animation,
@@ -508,6 +510,7 @@ impl Default for Config {
             accent: Accent::Color(DEFAULT_ACCENT),
             hotkey: None,
             max_columns: 4,
+            autostart: false,
             background: Background::default(),
             music: Music::default(),
             animation: Animation::default(),
@@ -638,6 +641,10 @@ hotkey = ""
 
 # The pinned grid is never wider than this many icons (1 to 8).
 max_columns = 4
+
+# Start Glint when you sign in to Windows. You can also switch this with
+# "Start with Windows" in the tray icon's menu.
+autostart = false
 
 [background]
 # "solid", "gradient", "glass" (frosted glass) or "glass-gradient".
@@ -843,6 +850,18 @@ fn remove_keeping_comment(array: &mut Array, i: usize) {
             let own = array.trailing().as_str().unwrap_or("").to_string();
             array.set_trailing(format!("{line_end}{}", rest_after_line(&own)));
         }
+    }
+}
+
+/// Sets `autostart = on`, keeping the line's comments. Added (after the
+/// other top-level settings) if the file doesn't have it yet.
+pub fn set_autostart(doc: &mut DocumentMut, on: bool) {
+    if let Some(value) = doc.get_mut("autostart").and_then(Item::as_value_mut) {
+        let decor = value.decor().clone();
+        *value = Value::from(on);
+        *value.decor_mut() = decor;
+    } else {
+        doc.insert("autostart", toml_edit::value(on));
     }
 }
 
@@ -1065,5 +1084,27 @@ mod tests {
             set_launch_counts(&mut doc, &counts);
             assert_eq!(parse(&doc.to_string()).unwrap().stats.launch_counts, counts);
         }
+    }
+
+    #[test]
+    fn editing_autostart() {
+        // The template has the line: only the value changes, comments stay.
+        let text = default_text(&pins(&["a"]));
+        let mut doc: DocumentMut = text.parse().unwrap();
+        set_autostart(&mut doc, true);
+        let out = doc.to_string();
+        assert!(out.contains("autostart = true\n"), "{out}");
+        assert!(out.contains("# Start Glint when you sign in"), "{out}");
+        assert!(parse(&out).unwrap().autostart);
+        assert_eq!(out.replace("autostart = true", "autostart = false"), text);
+
+        // An older file without the line: it is added and still parses.
+        let mut doc: DocumentMut = "accent = \"system\"\n\n[music]\nenabled = true\n"
+            .parse()
+            .unwrap();
+        set_autostart(&mut doc, true);
+        let c = parse(&doc.to_string()).unwrap();
+        assert!(c.autostart && c.music.enabled);
+        assert!(!parse("").unwrap().autostart, "off by default");
     }
 }

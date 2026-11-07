@@ -273,6 +273,8 @@ pub struct Ui {
     seek_drag: Cell<bool>,
     /// The last "Playing from" lookup: (AUMID, app name, app icon).
     source_cache: RefCell<Option<(String, String, Option<ID2D1Bitmap1>)>>,
+    /// The high contrast text color in use (None = high contrast is off).
+    high_contrast: Cell<Option<Rgb>>,
 }
 
 fn white(alpha: f32) -> windows::UI::Color {
@@ -412,6 +414,7 @@ impl Ui {
             swallow_space: Cell::new(false),
             seek_drag: Cell::new(false),
             source_cache: RefCell::new(None),
+            high_contrast: Cell::new(None),
         };
         ui.refresh()?;
         Ok(ui)
@@ -494,8 +497,35 @@ impl Ui {
     /// bitmap useless. Paint it all again.
     pub fn device_replaced(&self) -> Result<()> {
         self.icons.clear();
-        self.source_cache.borrow_mut().take();
+        self.refetch_source_icon();
         self.refresh()
+    }
+
+    /// The music card keeps the playing app's icon as a GPU bitmap. After a
+    /// device reset it belongs to the dead device (drawing it would fail),
+    /// and after a DPI change it has the wrong size: fetch it again.
+    fn refetch_source_icon(&self) {
+        self.source_cache.borrow_mut().take();
+        let icon = self
+            .music
+            .view()
+            .and_then(|v| self.source_app(&v.source_id).1);
+        self.music.set_source_icon(icon);
+    }
+
+    /// The menu is hidden: let Direct2D free its scratch textures.
+    pub fn release_caches(&self) {
+        self.gfx.release_caches();
+    }
+
+    /// Before opening: make sure the GPU device survived while hidden.
+    pub fn ensure_device(&self) {
+        self.gfx.ensure_device();
+    }
+
+    /// Debug (tray, Shift + right-click; and `--stress`): a fake GPU reset.
+    pub fn simulate_device_loss(&self) {
+        self.gfx.simulate_device_loss();
     }
 
     /// The album cover's size in pixels at the current DPI.
@@ -509,6 +539,8 @@ impl Ui {
         if (p.scale - self.gfx.scale()).abs() > 0.001 {
             log_info!("DPI scale {} -> {}: repainting", self.gfx.scale(), p.scale);
             self.gfx.set_scale(p.scale);
+            self.icons.clear();
+            self.refetch_source_icon();
             self.refresh()?;
         }
         self.root.SetScale(Vector3 {
@@ -520,6 +552,12 @@ impl Ui {
     }
 
     pub fn apply_background(&self, config: &Config, effects: SystemEffects) -> Result<Applied> {
+        let text = effects.high_contrast.map(|hc| hc.text);
+        if self.high_contrast.replace(text) != text {
+            // Every text color changes: repaint all surfaces.
+            gfx::set_high_contrast_text(text);
+            self.refresh()?;
+        }
         self.shell.background.apply(&config.background, effects)
     }
 

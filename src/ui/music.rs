@@ -37,7 +37,7 @@ use windows::core::{Interface, Result, h};
 use windows_numerics::{Vector2, Vector3};
 
 use super::anim::{Kind, ms};
-use super::gfx::{self, Canvas, Gfx, TEXT_PRIMARY, TEXT_SECONDARY};
+use super::gfx::{self, Canvas, Gfx, text_primary, text_secondary};
 use super::layout::{self, COVER, CardParts, Layout, Music, Rect, THUMB, TRACK_HEIGHT};
 use super::shape::RoundRect;
 use crate::config::Rgb;
@@ -230,7 +230,7 @@ impl MusicCard {
             Y: THUMB / 2.0,
         })?;
         let dot_shape = c.CreateSpriteShapeWithGeometry(&dot)?;
-        dot_shape.SetFillBrush(&c.CreateColorBrushWithColor(gfx::color(TEXT_PRIMARY, 1.0))?)?;
+        dot_shape.SetFillBrush(&c.CreateColorBrushWithColor(gfx::color(text_primary(), 1.0))?)?;
         let thumb = c.CreateShapeVisual()?;
         thumb.SetSize(Vector2 { X: THUMB, Y: THUMB })?;
         thumb.Shapes()?.Append(&dot_shape)?;
@@ -428,6 +428,12 @@ impl MusicCard {
         self.repaint(gfx)
     }
 
+    /// A freshly fetched source app icon (after a GPU reset or DPI change).
+    /// Painted with the next repaint.
+    pub fn set_source_icon(&self, icon: Option<ID2D1Bitmap1>) {
+        *self.source_icon.borrow_mut() = icon;
+    }
+
     pub fn view(&self) -> Option<MusicView> {
         self.view.borrow().clone()
     }
@@ -523,7 +529,7 @@ impl MusicCard {
                     &self.title_format,
                     p.title,
                     lead,
-                    (TEXT_PRIMARY, 1.0),
+                    (text_primary(), 1.0),
                 )?;
                 draw_text(
                     ctx,
@@ -532,7 +538,7 @@ impl MusicCard {
                     &self.artist_format,
                     p.artist,
                     lead,
-                    (TEXT_SECONDARY, 1.0),
+                    (text_secondary(), 1.0),
                 )?;
                 let play = if painted.playing {
                     PAUSE_GLYPH
@@ -553,7 +559,7 @@ impl MusicCard {
                         format,
                         p.buttons[i],
                         center,
-                        (TEXT_PRIMARY, alpha),
+                        (text_primary(), alpha),
                     )?;
                 }
                 if painted.sources {
@@ -587,7 +593,7 @@ impl MusicCard {
                         &self.artist_format,
                         text,
                         lead,
-                        (TEXT_SECONDARY, 1.0),
+                        (text_secondary(), 1.0),
                     )?;
                     draw_text(
                         ctx,
@@ -596,7 +602,7 @@ impl MusicCard {
                         &self.pill_format,
                         p.pill,
                         center,
-                        (TEXT_PRIMARY, 1.0),
+                        (text_primary(), 1.0),
                     )?;
                 }
                 Ok(())
@@ -639,7 +645,7 @@ impl MusicCard {
                 &self.big_glyph,
                 full,
                 DWRITE_TEXT_ALIGNMENT_CENTER,
-                (TEXT_SECONDARY, 1.0),
+                (text_secondary(), 1.0),
             )
         })
     }
@@ -695,7 +701,7 @@ impl MusicCard {
                     &self.time_format,
                     Rect::new(0.0, 0.0, size.X, size.Y),
                     align,
-                    (TEXT_SECONDARY, 1.0),
+                    (text_secondary(), 1.0),
                 )
             })
         })

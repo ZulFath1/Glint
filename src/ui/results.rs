@@ -20,7 +20,7 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::core::{Interface, Result, h};
 use windows_numerics::Vector2;
 
-use super::gfx::{self, Canvas, Gfx, TEXT_PRIMARY, TEXT_SECONDARY};
+use super::gfx::{self, Canvas, Gfx, text_primary, text_secondary};
 use super::layout::{Layout, MAX_RESULTS, ROW_HEIGHT, Rect};
 use super::shape::RoundRect;
 use crate::config::Rgb;
@@ -145,7 +145,7 @@ impl Results {
         self.message.draw(gfx, |ctx| {
             let layout =
                 gfx.text_layout(NO_RESULTS, format, size, DWRITE_TEXT_ALIGNMENT_CENTER, true)?;
-            let brush = gfx::brush(ctx, TEXT_SECONDARY, 1.0)?;
+            let brush = gfx::brush(ctx, text_secondary(), 1.0)?;
             gfx::with_glow(ctx, |ctx| {
                 // SAFETY: draws a live text layout with a live brush.
                 unsafe { ctx.DrawTextLayout(Vector2::zero(), &layout, &brush, gfx::TEXT_OPTIONS) };
@@ -221,7 +221,7 @@ impl Results {
             true,
         )?;
         row.draw(gfx, |ctx| {
-            let brush = gfx::brush(ctx, TEXT_PRIMARY, 1.0)?;
+            let brush = gfx::brush(ctx, text_primary(), 1.0)?;
             gfx::with_glow(ctx, |ctx| {
                 let top = (ROW_HEIGHT - ICON) / 2.0;
                 let dest = gfx::d2d_rect(Rect::new(ICON_LEFT, top, ICON, ICON));

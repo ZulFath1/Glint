@@ -22,7 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{DEVICE_NOTIFY_WINDOW_HANDLE, PostM
 use windows::core::Result;
 
 use crate::config::Rgb;
-use crate::ui::background::SystemEffects;
+use crate::ui::background::{HighContrast, SystemEffects};
 
 /// Posted to the UI window when transparency or battery saver changed.
 pub const WM_APP_SETTINGS_CHANGED: u32 = WM_APP + 3;
@@ -98,6 +98,7 @@ impl SettingsWatch {
         SystemEffects {
             transparency: self.ui_settings.AdvancedEffectsEnabled().unwrap_or(true),
             battery_saver: battery_saver_on(),
+            high_contrast: high_contrast(),
         }
     }
 
@@ -116,6 +117,46 @@ impl SettingsWatch {
             .ok()
             .map(|c| Rgb::new(c.R, c.G, c.B))
     }
+}
+
+/// The high contrast theme's colors, if high contrast is on. Windows sends
+/// WM_SETTINGCHANGE when it is switched, and we read it again then.
+pub fn high_contrast() -> Option<HighContrast> {
+    use windows::Win32::Graphics::Gdi::{
+        COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
+    };
+    use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETHIGHCONTRAST, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+
+    let mut hc = HIGHCONTRASTW {
+        cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `hc` is a valid, correctly sized HIGHCONTRASTW out-parameter.
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            hc.cbSize,
+            Some(std::ptr::from_mut(&mut hc).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if ok.is_err() || !hc.dwFlags.contains(HCF_HIGHCONTRASTON) {
+        return None;
+    }
+    // GetSysColor gives 0x00BBGGRR.
+    let sys = |index| {
+        // SAFETY: no pointers; any index is allowed.
+        let c = unsafe { GetSysColor(index) };
+        Rgb::new(c as u8, (c >> 8) as u8, (c >> 16) as u8)
+    };
+    Some(HighContrast {
+        window: sys(COLOR_WINDOW),
+        text: sys(COLOR_WINDOWTEXT),
+        highlight: sys(COLOR_HIGHLIGHT),
+    })
 }
 
 /// The last "effective power mode" Windows reported (-1 = not known yet).

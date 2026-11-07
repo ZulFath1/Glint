@@ -11,6 +11,7 @@
 #[macro_use]
 mod log;
 mod apps;
+mod autostart;
 mod config;
 mod config_watch;
 mod hook;
@@ -19,6 +20,7 @@ mod media;
 mod power;
 mod search;
 mod settings_watch;
+mod stress;
 mod tray;
 mod ui;
 mod window;
@@ -51,7 +53,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::Ime::ISC_SHOWUICOMPOSITIONWINDOW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, TME_LEAVE,
-    TRACKMOUSEEVENT, TrackMouseEvent, UnregisterHotKey, VK_CONTROL, VK_SHIFT,
+    TRACKMOUSEEVENT, TrackMouseEvent, UnregisterHotKey, VK_CONTROL, VK_ESCAPE, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -59,7 +61,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_IBEAM, KillTimer, LoadCursorW, MSG, PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE,
     PostMessageW, PostQuitMessage, RegisterWindowMessageW, SC_KEYMENU, SW_SHOWNORMAL, SetCursor,
     SetTimer, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE,
-    WM_CONTEXTMENU, WM_DPICHANGED, WM_ENDSESSION, WM_HOTKEY, WM_IME_COMPOSITION,
+    WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_HOTKEY, WM_IME_COMPOSITION,
     WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_POWERBROADCAST, WM_RBUTTONDOWN, WM_RBUTTONUP,
     WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WM_WTSSESSION_CHANGE,
@@ -136,6 +138,10 @@ struct App {
     hotkey_on: Cell<bool>,
     /// The accent color in use (resolved, also for `accent = "system"`).
     accent: Cell<Rgb>,
+    /// `--stress N` is running (the leak test).
+    stress: Option<stress::Stress>,
+    /// Trim memory once the menu is hidden again (after a GPU reset).
+    trim_after_close: Cell<bool>,
 }
 
 /// WM_TIMER id: an app was installed or removed; wait until things settle.
@@ -156,6 +162,10 @@ const HOTKEY_ID: i32 = 1;
 
 /// The accent color to draw with.
 fn resolve_accent(config: &Config, settings: &SettingsWatch) -> Rgb {
+    // High contrast: the theme's highlight color, whatever the config says.
+    if let Some(hc) = settings_watch::high_contrast() {
+        return hc.highlight;
+    }
     match config.accent {
         Accent::Color(c) => c,
         Accent::System => settings.accent().unwrap_or(config::DEFAULT_ACCENT),
@@ -257,6 +267,8 @@ impl App {
         self.generation.set(self.generation.get() + 1);
         let fresh = !self.is_visible.get();
         if fresh {
+            // A GPU reset while hidden is noticed here, before painting.
+            self.ui.ensure_device();
             // Fully hidden: empty search and the grid back, then pick the
             // monitor and position fresh. (If we are interrupting a close,
             // stay where we are and just reverse.)
@@ -279,7 +291,9 @@ impl App {
             "open animation",
             self.ui.animate_open(fresh, self.reduced_motion()),
         );
-        if !window::take_focus(self.hwnd) {
+        // The stress test types through the UI directly and never takes the
+        // keyboard away from whatever you are doing meanwhile.
+        if self.stress.is_none() && !window::take_focus(self.hwnd) {
             // SAFETY: posts a plain message (no pointers) to our window.
             let _ =
                 unsafe { PostMessageW(Some(self.hwnd), WM_APP_FOCUS_RETRY, WPARAM(0), LPARAM(0)) };
@@ -358,6 +372,9 @@ impl App {
     /// Shows the current music state on the card (`[music] enabled =
     /// false`: never).
     fn push_music(&self) {
+        if self.stress.is_some() {
+            return; // the stress test shows its own made-up songs
+        }
         let enabled = self.config.borrow().music.enabled;
         let view = if enabled { self.media.view() } else { None };
         log_err("music card", self.ui.set_music(view));
@@ -439,6 +456,10 @@ impl App {
         if old.pinned != new.pinned || old.max_columns != new.max_columns {
             changed.push("pins");
             self.apply_pins();
+        }
+        if old.autostart != new.autostart {
+            changed.push("autostart");
+            autostart::sync(new.autostart);
         }
         if old.hotkey != new.hotkey {
             changed.push("hotkey");
@@ -525,6 +546,27 @@ impl App {
         log_info!("{} {id}", if pin { "pinned" } else { "unpinned" });
         self.config.borrow_mut().pinned = pins;
         self.apply_pins();
+    }
+
+    /// The tray's "Start with Windows": saved to config.toml first (so the
+    /// file stays the one place the setting lives), then the registry.
+    fn set_autostart(&self, on: bool) {
+        if let Some(path) = &self.config_path
+            && let Err(e) = config::edit(path, |doc| config::set_autostart(doc, on))
+        {
+            log_error!("saving autostart failed: config.toml {e}");
+            self.tray.notify(
+                "Start with Windows didn't change",
+                &format!(
+                    "config.toml {e}
+Fix the file, then try again."
+                ),
+                true,
+            );
+            return;
+        }
+        self.config.borrow_mut().autostart = on;
+        autostart::sync(on);
     }
 
     /// Writes the launch counts to `[stats]` in config.toml, if any are new.
@@ -618,6 +660,15 @@ impl App {
             // the first rescan without this.
             trim_memory();
         }
+        // The leak test starts once search has the app list.
+        if let Some(s) = &self.stress
+            && s.begin()
+        {
+            // SAFETY: posts a plain message (no pointers) to our window.
+            let _ = unsafe {
+                PostMessageW(Some(self.hwnd), stress::WM_APP_STRESS, WPARAM(0), LPARAM(0))
+            };
+        }
     }
 
     /// The shell says something changed in the Start menu folders: wait for
@@ -642,6 +693,7 @@ impl App {
                 self.reload_config(false);
             }
             TIMER_SAVE_STATS => self.save_stats(),
+            stress::TIMER_STRESS => self.stress_close(),
             ui::TIMER_ICONS => self.ui.load_icons(),
             ui::TIMER_SEEK => log_err("music time", self.ui.music_tick()),
             _ => {}
@@ -715,6 +767,21 @@ impl App {
         self.close_batch.borrow_mut().take();
         self.is_visible.set(false);
         window::hide(self.hwnd);
+        self.ui.release_caches();
+        if self.trim_after_close.replace(false) {
+            trim_memory();
+        }
+        if let Some(s) = &self.stress {
+            if s.after_cycle() {
+                // SAFETY: posts WM_QUIT to this (the UI) thread.
+                unsafe { PostQuitMessage(0) };
+            } else {
+                // SAFETY: posts a plain message (no pointers) to our window.
+                let _ = unsafe {
+                    PostMessageW(Some(self.hwnd), stress::WM_APP_STRESS, WPARAM(0), LPARAM(0))
+                };
+            }
+        }
     }
 
     /// Re-place the open menu, e.g. after a DPI change.
@@ -746,7 +813,11 @@ impl App {
                     applied.overlay,
                     if effects.transparency { "on" } else { "off" },
                     if effects.battery_saver { "on" } else { "off" },
-                );
+                ) + if effects.high_contrast.is_some() {
+                    "; HIGH CONTRAST"
+                } else {
+                    ""
+                };
                 // Only log real changes (WM_SETTINGCHANGE can be chatty).
                 if *self.last_background_log.borrow() != line {
                     log_info!("{line}");
@@ -755,6 +826,69 @@ impl App {
             }
             Err(e) => log_error!("applying the background failed: {e}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // `--stress N` (the leak test; see stress.rs)
+    // -----------------------------------------------------------------------
+
+    /// A cycle starts: change what this cycle changes, then open.
+    fn stress_open(&self) {
+        let Some(s) = &self.stress else {
+            return;
+        };
+        let (n, plan) = s.next();
+
+        // Background mode: on the menu only (config.toml is never written).
+        let mut look = self.config.borrow().clone();
+        look.background.mode = plan.background;
+        let applied = self.ui.apply_background(&look, self.settings.effects());
+        log_err("stress: background", applied.map(|_| ()));
+
+        // Pins: take the last one away, 25 cycles later put it back.
+        if let Some(back) = plan.pin {
+            let mut parked = s.parked_pin.borrow_mut();
+            let changed = {
+                let mut config = self.config.borrow_mut();
+                if back {
+                    parked.take().map(|p| config.pinned.push(p)).is_some()
+                } else if config.pinned.len() > 1 {
+                    *parked = config.pinned.pop();
+                    true
+                } else {
+                    false
+                }
+            };
+            drop(parked);
+            if changed {
+                self.apply_pins();
+            }
+        }
+        if plan.reload_config {
+            self.reload_config(false);
+        }
+        if plan.device_loss {
+            self.ui.simulate_device_loss();
+        }
+        let song = plan.music.then(|| stress::fake_song(n, plan.two_sources));
+        log_err("stress: music card", self.ui.set_music(song));
+
+        self.open();
+        // Let the open animation play fully, like a real open.
+        let wait = self.config.borrow().animation.open_ms + 60;
+        // SAFETY: a one-shot timer on our own window (killed when it fires).
+        unsafe { SetTimer(Some(self.hwnd), stress::TIMER_STRESS, wait, None) };
+    }
+
+    /// The menu is open: type a search, clear it with Esc, close.
+    fn stress_close(&self) {
+        // SAFETY: stops our own one-shot timer.
+        let _ = unsafe { KillTimer(Some(self.hwnd), stress::TIMER_STRESS) };
+        for unit in "no".encode_utf16() {
+            log_err("stress: typing", self.ui.char_typed(unit));
+        }
+        self.run(self.ui.key_down(VK_ESCAPE.0, false, false));
+        self.close();
     }
 
     fn on_tray(&self, event: u32) {
@@ -767,7 +901,9 @@ impl App {
             }
             WM_RBUTTONUP => {
                 self.close();
-                match self.tray.show_menu() {
+                let debug = key_held(VK_SHIFT);
+                let autostart = self.config.borrow().autostart;
+                match self.tray.show_menu(autostart, debug) {
                     Some(TrayCommand::Quit) => {
                         self.save_stats();
                         // SAFETY: posts WM_QUIT to this (the UI) thread.
@@ -778,6 +914,8 @@ impl App {
                         None => log_warn!("no config file (APPDATA is not set)"),
                     },
                     Some(TrayCommand::ReloadConfig) => self.reload_config(true),
+                    Some(TrayCommand::ToggleAutostart) => self.set_autostart(!autostart),
+                    Some(TrayCommand::SimulateGpuReset) => self.ui.simulate_device_loss(),
                     None => {}
                 }
             }
@@ -804,6 +942,9 @@ impl App {
     /// Another window was activated: close. If that happens right after we
     /// opened, the user didn't do it, so log who took the focus.
     fn on_deactivate(&self, lparam: LPARAM) {
+        if self.stress.is_some() {
+            return; // the stress test closes the menu itself
+        }
         let open_for = now_ms().saturating_sub(self.opened_at.get());
         if self.is_open.get() && open_for < 1500 {
             let other = HWND(lparam.0 as *mut _);
@@ -823,6 +964,10 @@ impl App {
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if let Some(app) = app() {
         match msg {
+            stress::WM_APP_STRESS => {
+                app.stress_open();
+                return LRESULT(0);
+            }
             WM_APP_TOGGLE => {
                 app.toggle();
                 return LRESULT(0);
@@ -962,6 +1107,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_APP_REDRAW => {
                 log_warn!("graphics device replaced; repainting");
                 log_err("repaint", app.ui.device_replaced());
+                // The new device's driver memory is all in RAM (measured in
+                // milestone 7: +10 MB working set after the first reset, and
+                // nothing more on later ones). Hand it back, like at startup;
+                // not while the menu shows (that would only page it back in).
+                if app.is_visible.get() {
+                    app.trim_after_close.set(true);
+                } else {
+                    trim_memory();
+                }
                 return LRESULT(0);
             }
             // Alt+F4 must hide the menu, never destroy the window.
@@ -974,11 +1128,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 app.reposition();
                 return LRESULT(0);
             }
+            // A monitor was plugged in or out, or a resolution changed: the
+            // open menu may now sit in the wrong place (or off-screen). Close
+            // it; the next open picks the monitor and size fresh. The GPU may
+            // have changed too.
+            WM_DISPLAYCHANGE => {
+                log_info!("display configuration changed");
+                app.close();
+                app.ui.ensure_device();
+                return LRESULT(0);
+            }
             WM_WTSSESSION_CHANGE if wparam.0 as u32 == WTS_SESSION_UNLOCK => {
                 app.hook.reinstall(true)
             }
             WM_POWERBROADCAST => match wparam.0 as u32 {
-                PBT_APMRESUMEAUTOMATIC => app.hook.reinstall(true),
+                PBT_APMRESUMEAUTOMATIC => {
+                    app.hook.reinstall(true);
+                    app.ui.ensure_device();
+                }
                 PBT_POWERSETTINGCHANGE => app.apply_background(), // battery saver
                 _ => {}
             },
@@ -1004,6 +1171,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 /// 21 MB right after startup, but an open/close cycle afterwards needs only
 /// about 5 MB. Handing the rest back to Windows keeps idle RAM low.
 /// The same after each app scan (see `App::on_apps_loaded`).
+/// And after a GPU device reset (see `WM_APP_REDRAW`).
 /// (Not done after every close: that would only make each open fault the
 /// same 5 MB back in.)
 fn trim_memory() {
@@ -1037,7 +1205,40 @@ fn create_dispatcher_queue() -> Result<DispatcherQueueController> {
     unsafe { CreateDispatcherQueueController(options) }
 }
 
+/// Command-line flags (all for testing; a normal start has none).
+#[derive(Default)]
+struct Args {
+    /// `--stress N` / `--stress-gpu N`: the leak tests (bool = GPU resets).
+    stress: Option<(u32, bool)>,
+    /// `--taskbar-edge top|left|right|bottom`: pretend the taskbar is there.
+    taskbar_edge: Option<window::Edge>,
+}
+
+fn parse_args() -> Args {
+    let mut args = Args::default();
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--stress" | "--stress-gpu" => match it.next().and_then(|n| n.parse().ok()) {
+                Some(n) => args.stress = Some((n, arg == "--stress-gpu")),
+                None => log_warn!("{arg} needs a number, like {arg} 1000"),
+            },
+            "--taskbar-edge" => match it.next().as_deref().and_then(window::Edge::parse) {
+                Some(edge) => args.taskbar_edge = Some(edge),
+                None => log_warn!("--taskbar-edge needs top, left, right or bottom"),
+            },
+            other => log_warn!("unknown argument {other:?} (ignored)"),
+        }
+    }
+    args
+}
+
 fn run() -> Result<()> {
+    let args = parse_args();
+    if let Some(edge) = args.taskbar_edge {
+        log_info!("pretending the taskbar is on the {edge:?} edge");
+        window::set_fake_taskbar(edge);
+    }
     let Some(_instance) = single_instance()? else {
         log_info!("Glint is already running; exiting");
         return Ok(());
@@ -1109,9 +1310,17 @@ fn run() -> Result<()> {
         stats_dirty: Cell::new(false),
         hotkey_on: Cell::new(false),
         accent: Cell::new(accent),
+        stress: args.stress.map(|(n, gpu)| stress::Stress::new(n, gpu)),
+        trim_after_close: Cell::new(false),
     });
     app.apply_background();
     app.register_hotkey();
+    // Also fixes the Run value if the exe was moved since it was written.
+    // Not with a broken file: its stand-in defaults say "off", which would
+    // wrongly remove a Run value the user turned on.
+    if config_problem.is_none() {
+        autostart::sync(app.config.borrow().autostart);
+    }
     if let Some(e) = &config_problem {
         app.config_error(e, true);
     }

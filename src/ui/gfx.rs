@@ -5,8 +5,8 @@
 //! bitmaps) and DirectWrite (text). We paint each one once, and again only
 //! when its content changes (typing, a DPI change). Motion never repaints.
 //!
-//! One D3D11 device, one D2D device and one `CompositionGraphicsDevice` serve
-//! the whole app. Surfaces are sized in physical pixels for the current DPI
+//! One D3D11 device (WARP, the software renderer; see `create_devices`), one
+//! D2D device and one `CompositionGraphicsDevice` serve the whole app. Surfaces are sized in physical pixels for the current DPI
 //! scale, and we draw into them in DIPs (D2D does the scaling), so text
 //! stays sharp at 125–200%.
 
@@ -69,8 +69,35 @@ pub const WM_APP_REDRAW: u32 = WM_APP + 5;
 pub const TEXT_OPTIONS: D2D1_DRAW_TEXT_OPTIONS = D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT;
 
 /// Text colors (CLAUDE.md section 5).
-pub const TEXT_PRIMARY: Rgb = Rgb::new(0xf4, 0xf4, 0xf5);
-pub const TEXT_SECONDARY: Rgb = Rgb::new(0xd4, 0xd4, 0xd8);
+const TEXT_PRIMARY: Rgb = Rgb::new(0xf4, 0xf4, 0xf5);
+const TEXT_SECONDARY: Rgb = Rgb::new(0xd4, 0xd4, 0xd8);
+
+thread_local! {
+    /// Windows high contrast is on: all text in this color, and no glow.
+    /// (Only the UI thread paints, so a per-thread value is enough.)
+    static HIGH_CONTRAST_TEXT: Cell<Option<Rgb>> = const { Cell::new(None) };
+}
+
+/// Switches every text color to the high contrast one (`Some`), or back to
+/// ours. Surfaces have to be repainted afterwards.
+pub fn set_high_contrast_text(text: Option<Rgb>) {
+    HIGH_CONTRAST_TEXT.with(|c| c.set(text));
+}
+
+fn high_contrast_text() -> Option<Rgb> {
+    HIGH_CONTRAST_TEXT.with(Cell::get)
+}
+
+/// Main text: names, titles, labels.
+pub fn text_primary() -> Rgb {
+    high_contrast_text().unwrap_or(TEXT_PRIMARY)
+}
+
+/// Quieter text: artist, times, placeholder. In high contrast, all text
+/// uses the one system text color.
+pub fn text_secondary() -> Rgb {
+    high_contrast_text().unwrap_or(TEXT_SECONDARY)
+}
 
 const TEXT_FONT: windows::core::PCWSTR = w!("Segoe UI Variable Text");
 const ICON_FONT: windows::core::PCWSTR = w!("Segoe Fluent Icons");
@@ -120,6 +147,8 @@ pub fn snap(dip: f32, scale: f32) -> f32 {
 }
 
 struct Devices {
+    /// Kept to ask "is the GPU still there?" (`GetDeviceRemovedReason`).
+    d3d: ID3D11Device,
     d2d: ID2D1Device,
     /// A device context that is never drawn into; it creates bitmaps that
     /// every surface (all on the same D2D device) can then draw.
@@ -145,10 +174,18 @@ fn create_devices(factory: &ID2D1Factory1) -> Result<Devices> {
         }
         .and_then(|()| device.ok_or_else(Error::empty))
     };
-    // The GPU; WARP (the CPU) only if there is no usable GPU driver.
-    let d3d = create(D3D_DRIVER_TYPE_HARDWARE).or_else(|e| {
-        log_warn!("no hardware D3D11 device ({e}); using WARP");
-        create(D3D_DRIVER_TYPE_WARP)
+    // WARP: Windows' own software renderer, on purpose. We only *paint*
+    // small pictures, rarely (typing, a song change, a DPI change); all
+    // motion is DWM's, on the GPU, either way. A GPU device would load the
+    // graphics driver into Glint. Measured in milestone 7 on an NVIDIA
+    // laptop: WARP = 44 MB less private memory, 44 fewer threads (the
+    // driver's), 3x less idle CPU (driver threads waking up), no 2-handle
+    // leak per device reset (a driver bug), and a driver update can't take
+    // the device away. Painting the whole menu: 14.9 ms vs 13.8 ms.
+    // The GPU only if WARP is missing (it never should be).
+    let d3d = create(D3D_DRIVER_TYPE_WARP).or_else(|e| {
+        log_warn!("no WARP device ({e}); using the GPU");
+        create(D3D_DRIVER_TYPE_HARDWARE)
     })?;
     let dxgi: IDXGIDevice = d3d.cast()?;
     // SAFETY: plain COM calls on live interfaces.
@@ -156,6 +193,7 @@ fn create_devices(factory: &ID2D1Factory1) -> Result<Devices> {
         let d2d = factory.CreateDevice(&dxgi)?;
         let resources = d2d.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
         Ok(Devices {
+            d3d,
             d2d: d2d.cast()?,
             resources,
         })
@@ -298,6 +336,42 @@ impl Gfx {
             return;
         }
         log_warn!("graphics device lost ({e}); recreating it");
+        self.recreate_devices();
+    }
+
+    /// Direct2D keeps scratch GPU textures (for the glow effect, text) in a
+    /// cache it only empties when asked. Measured in milestone 7: without
+    /// this, private bytes crept up about 1.4 MB per 1,000 open/close cycles.
+    /// Called when the menu is hidden, so nothing is repainted meanwhile.
+    pub fn release_caches(&self) {
+        // SAFETY: a plain call on the live device; 0 ms = everything unused now.
+        unsafe { self.devices.borrow().d2d.ClearResources(0) };
+    }
+
+    /// Checks that the GPU device still works (a driver update, a GPU reset,
+    /// sleep or remote desktop can take it away while the menu is hidden),
+    /// and makes a new one if not. Cheap: one call, no drawing. Run before
+    /// opening, so a lost device is noticed before anything is painted.
+    pub fn ensure_device(&self) {
+        // SAFETY: a plain query on a live device.
+        let reason = unsafe { self.devices.borrow().d3d.GetDeviceRemovedReason() };
+        if let Err(e) = reason {
+            log_warn!("graphics device was removed ({e}); recreating it");
+            self.recreate_devices();
+        }
+    }
+
+    /// Debug: runs exactly what a real device loss runs (new D3D and D2D
+    /// devices, handed to the compositor, which then fires
+    /// `RenderingDeviceReplaced`), without needing a real GPU reset.
+    pub fn simulate_device_loss(&self) {
+        log_warn!("simulating a graphics device loss");
+        self.recreate_devices();
+    }
+
+    /// Makes new devices and hands them to the compositor. The old ones are
+    /// dropped (released) when replaced.
+    fn recreate_devices(&self) {
         match create_devices(&self.factory) {
             Ok(devices) => {
                 let swapped = self
@@ -469,6 +543,10 @@ pub fn with_glow(
     ctx: &ID2D1DeviceContext,
     paint: impl FnOnce(&ID2D1DeviceContext) -> Result<()>,
 ) -> Result<()> {
+    // High contrast: crisp text only (the glow is decoration).
+    if high_contrast_text().is_some() {
+        return paint(ctx);
+    }
     // SAFETY: plain COM calls on the live device context. The original target
     // and transform are put back before anything else is drawn.
     unsafe {
