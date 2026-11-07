@@ -3,11 +3,13 @@
 
 use windows::UI::Color;
 use windows::UI::Composition::{
-    CompositionColorBrush, CompositionRoundedRectangleGeometry, Compositor, ShapeVisual,
+    CompositionColorBrush, CompositionObject, CompositionRoundedRectangleGeometry, Compositor,
+    ShapeVisual,
 };
-use windows::core::Result;
+use windows::core::{Interface, Result};
 use windows_numerics::{Vector2, Vector3};
 
+use super::anim::Kind;
 use super::layout::Rect;
 
 pub struct RoundRect {
@@ -79,5 +81,14 @@ impl RoundRect {
 
     pub fn show(&self, visible: bool) -> Result<()> {
         self.visual.SetIsVisible(visible)
+    }
+
+    /// The visual and its shape, for the layout animation (so a size change
+    /// glides).
+    pub fn motion_objects(&self) -> Result<Vec<(CompositionObject, Kind)>> {
+        Ok(vec![
+            (self.visual.cast()?, Kind::Visual),
+            (self.geometry.cast()?, Kind::Geometry),
+        ])
     }
 }

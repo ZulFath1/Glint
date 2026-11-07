@@ -18,6 +18,12 @@ features = [
   "Foundation",
   "Graphics",
   "Graphics_DirectX",
+  # Milestone 5: the music card (the media sessions behind the volume
+  # flyout) and reading album covers from their streams.
+  "Media",
+  "Media_Control",
+  "Storage",
+  "Storage_Streams",
   "System",
   "UI",
   "UI_Composition",

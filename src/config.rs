@@ -148,7 +148,15 @@ pub struct Background {
     /// Glass modes: how strongly the color tints the glass.
     /// 0.0 = colorless glass, 1.0 = no see-through at all.
     pub tint: f32,
+    /// While music shows, replace the first color with the album cover's
+    /// color (darkened for readability).
+    pub tint_from_album: bool,
 }
+
+/// The album tint is off by default (CLAUDE.md section 10). Until the config
+/// file arrives (milestone 6), flip this to `true` to try it, or start Glint
+/// with `--album-tint on`.
+pub const TINT_FROM_ALBUM: bool = false;
 
 /// Tint strengths offered in the tray menu.
 pub const TINT_STEPS: [f32; 5] = [0.0, 0.2, 0.35, 0.55, 0.8];
@@ -166,6 +174,7 @@ impl Default for Background {
             ],
             angle: 135.0,
             overlay: 0.2,
+            tint_from_album: TINT_FROM_ALBUM,
         }
     }
 }
@@ -247,7 +256,7 @@ impl Default for Config {
 impl Config {
     /// Defaults, plus test flags: `--bg <mode>`, `--preset <name>`,
     /// `--overlay <0..0.6>`, `--tint <0..1>`, `--angle <deg>`,
-    /// `--colors "#a,#b,#c"`, `--pins <count>`.
+    /// `--colors "#a,#b,#c"`, `--pins <count>`, `--album-tint on|off`.
     ///
     /// `--pins N` keeps the first N default pins, so you can see the menu
     /// size follow the pin count. Above 6 it repeats them (test only).
@@ -272,6 +281,9 @@ impl Config {
                 "--overlay" => bg.overlay = value.parse().unwrap_or(bg.overlay),
                 "--tint" => bg.tint = value.parse().unwrap_or(bg.tint),
                 "--angle" => bg.angle = value.parse().unwrap_or(bg.angle),
+                "--album-tint" => {
+                    bg.tint_from_album = matches!(value.as_str(), "on" | "true" | "1")
+                }
                 "--colors" => {
                     bg.colors = value.split(',').filter_map(Rgb::parse).take(3).collect();
                     bg.preset = Preset::Custom;
@@ -331,6 +343,9 @@ mod tests {
         assert_eq!(c.background.mode, BackgroundMode::Solid);
         assert_eq!(c.background.preset, Preset::Ocean);
         assert_eq!(c.background.overlay, 0.6); // clamped
+        assert!(!Config::default().background.tint_from_album);
+        let c = Config::from_args(["--album-tint", "on"].map(String::from));
+        assert!(c.background.tint_from_album);
     }
 
     #[test]

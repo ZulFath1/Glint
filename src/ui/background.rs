@@ -17,14 +17,18 @@ use std::cell::{Cell, RefCell};
 
 use windows::UI::Color;
 use windows::UI::Composition::{
-    CompositionBackdropBrush, CompositionColorBrush, CompositionLinearGradientBrush,
-    CompositionMappingMode, CompositionObject, CompositionRoundedRectangleGeometry,
-    CompositionSpriteShape, Compositor, ContainerVisual, ShapeVisual, SpriteVisual,
+    CompositionBackdropBrush, CompositionColorBrush, CompositionColorSpace,
+    CompositionLinearGradientBrush, CompositionMappingMode, CompositionObject,
+    CompositionRoundedRectangleGeometry, CompositionSpriteShape, Compositor, ContainerVisual,
+    ShapeVisual, SpriteVisual,
 };
-use windows::core::{Interface, Result};
+use windows::core::{Interface, Result, h};
 use windows_numerics::Vector2;
 
-use super::anim::Kind;
+use super::anim::{Kind, ms};
+
+/// The album tint cross-fades this long.
+const ALBUM_FADE_MS: u32 = 400;
 use crate::config::{self, Rgb};
 
 /// Primary text color (#f4f4f5) that must stay readable on the background.
@@ -81,6 +85,10 @@ pub struct Background {
     /// Created on first use; reused after that.
     host_backdrop: RefCell<Option<CompositionBackdropBrush>>,
     host_backdrop_failed: Cell<bool>,
+    /// The album tint: the cover's color, replacing the first color.
+    album: Cell<Option<Rgb>>,
+    /// The last settings applied, to apply them again with a new album color.
+    last: RefCell<Option<(config::Background, SystemEffects)>>,
 }
 
 fn white(alpha: f32) -> Color {
@@ -172,13 +180,63 @@ impl Background {
             rim,
             host_backdrop: RefCell::new(None),
             host_backdrop_failed: Cell::new(false),
+            album: Cell::new(None),
+            last: RefCell::new(None),
         })
     }
 
     /// Applies the background settings. Safe to call again at any time
     /// (settings changed, transparency toggled, battery saver...).
     pub fn apply(&self, cfg: &config::Background, effects: SystemEffects) -> Result<Applied> {
-        let colors = cfg.resolved_colors();
+        self.apply_with(cfg, effects, false)
+    }
+
+    /// The album tint (CLAUDE.md section 6): `Some(cover color)` replaces
+    /// the first color with a darkened version of it, `None` goes back to
+    /// the normal colors. The change cross-fades over 400 ms.
+    pub fn set_album_color(&self, color: Option<Rgb>) -> Result<()> {
+        if self.album.replace(color) == color {
+            return Ok(());
+        }
+        let last = self.last.borrow().clone();
+        match last {
+            Some((cfg, effects)) => self.apply_with(&cfg, effects, true).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
+    /// Sets a brush's or gradient stop's `Color`: at once, or (`fade`)
+    /// cross-fading from the current color.
+    fn set_color(
+        &self,
+        target: &CompositionObject,
+        to: Color,
+        fade: bool,
+        set: impl FnOnce(Color) -> Result<()>,
+    ) -> Result<()> {
+        if fade {
+            let a = self.compositor.CreateColorKeyFrameAnimation()?;
+            a.SetInterpolationColorSpace(CompositionColorSpace::Rgb)?;
+            a.InsertExpressionKeyFrame(0.0, h!("this.StartingValue"))?;
+            a.InsertKeyFrame(1.0, to)?;
+            a.SetDuration(ms(ALBUM_FADE_MS))?;
+            return target.StartAnimation(h!("Color"), &a);
+        }
+        target.StopAnimation(h!("Color"))?;
+        set(to)
+    }
+
+    fn apply_with(
+        &self,
+        cfg: &config::Background,
+        effects: SystemEffects,
+        fade: bool,
+    ) -> Result<Applied> {
+        *self.last.borrow_mut() = Some((cfg.clone(), effects));
+        let mut colors = cfg.resolved_colors();
+        if let Some(album) = self.album.get() {
+            colors[0] = album_tint(album, cfg.overlay);
+        }
 
         let wants_glass =
             cfg.mode.uses_backdrop() && effects.transparency && !effects.battery_saver;
@@ -194,19 +252,30 @@ impl Background {
             let (start, end) = gradient_points(self.size.get(), cfg.angle);
             self.gradient.SetStartPoint(start)?;
             self.gradient.SetEndPoint(end)?;
+            // The stops are reused (so the first one can cross-fade);
+            // only a different number of colors makes new ones.
             let stops = self.gradient.ColorStops()?;
-            stops.Clear()?;
+            if stops.Size()? as usize != colors.len() {
+                stops.Clear()?;
+                for _ in &colors {
+                    stops.Append(&self.compositor.CreateColorGradientStop()?)?;
+                }
+            }
             let last = (colors.len() - 1) as f32;
             for (i, &c) in colors.iter().enumerate() {
-                let stop = self.compositor.CreateColorGradientStopWithOffsetAndColor(
-                    i as f32 / last,
-                    to_color(c, alpha),
-                )?;
-                stops.Append(&stop)?;
+                let stop = stops.GetAt(i as u32)?;
+                stop.SetOffset(i as f32 / last)?;
+                let fade_this = fade && i == 0;
+                self.set_color(&stop.cast()?, to_color(c, alpha), fade_this, |c| {
+                    stop.SetColor(c)
+                })?;
             }
             self.tint.SetBrush(&self.gradient)?;
         } else {
-            self.tint_color.SetColor(to_color(colors[0], alpha))?;
+            let brush = &self.tint_color;
+            self.set_color(&brush.cast()?, to_color(colors[0], alpha), fade, |c| {
+                brush.SetColor(c)
+            })?;
             self.tint.SetBrush(&self.tint_color)?;
         }
 
@@ -385,6 +454,15 @@ pub fn darken(c: Rgb, alpha: f32) -> Rgb {
     Rgb::new(f(c.r), f(c.g), f(c.b))
 }
 
+/// The album color made dark enough: darkened in 5% steps until `TEXT` has
+/// 4.5:1 contrast on it (with the user's overlay on top).
+pub fn album_tint(c: Rgb, overlay: f32) -> Rgb {
+    (0..=20)
+        .map(|step| darken(c, step as f32 * GUARD_STEP))
+        .find(|&candidate| contrast(TEXT, darken(candidate, overlay)) >= MIN_CONTRAST)
+        .unwrap_or(Rgb::new(0, 0, 0))
+}
+
 /// Raises the overlay in 0.05 steps until `TEXT` has 4.5:1 contrast on every
 /// color. Never returns less than the user's overlay.
 pub fn guard_overlay(colors: &[Rgb], user_overlay: f32) -> f32 {
@@ -440,6 +518,22 @@ mod tests {
         }
         // The user's overlay is kept when it is already high enough.
         assert!(close(guard_overlay(&bright, 0.6), 0.6));
+    }
+
+    #[test]
+    fn album_colors_are_darkened_until_text_is_readable() {
+        // A bright yellow cover gets much darker...
+        let yellow = Rgb::new(0xf5, 0xd0, 0x20);
+        let tint = album_tint(yellow, 0.2);
+        assert!(contrast(TEXT, darken(tint, 0.2)) >= MIN_CONTRAST);
+        assert!(luminance(tint) < luminance(yellow));
+        // ...and keeps its hue (red stays the biggest channel).
+        assert!(tint.r >= tint.b);
+        // A dark cover color is used as it is.
+        let navy = Rgb::new(0x10, 0x20, 0x50);
+        assert_eq!(album_tint(navy, 0.2), navy);
+        // So the readability guard never has to step in for it.
+        assert!(close(guard_overlay(&[tint], 0.2), 0.2));
     }
 
     #[test]

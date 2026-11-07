@@ -46,6 +46,25 @@ const STRIP_ABOVE_FOOTER: f32 = 8.0;
 pub const STRIP_PAD: f32 = 4.0;
 pub const STRIP_BUTTONS: usize = 4;
 
+/// The music card: 12 from the menu's sides and 12 above the footer.
+const CARD_MARGIN: f32 = 12.0;
+/// Padding inside the card: 10 top/bottom, 12 left/right.
+const CARD_PAD_Y: f32 = 10.0;
+const CARD_PAD_X: f32 = 12.0;
+pub const COVER: f32 = 44.0;
+const CARD_ROW_GAP: f32 = 8.0;
+/// Row 2: elapsed time, seek bar, total time.
+const SEEK_ROW: f32 = 16.0;
+const TIME_WIDTH: f32 = 40.0;
+pub const TRACK_HEIGHT: f32 = 4.0;
+pub const THUMB: f32 = 12.0;
+/// Row 3 ("Playing from …" + the "Switch source" pill), only with 2+ sources.
+const SOURCE_ROW: f32 = 26.0;
+const PILL_WIDTH: f32 = 104.0;
+/// Previous / Play-Pause / Next: hit targets of 36 × 44.
+pub const MEDIA_BUTTON_W: f32 = 36.0;
+const MEDIA_BUTTONS_RIGHT: f32 = 6.0;
+
 /// A rectangle in DIPs.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Rect {
@@ -89,9 +108,117 @@ pub enum Content {
     List(usize),
 }
 
+/// Whether the music card shows, and how tall it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Music {
+    Hidden,
+    /// Cover, title, buttons and the seek bar.
+    Card,
+    /// The same plus "Playing from …" and "Switch source" (2+ sources).
+    CardWithSources,
+}
+
+/// The parts of the music card, relative to the card's top-left corner.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CardParts {
+    pub cover: Rect,
+    /// Title on top, artist below; both end in "…" when too long.
+    pub title: Rect,
+    pub artist: Rect,
+    /// Previous, Play/Pause, Next.
+    pub buttons: [Rect; 3],
+    pub elapsed: Rect,
+    pub total: Rect,
+    /// The 4 px track, full width (the thumb's center moves along it).
+    pub track: Rect,
+    /// Where you can grab the seek bar (taller than the track).
+    pub seek_hit: Rect,
+    /// "Playing from <app>" (empty rect without the source row).
+    pub source: Rect,
+    pub pill: Rect,
+}
+
+/// The card's parts for a card `w` DIPs wide.
+pub fn card_parts(w: f32, sources: bool) -> CardParts {
+    let top = CARD_PAD_Y;
+    let cover = Rect::new(CARD_PAD_X, top, COVER, COVER);
+    let first_button = w - MEDIA_BUTTONS_RIGHT - 3.0 * MEDIA_BUTTON_W;
+    let buttons = std::array::from_fn(|i| {
+        Rect::new(
+            first_button + i as f32 * MEDIA_BUTTON_W,
+            top,
+            MEDIA_BUTTON_W,
+            COVER,
+        )
+    });
+    let text_x = cover.right() + 10.0;
+    let text_w = (first_button - 4.0 - text_x).max(0.0);
+    let title = Rect::new(text_x, top + 3.0, text_w, 20.0);
+    let artist = Rect::new(text_x, top + 23.0, text_w, 18.0);
+
+    let seek_y = cover.bottom() + CARD_ROW_GAP;
+    let elapsed = Rect::new(CARD_PAD_X, seek_y, TIME_WIDTH, SEEK_ROW);
+    let total = Rect::new(w - CARD_PAD_X - TIME_WIDTH, seek_y, TIME_WIDTH, SEEK_ROW);
+    let track_x = elapsed.right() + 6.0;
+    let track = Rect::new(
+        track_x,
+        seek_y + (SEEK_ROW - TRACK_HEIGHT) / 2.0,
+        (total.x - 6.0 - track_x).max(0.0),
+        TRACK_HEIGHT,
+    );
+    let seek_hit = Rect::new(
+        track.x - THUMB / 2.0,
+        seek_y - 4.0,
+        track.w + THUMB,
+        SEEK_ROW + 8.0,
+    );
+
+    let (source, pill) = if sources {
+        let y = seek_y + SEEK_ROW + CARD_ROW_GAP;
+        let pill = Rect::new(w - CARD_PAD_X - PILL_WIDTH, y, PILL_WIDTH, SOURCE_ROW);
+        let source = Rect::new(
+            CARD_PAD_X,
+            y,
+            (pill.x - 8.0 - CARD_PAD_X).max(0.0),
+            SOURCE_ROW,
+        );
+        (source, pill)
+    } else {
+        (Rect::default(), Rect::default())
+    };
+    CardParts {
+        cover,
+        title,
+        artist,
+        buttons,
+        elapsed,
+        total,
+        track,
+        seek_hit,
+        source,
+        pill,
+    }
+}
+
+/// How tall the music card is.
+pub fn card_height(music: Music) -> f32 {
+    let base = 2.0 * CARD_PAD_Y + COVER + CARD_ROW_GAP + SEEK_ROW;
+    match music {
+        Music::Hidden => 0.0,
+        Music::Card => base,
+        Music::CardWithSources => base + CARD_ROW_GAP + SOURCE_ROW,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
     pub content: Content,
+    /// The music card as it shows (always `Hidden` with search results).
+    pub music: Music,
+    /// Where the music card is (its full rect, even while hidden, so it can
+    /// fade out in place).
+    pub card: Rect,
+    pub card_parts: CardParts,
     /// The whole menu.
     pub size: Vector2,
     pub search: Rect,
@@ -114,18 +241,26 @@ pub struct Layout {
 }
 
 /// The window has to fit the tallest menu, so it never has to move or grow
-/// while the menu is open: the grid or 8 results, whichever is taller.
+/// while the menu is open: the grid with the biggest music card, or 8
+/// results, whichever is taller.
 pub fn max_size(pins: usize, max_columns: usize) -> Vector2 {
-    let grid = layout(pins, max_columns, Content::Grid).size;
-    let list = layout(pins, max_columns, Content::List(MAX_RESULTS)).size;
+    let grid = layout(pins, max_columns, Content::Grid, Music::CardWithSources).size;
+    let list = layout(pins, max_columns, Content::List(MAX_RESULTS), Music::Hidden).size;
     Vector2 {
         X: grid.X.max(list.X),
         Y: grid.Y.max(list.Y),
     }
 }
 
-/// The menu layout for `pins` pinned apps, showing `content`.
-pub fn layout(pins: usize, max_columns: usize, content: Content) -> Layout {
+/// The menu layout for `pins` pinned apps, showing `content`, with the music
+/// card as `music` says (the card only shows with the grid, never with search
+/// results).
+pub fn layout(pins: usize, max_columns: usize, content: Content, music: Music) -> Layout {
+    let music = if content == Content::Grid {
+        music
+    } else {
+        Music::Hidden
+    };
     let columns = pins.min(max_columns.max(1));
     let rows = if columns == 0 {
         0
@@ -180,7 +315,25 @@ pub fn layout(pins: usize, max_columns: usize, content: Content) -> Layout {
         }
     };
 
-    let footer_top = grid_top + middle_height + GRID_BELOW;
+    let below_middle = grid_top + middle_height + GRID_BELOW;
+    // The card's place, also while hidden (a "Card"-sized one then).
+    let card_kind = if music == Music::Hidden {
+        Music::Card
+    } else {
+        music
+    };
+    let card = Rect::new(
+        CARD_MARGIN,
+        below_middle,
+        width - 2.0 * CARD_MARGIN,
+        card_height(card_kind),
+    );
+    let card_parts = card_parts(card.w, card_kind == Music::CardWithSources);
+    let footer_top = if music == Music::Hidden {
+        below_middle
+    } else {
+        card.bottom() + CARD_MARGIN
+    };
     let footer = Rect::new(0.0, footer_top, width, FOOTER_HEIGHT);
     let mid = footer_top + FOOTER_HEIGHT / 2.0;
     let power = Rect::new(
@@ -207,6 +360,9 @@ pub fn layout(pins: usize, max_columns: usize, content: Content) -> Layout {
 
     Layout {
         content,
+        music,
+        card,
+        card_parts,
         size: Vector2 {
             X: width,
             Y: footer.bottom(),
@@ -255,7 +411,7 @@ mod tests {
 
     #[test]
     fn six_pins_make_a_4_by_2_grid() {
-        let l = layout(6, 4, Content::Grid);
+        let l = layout(6, 4, Content::Grid, Music::Hidden);
         assert_eq!((l.columns, l.rows), (4, 2));
         assert_eq!(l.size.X, 360.0); // 4 × 84 + 24
         assert_eq!(l.size.Y, 64.0 + 164.0 + 12.0 + 60.0);
@@ -265,28 +421,31 @@ mod tests {
 
     #[test]
     fn few_pins_keep_the_minimum_width_and_center_the_grid() {
-        let l = layout(1, 4, Content::Grid);
+        let l = layout(1, 4, Content::Grid, Music::Hidden);
         assert_eq!((l.columns, l.rows), (1, 1));
         assert_eq!(l.size.X, 320.0);
         assert_eq!(l.cells[0].x, 120.0); // (320 - 80) / 2
-        let l3 = layout(3, 4, Content::Grid);
+        let l3 = layout(3, 4, Content::Grid, Music::Hidden);
         assert_eq!(l3.size.X, 320.0);
         // Fewer rows means a shorter menu.
-        assert!(layout(4, 4, Content::Grid).size.Y < layout(5, 4, Content::Grid).size.Y);
-        assert_eq!(layout(4, 4, Content::Grid).size.Y, l.size.Y);
+        assert!(
+            layout(4, 4, Content::Grid, Music::Hidden).size.Y
+                < layout(5, 4, Content::Grid, Music::Hidden).size.Y
+        );
+        assert_eq!(layout(4, 4, Content::Grid, Music::Hidden).size.Y, l.size.Y);
     }
 
     #[test]
     fn many_pins_add_rows_not_columns() {
-        let l = layout(9, 4, Content::Grid);
+        let l = layout(9, 4, Content::Grid, Music::Hidden);
         assert_eq!((l.columns, l.rows), (4, 3));
         assert_eq!(l.size.X, 360.0);
-        assert_eq!(layout(9, 3, Content::Grid).columns, 3);
+        assert_eq!(layout(9, 3, Content::Grid, Music::Hidden).columns, 3);
     }
 
     #[test]
     fn no_pins_is_search_plus_footer() {
-        let l = layout(0, 4, Content::Grid);
+        let l = layout(0, 4, Content::Grid, Music::Hidden);
         assert_eq!((l.columns, l.rows), (0, 0));
         assert!(l.cells.is_empty());
         assert_eq!(
@@ -300,9 +459,9 @@ mod tests {
 
     #[test]
     fn search_results_keep_the_width_and_follow_the_row_count() {
-        let grid = layout(6, 4, Content::Grid);
-        let three = layout(6, 4, Content::List(3));
-        let eight = layout(6, 4, Content::List(8));
+        let grid = layout(6, 4, Content::Grid, Music::Hidden);
+        let three = layout(6, 4, Content::List(3), Music::Hidden);
+        let eight = layout(6, 4, Content::List(8), Music::Hidden);
         assert_eq!(three.size.X, grid.size.X);
         assert_eq!(three.result_rows.len(), 3);
         assert_eq!(three.result_rows[0], Rect::new(12.0, 64.0, 336.0, 40.0));
@@ -312,11 +471,11 @@ mod tests {
         assert_eq!(eight.size.Y, 64.0 + 320.0 + 12.0 + 60.0);
         // More than 8 is capped.
         assert_eq!(
-            layout(6, 4, Content::List(20)).result_rows,
+            layout(6, 4, Content::List(20), Music::Hidden).result_rows,
             eight.result_rows
         );
         // No results: one row for the message.
-        let none = layout(6, 4, Content::List(0));
+        let none = layout(6, 4, Content::List(0), Music::Hidden);
         assert!(none.result_rows.is_empty());
         assert_eq!(none.size.Y, 64.0 + 40.0 + 12.0 + 60.0);
         assert_eq!(none.no_results, three.result_rows[0]);
@@ -326,16 +485,83 @@ mod tests {
 
     #[test]
     fn the_window_fits_the_tallest_menu() {
-        assert_eq!(max_size(6, 4), layout(6, 4, Content::List(8)).size);
-        // 5 rows of icons are taller than 8 results.
-        assert_eq!(max_size(20, 4), layout(20, 4, Content::Grid).size);
+        // 2 rows of icons + the tallest card (434) < 8 results (456).
+        assert_eq!(
+            max_size(6, 4),
+            layout(6, 4, Content::List(8), Music::Hidden).size
+        );
+        // 5 rows of icons + the card are taller than 8 results.
+        assert_eq!(
+            max_size(20, 4),
+            layout(20, 4, Content::Grid, Music::CardWithSources).size
+        );
+        for pins in 0..13 {
+            let max = max_size(pins, 4);
+            for music in [Music::Hidden, Music::Card, Music::CardWithSources] {
+                assert!(layout(pins, 4, Content::Grid, music).size.Y <= max.Y);
+            }
+        }
+    }
+
+    #[test]
+    fn the_music_card_sits_between_the_grid_and_the_footer() {
+        let plain = layout(6, 4, Content::Grid, Music::Hidden);
+        let card = layout(6, 4, Content::Grid, Music::Card);
+        let full = layout(6, 4, Content::Grid, Music::CardWithSources);
+        // 12 below the grid, 12 from the sides, 12 above the footer.
+        assert_eq!(card.card, Rect::new(12.0, 64.0 + 164.0 + 12.0, 336.0, 88.0));
+        assert_eq!(card.footer.y, card.card.bottom() + 12.0);
+        assert_eq!(card.size.Y, plain.size.Y + 88.0 + 12.0);
+        assert_eq!(full.card.h, 88.0 + 8.0 + 26.0);
+        // The grid doesn't move when the card appears.
+        assert_eq!(card.cells, plain.cells);
+        // Search results hide the card.
+        let list = layout(6, 4, Content::List(3), Music::Card);
+        assert_eq!(list.music, Music::Hidden);
+        assert_eq!(
+            list.size,
+            layout(6, 4, Content::List(3), Music::Hidden).size
+        );
+    }
+
+    #[test]
+    fn card_parts_fit_inside_the_card() {
+        for w in [296.0, 336.0] {
+            for sources in [false, true] {
+                let p = card_parts(w, sources);
+                let h = card_height(if sources {
+                    Music::CardWithSources
+                } else {
+                    Music::Card
+                });
+                let all = [p.cover, p.title, p.artist, p.elapsed, p.total, p.track];
+                for r in all.iter().chain(p.buttons.iter()) {
+                    assert!(r.x >= 0.0 && r.right() <= w && r.y >= 0.0 && r.bottom() <= h);
+                }
+                // Text never runs under the buttons; hit targets ≥ 36 × 44.
+                assert!(p.title.right() <= p.buttons[0].x);
+                assert!(p.buttons.iter().all(|b| b.w >= 36.0 && b.h >= 44.0));
+                assert!(p.track.w > 100.0);
+                assert_eq!(p.pill.w > 0.0, sources);
+                if sources {
+                    assert!(p.pill.right() <= w && p.pill.bottom() <= h);
+                    assert!(p.source.right() < p.pill.x);
+                }
+            }
+        }
     }
 
     #[test]
     fn footer_and_strip_fit_inside_the_menu() {
-        for content in [Content::Grid, Content::List(0), Content::List(8)] {
+        let cases = [
+            (Content::Grid, Music::Hidden),
+            (Content::Grid, Music::CardWithSources),
+            (Content::List(0), Music::Hidden),
+            (Content::List(8), Music::Card),
+        ];
+        for (content, music) in cases {
             for pins in 0..13 {
-                let l = layout(pins, 4, content);
+                let l = layout(pins, 4, content, music);
                 assert_eq!(l.footer.bottom(), l.size.Y);
                 assert!(l.power.right() <= l.size.X && l.power.bottom() <= l.size.Y);
                 assert!(l.strip.y >= 0.0, "{pins} pins");

@@ -51,13 +51,19 @@ pub struct Animator {
     caret_blink: ScalarKeyFrameAnimation,
 }
 
-fn ms(value: u32) -> TimeSpan {
+pub fn ms(value: u32) -> TimeSpan {
     TimeSpan {
         Duration: i64::from(value) * 10_000, // 100 ns ticks
     }
 }
 
-fn cubic(c: &Compositor, x1: f32, y1: f32, x2: f32, y2: f32) -> Result<CompositionEasingFunction> {
+pub fn cubic(
+    c: &Compositor,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+) -> Result<CompositionEasingFunction> {
     let f =
         c.CreateCubicBezierEasingFunction(Vector2 { X: x1, Y: y1 }, Vector2 { X: x2, Y: y2 })?;
     f.cast()
@@ -158,17 +164,32 @@ impl Animator {
     /// Pops the pinned icons in, one after another. `visuals` are the inner
     /// (animated) visual of each icon, in order.
     pub fn stagger_in(&self, visuals: &[Visual]) -> Result<()> {
-        let s = &self.stagger;
         for (i, v) in visuals.iter().enumerate() {
-            let delay = ms(STAGGER_FIRST_MS + i as u32 * s.step_ms);
-            s.opacity.SetDelayTime(delay)?;
-            s.offset.SetDelayTime(delay)?;
-            s.scale.SetDelayTime(delay)?;
-            v.StartAnimation(h!("Opacity"), &s.opacity)?;
-            v.StartAnimation(h!("Offset"), &s.offset)?;
-            v.StartAnimation(h!("Scale"), &s.scale)?;
+            self.pop_after(v, STAGGER_FIRST_MS + i as u32 * self.stagger.step_ms)?;
         }
         Ok(())
+    }
+
+    /// Pops the music card in the same way, 40 ms after the last of
+    /// `icons` pinned icons started.
+    pub fn pop_card(&self, visual: &Visual, icons: usize) -> Result<()> {
+        let delay = match icons {
+            0 => STAGGER_FIRST_MS,
+            n => STAGGER_FIRST_MS + (n as u32 - 1) * self.stagger.step_ms + CARD_AFTER_ICONS_MS,
+        };
+        self.pop_after(visual, delay)
+    }
+
+    /// One icon's (or the card's) pop-in, starting `delay_ms` from now.
+    fn pop_after(&self, v: &Visual, delay_ms: u32) -> Result<()> {
+        let s = &self.stagger;
+        let delay = ms(delay_ms);
+        s.opacity.SetDelayTime(delay)?;
+        s.offset.SetDelayTime(delay)?;
+        s.scale.SetDelayTime(delay)?;
+        v.StartAnimation(h!("Opacity"), &s.opacity)?;
+        v.StartAnimation(h!("Offset"), &s.offset)?;
+        v.StartAnimation(h!("Scale"), &s.scale)
     }
 
     /// Shows the icons at rest, with no animation (reduced motion).
@@ -222,6 +243,8 @@ impl Animator {
 
 /// The first icon starts this long after the menu starts opening.
 const STAGGER_FIRST_MS: u32 = 70;
+/// The music card starts this long after the last icon.
+const CARD_AFTER_ICONS_MS: u32 = 40;
 /// Each icon's own animation.
 const STAGGER_MS: u32 = 300;
 const STAGGER_FADE_MS: u32 = 160;

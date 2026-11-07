@@ -27,6 +27,7 @@ pub mod footer;
 pub mod gfx;
 pub mod grid;
 pub mod layout;
+pub mod music;
 pub mod results;
 pub mod search_box;
 pub mod shape;
@@ -39,10 +40,11 @@ use std::time::{Duration, Instant};
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{CompositionScopedBatch, Compositor, ContainerVisual, Visual};
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
 use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
-    VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP,
+    VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetQueueStatus, KillTimer, QS_INPUT, SetTimer};
 use windows::core::{Interface, Result};
@@ -51,6 +53,7 @@ use windows_numerics::{Vector2, Vector3};
 use crate::apps::AppInfo;
 use crate::config::{Config, Rgb};
 use crate::icons::IconCache;
+use crate::media::{self, MediaCommand, MusicView};
 use crate::power::PowerAction;
 use crate::search::{self, Query};
 use crate::window::{Edge, Placement};
@@ -59,7 +62,8 @@ use background::{Applied, SystemEffects};
 use footer::{Footer, PowerStrip, StripState};
 use gfx::Gfx;
 use grid::Grid;
-use layout::{Content, Layout, MAX_RESULTS, Rect};
+use layout::{Content, Layout, MAX_RESULTS, Music, Rect};
+use music::{CardPart, MusicCard};
 use results::Results;
 use search_box::SearchBox;
 use shape::RoundRect;
@@ -69,6 +73,13 @@ pub const TIMER_ICONS: usize = 2;
 /// At most this long per WM_TIMER spent loading icons, so the thread is
 /// never busy for longer than a frame.
 const ICON_BUDGET: Duration = Duration::from_millis(8);
+/// The timer that refreshes the music card's elapsed time (WM_TIMER id).
+/// It only runs while the menu is open and music plays.
+pub const TIMER_SEEK: usize = 3;
+/// At most 4 updates a second (the text changes once a second).
+const SEEK_TICK_MS: u32 = 250;
+/// The app icon next to "Playing from …".
+const SOURCE_ICON: f32 = 16.0;
 
 /// Something main.rs should do after an input event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +90,8 @@ pub enum Action {
     Power(PowerAction),
     /// Launch the app with this AppsFolder ID (AUMID).
     Launch(String),
+    /// A music card button (or its keyboard shortcut).
+    Media(MediaCommand),
 }
 
 /// Who has the keyboard.
@@ -88,6 +101,8 @@ pub enum Focus {
     /// highlight and Enter launches it).
     Search,
     Cell(usize),
+    /// A button of the music card.
+    Media(CardPart),
     Profile,
     Power,
     /// A button of the power strip.
@@ -102,6 +117,8 @@ enum Target {
     Cell(usize),
     /// A search result row.
     Row(usize),
+    /// A button or the seek bar of the music card.
+    Media(CardPart),
     Profile,
     Power,
     Strip(usize),
@@ -205,6 +222,17 @@ pub struct Ui {
     /// Apps whose icon could not be loaded (not retried).
     failed_icons: RefCell<HashSet<String>>,
     stats: Cell<SearchStats>,
+    music: MusicCard,
+    /// Whether the music card would show (with the grid).
+    music_mode: Cell<Music>,
+    /// Use the album cover's color for the background (CLAUDE.md section 6).
+    tint_from_album: bool,
+    /// Space just played/paused the music: ignore the WM_CHAR ' ' after it.
+    swallow_space: Cell<bool>,
+    /// Dragging the music card's seek bar.
+    seek_drag: Cell<bool>,
+    /// The last "Playing from" lookup: (AUMID, app name, app icon).
+    source_cache: RefCell<Option<(String, String, Option<ID2D1Bitmap1>)>>,
 }
 
 fn white(alpha: f32) -> windows::UI::Color {
@@ -235,7 +263,7 @@ impl Ui {
             .iter()
             .filter_map(|aumid| crate::apps::find(aumid))
             .collect();
-        let layout = layout::layout(apps.len(), config.max_columns, Content::Grid);
+        let layout = layout::layout(apps.len(), config.max_columns, Content::Grid, Music::Hidden);
 
         let shell = shell::Shell::new(&compositor, layout.size)?;
         root.Children()?.InsertAtTop(shell.host())?;
@@ -264,6 +292,14 @@ impl Ui {
         let search = SearchBox::new(&compositor, &gfx, &front, layout.search, config.accent)?;
         let grid = Grid::new(&compositor, &gfx, &front, apps)?;
         let results = Results::new(&compositor, &gfx, &front, &layout, &footer.fill_visual()?)?;
+        let music = MusicCard::new(
+            &compositor,
+            &gfx,
+            &front,
+            &footer.fill_visual()?,
+            config.accent,
+            &layout,
+        )?;
         let strip = PowerStrip::new(&compositor, &gfx, &popup, layout.strip)?;
         let ring = RoundRect::new(&compositor, CELL_RADIUS, RING_WIDTH)?;
         ring.set_stroke(gfx::color(config.accent, 1.0))?;
@@ -275,6 +311,7 @@ impl Ui {
             .motion_objects()?
             .into_iter()
             .chain(footer.motion_objects()?)
+            .chain(music.motion_objects()?)
         {
             motion.add(object, kind);
         }
@@ -322,6 +359,12 @@ impl Ui {
             selected: Cell::new(0),
             failed_icons: RefCell::new(HashSet::new()),
             stats: Cell::new(SearchStats::default()),
+            music,
+            music_mode: Cell::new(Music::Hidden),
+            tint_from_album: config.background.tint_from_album,
+            swallow_space: Cell::new(false),
+            seek_drag: Cell::new(false),
+            source_cache: RefCell::new(None),
         };
         ui.refresh()?;
         Ok(ui)
@@ -353,6 +396,7 @@ impl Ui {
             self.strip
                 .refresh(&self.gfx, l.strip, Self::strip_origin(&l))?;
             self.results.resize(&self.gfx, &l)?;
+            self.music.refresh(&self.gfx, &l)?;
             self.place_content()
         })?;
         self.paint_results()?;
@@ -367,6 +411,7 @@ impl Ui {
         self.footer.move_to(&self.gfx, &l)?;
         self.strip
             .move_to(&self.gfx, l.strip, Self::strip_origin(&l))?;
+        self.music.move_to(&self.gfx, &l)?;
         // Going back to the grid, the rows stay as they are while they fade.
         if let Content::List(n) = l.content {
             self.results.set_rows(&self.gfx, &l, n == 0)?;
@@ -401,7 +446,13 @@ impl Ui {
     /// bitmap useless. Paint it all again.
     pub fn device_replaced(&self) -> Result<()> {
         self.icons.clear();
+        self.source_cache.borrow_mut().take();
         self.refresh()
+    }
+
+    /// The album cover's size in pixels at the current DPI.
+    pub fn cover_px(&self) -> u32 {
+        self.gfx.px(layout::COVER) as u32
     }
 
     /// Applies the DPI scale and the menu's position inside the window.
@@ -458,18 +509,32 @@ impl Ui {
             self.hover.show(false)?;
             self.focus.set(Focus::Search);
             let icons = self.grid.animated_visuals()?;
+            let card = self.music.animated()?;
             if reduced_motion {
                 Animator::stagger_done(&icons)?;
+                Animator::stagger_done(&[card])?;
             } else {
                 self.animator.stagger_in(&icons)?;
+                if self.music_shown() {
+                    // 40 ms after the last icon.
+                    self.animator.pop_card(&card, icons.len())?;
+                }
             }
         }
         self.update_focus_visuals()?;
+        self.sync_seek()?;
         self.animator.open(&self.menu, reduced_motion)
     }
 
     pub fn animate_close(&self, reduced_motion: bool) -> Result<CompositionScopedBatch> {
         self.is_open.set(false);
+        if self.seek_drag.replace(false) {
+            // SAFETY: releases the mouse capture we took; no pointers.
+            let _ = unsafe { ReleaseCapture() };
+            self.music.cancel_drag();
+        }
+        // The seek bar stops and its timer ends: nothing runs while hidden.
+        self.sync_seek()?;
         // No blinking caret while hidden: zero work for DWM.
         Animator::stop_blink(&self.search.caret_visual()?, true)?;
         search_box::ime_cancel(self.hwnd);
@@ -501,6 +566,8 @@ impl Ui {
         }
         self.catalog.borrow_mut().set_apps(apps);
         self.results.forget();
+        // "Playing from" may find its app (and icon) now.
+        self.source_cache.borrow_mut().take();
         self.update_search(true)
     }
 
@@ -544,11 +611,23 @@ impl Ui {
     /// Switches the middle of the menu to `content`. While open, the menu
     /// glides to its new height and the grid and list cross-fade.
     fn set_content(&self, content: Content) -> Result<()> {
-        let old = self.layout.borrow().content;
-        if old == content {
+        self.relayout(content, self.music_mode.get())
+    }
+
+    /// Lays the menu out for `content` and the music card. While open,
+    /// everything glides to its new place (220 ms) and what appears or
+    /// disappears fades.
+    fn relayout(&self, content: Content, music: Music) -> Result<()> {
+        let new = layout::layout(self.grid.len(), self.max_columns, content, music);
+        let (old_content, old_music) = {
+            let l = self.layout.borrow();
+            (l.content, l.music)
+        };
+        if old_content == new.content && old_music == new.music {
             return Ok(());
         }
-        *self.layout.borrow_mut() = layout::layout(self.grid.len(), self.max_columns, content);
+        let card_visible = new.music != Music::Hidden;
+        *self.layout.borrow_mut() = new;
         let animate = self.is_open.get() && !self.reduced_motion.get();
         if animate {
             self.motion.animate(|| self.place_content())?;
@@ -556,10 +635,17 @@ impl Ui {
             self.motion.instant(|| self.place_content())?;
         }
         let list = matches!(content, Content::List(_));
-        if matches!(old, Content::List(_)) != list {
+        if matches!(old_content, Content::List(_)) != list {
             self.motion.fade(&self.grid.visual()?, !list, animate)?;
             self.motion.fade(&self.results.visual()?, list, animate)?;
             if list && matches!(self.focus.get(), Focus::Cell(_)) {
+                self.focus.set(Focus::Search);
+            }
+        }
+        if (old_music != Music::Hidden) != card_visible {
+            self.motion
+                .fade(&self.music.visual()?, card_visible, animate)?;
+            if !card_visible && matches!(self.focus.get(), Focus::Media(_)) {
                 self.focus.set(Focus::Search);
             }
         }
@@ -687,6 +773,151 @@ impl Ui {
     }
 
     // -----------------------------------------------------------------------
+    // Music card
+    // -----------------------------------------------------------------------
+
+    /// Is the music card showing (music plays or is paused, and no search)?
+    fn music_shown(&self) -> bool {
+        self.layout.borrow().music != Music::Hidden
+    }
+
+    /// New music state from `media.rs` (`None` = nothing playing or
+    /// paused). The card appears, disappears or changes; while the menu is
+    /// open the menu glides to its new height.
+    pub fn set_music(&self, view: Option<MusicView>) -> Result<()> {
+        let mode = match &view {
+            None => Music::Hidden,
+            Some(v) if v.sources >= 2 => Music::CardWithSources,
+            Some(_) => Music::Card,
+        };
+        let album = view
+            .as_ref()
+            .and_then(|v| v.info.cover.as_ref())
+            .and_then(|c| c.color)
+            .filter(|_| self.tint_from_album);
+        let (name, icon) = match &view {
+            Some(v) => self.source_app(&v.source_id),
+            None => (String::new(), None),
+        };
+        self.music.set_view(&self.gfx, view, name, icon)?;
+        if self.music_mode.replace(mode) != mode {
+            let content = self.layout.borrow().content;
+            self.relayout(content, mode)?;
+        }
+        if let Err(e) = self.shell.background.set_album_color(album) {
+            log_warn!("album tint: {e}");
+        }
+        self.sync_seek()
+    }
+
+    /// The seek bar moves (and the elapsed time ticks) only while the menu
+    /// is open and the card shows; otherwise both stop.
+    fn sync_seek(&self) -> Result<()> {
+        let moving = self.is_open.get() && self.music_shown();
+        self.music.sync_seek(moving)?;
+        // SAFETY: a timer on our own window, or stopping it.
+        unsafe {
+            if moving && self.music.is_playing() {
+                SetTimer(Some(self.hwnd), TIMER_SEEK, SEEK_TICK_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_SEEK);
+            }
+        }
+        Ok(())
+    }
+
+    /// WM_TIMER for [`TIMER_SEEK`]: refresh the elapsed time.
+    pub fn music_tick(&self) -> Result<()> {
+        if !self.is_open.get() {
+            // SAFETY: stops our own timer.
+            let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SEEK) };
+            return Ok(());
+        }
+        self.music.tick(&self.gfx)
+    }
+
+    /// The name and icon of the app behind a media session, found in the
+    /// same app list search uses.
+    fn source_app(&self, aumid: &str) -> (String, Option<ID2D1Bitmap1>) {
+        if let Some((id, name, icon)) = self.source_cache.borrow().as_ref()
+            && id == aumid
+        {
+            return (name.clone(), icon.clone());
+        }
+        let app = {
+            let catalog = self.catalog.borrow();
+            let apps = catalog
+                .apps
+                .iter()
+                .map(|a| (a.id.as_str(), a.name.as_str()));
+            media::match_source(apps, aumid).and_then(|i| catalog.apps.get(i).cloned())
+        };
+        let (name, icon) = match app {
+            Some(app) => {
+                let px = self.gfx.px(SOURCE_ICON);
+                let icon = app
+                    .shell_item()
+                    .and_then(|item| self.icons.get(&self.gfx, &app.id, &item, px))
+                    .inspect_err(|e| log_warn!("no icon for {}: {e}", app.id))
+                    .ok();
+                (app.name, icon)
+            }
+            None => (media::source_fallback_name(aumid), None),
+        };
+        *self.source_cache.borrow_mut() = Some((aumid.to_string(), name.clone(), icon.clone()));
+        (name, icon)
+    }
+
+    /// A card button was clicked or pressed with the keyboard.
+    fn press_card(&self, part: CardPart) -> Action {
+        if !self.music.is_enabled(part) {
+            return Action::None;
+        }
+        part.command().map_or(Action::None, Action::Media)
+    }
+
+    /// Where focus goes below the pinned grid: the card's first button, or
+    /// the profile.
+    fn below_grid(&self) -> Focus {
+        match self.music.focus_order().first() {
+            Some(&part) if self.music_shown() => Focus::Media(part),
+            _ => Focus::Profile,
+        }
+    }
+
+    fn media_key(&self, part: CardPart, vk: VIRTUAL_KEY, shift: bool) -> Result<Action> {
+        let order = self.music.focus_order();
+        let i = order.iter().position(|&p| p == part);
+        let before = i
+            .and_then(|i| i.checked_sub(1))
+            .and_then(|j| order.get(j))
+            .map(|&p| Focus::Media(p));
+        let after = i.and_then(|i| order.get(i + 1)).map(|&p| Focus::Media(p));
+        let n = self.grid.len();
+        let above = if n > 0 {
+            Focus::Cell(n - 1)
+        } else {
+            Focus::Search
+        };
+        let next = match vk {
+            VK_RETURN => return Ok(self.press_card(part)),
+            VK_SPACE => {
+                self.swallow_space.set(true);
+                return Ok(self.press_card(part));
+            }
+            VK_LEFT => before.unwrap_or(Focus::Media(part)),
+            VK_RIGHT => after.unwrap_or(Focus::Media(part)),
+            VK_UP => above,
+            VK_DOWN => Focus::Profile,
+            VK_TAB if shift => before.unwrap_or(above),
+            VK_TAB => after.unwrap_or(Focus::Profile),
+            _ => return Ok(Action::None),
+        };
+        self.set_focus(next)?;
+        Ok(Action::None)
+    }
+
+    // -----------------------------------------------------------------------
     // Focus, hover, ring
     // -----------------------------------------------------------------------
 
@@ -699,6 +930,7 @@ impl Ui {
         match focus {
             Focus::Search => None, // the search box shows focus with its border
             Focus::Cell(i) => self.grid.rect(i).map(|r| (r, CELL_RADIUS)),
+            Focus::Media(part) => Some((self.music.part_rect(part), self.music.part_radius(part))),
             Focus::Profile => Some((self.footer.profile_rect(), BUTTON_RADIUS)),
             Focus::Power => Some((self.footer.power_rect(), BUTTON_RADIUS)),
             Focus::Strip(i) => self.strip.buttons().get(i).map(|&r| (r, BUTTON_RADIUS)),
@@ -734,6 +966,11 @@ impl Ui {
             _ => None,
         };
         self.strip.set_hover(strip_button)?;
+        // The card has its own highlight (drawn above its dark panel).
+        self.music.set_hover(match target {
+            Target::Media(part) => Some(part),
+            _ => None,
+        })?;
         let highlight = match target {
             Target::Cell(i) => self.grid.rect(i).map(|r| (r, CELL_RADIUS)),
             Target::Row(i) => self.results.rect(i).map(|r| (r, results::ROW_RADIUS)),
@@ -766,6 +1003,8 @@ impl Ui {
             Target::Row(i)
         } else if let Some(i) = self.grid.hit(p).filter(|_| !self.is_list()) {
             Target::Cell(i)
+        } else if let Some(part) = self.music.hit(p).filter(|_| self.music_shown()) {
+            Target::Media(part)
         } else if self.footer.profile_rect().contains(p) {
             Target::Profile
         } else if self.footer.power_rect().contains(p) {
@@ -842,6 +1081,9 @@ impl Ui {
     /// WM_KEYDOWN. `ctrl` / `shift` = those keys are held.
     pub fn key_down(&self, vk: u16, ctrl: bool, shift: bool) -> Result<Action> {
         let vk = VIRTUAL_KEY(vk);
+        if vk != VK_SPACE {
+            self.swallow_space.set(false);
+        }
         if vk == VK_ESCAPE {
             // Esc closes the innermost thing: strip, then text, then menu.
             if self.strip.is_open() {
@@ -872,6 +1114,7 @@ impl Ui {
         match focus {
             Focus::Search => self.search_key(vk, ctrl, shift),
             Focus::Cell(i) => self.grid_key(i, vk, shift),
+            Focus::Media(part) => self.media_key(part, vk, shift),
             Focus::Profile | Focus::Power => self.footer_key(focus, vk, shift),
             Focus::Strip(i) => self.strip_key(i, vk, shift),
         }
@@ -882,6 +1125,22 @@ impl Ui {
         const KEY_C: VIRTUAL_KEY = VIRTUAL_KEY(b'C' as u16);
         const KEY_V: VIRTUAL_KEY = VIRTUAL_KEY(b'V' as u16);
         const KEY_X: VIRTUAL_KEY = VIRTUAL_KEY(b'X' as u16);
+
+        // Music shortcuts, only while nothing is typed: Space = play/pause,
+        // Ctrl+Left / Ctrl+Right = previous / next.
+        if self.music_shown() && self.search.editor.borrow().is_empty() {
+            let part = match vk {
+                VK_SPACE => Some(CardPart::PlayPause),
+                VK_LEFT if ctrl => Some(CardPart::Previous),
+                VK_RIGHT if ctrl => Some(CardPart::Next),
+                _ => None,
+            };
+            if let Some(part) = part {
+                // The space must not also be typed into the search box.
+                self.swallow_space.set(vk == VK_SPACE);
+                return Ok(self.press_card(part));
+            }
+        }
 
         // With results showing: Up/Down move the highlight (wrapping
         // around), Enter launches it, Tab goes to the footer.
@@ -906,7 +1165,7 @@ impl Ui {
                 let next = if self.grid.len() > 0 {
                     Focus::Cell(0)
                 } else {
-                    Focus::Profile
+                    self.below_grid()
                 };
                 return self.set_focus(next).map(|()| Action::None);
             }
@@ -984,13 +1243,13 @@ impl Ui {
             VK_DOWN if i + cols < n => Focus::Cell(i + cols),
             // The row below is shorter: go to its last icon.
             VK_DOWN if i / cols < last_row => Focus::Cell(n - 1),
-            VK_DOWN => Focus::Profile,
+            VK_DOWN => self.below_grid(),
             VK_HOME => Focus::Cell(0),
             VK_END => Focus::Cell(n - 1),
             VK_TAB if shift && i == 0 => Focus::Search,
             VK_TAB if shift => Focus::Cell(i - 1),
             VK_TAB if i + 1 < n => Focus::Cell(i + 1),
-            VK_TAB => Focus::Profile,
+            VK_TAB => self.below_grid(),
             VK_RETURN => return Ok(self.launch_pin(i)),
             _ => return Ok(Action::None),
         };
@@ -1000,9 +1259,17 @@ impl Ui {
 
     fn footer_key(&self, focus: Focus, vk: VIRTUAL_KEY, shift: bool) -> Result<Action> {
         let n = self.grid.len();
-        // Above the footer: the last pin, or the search box (no pins, or
-        // search results showing).
-        let above = if n > 0 && !self.is_list() {
+        // Above the footer: the music card's last button, the last pin, or
+        // the search box (no pins, or search results showing).
+        let card_last = self
+            .music
+            .focus_order()
+            .last()
+            .copied()
+            .filter(|_| self.music_shown());
+        let above = if let Some(part) = card_last {
+            Focus::Media(part)
+        } else if n > 0 && !self.is_list() {
             Focus::Cell(n - 1)
         } else {
             Focus::Search
@@ -1045,6 +1312,10 @@ impl Ui {
 
     /// WM_CHAR: typing always goes to the search box.
     pub fn char_typed(&self, unit: u16) -> Result<()> {
+        // This space already played or paused the music.
+        if unit == u16::from(b' ') && self.swallow_space.replace(false) {
+            return Ok(());
+        }
         // Control characters (Backspace, Tab, Enter, Esc, Ctrl+letters...)
         // are handled as keys in `key_down`.
         let is_text = unit >= 0x20 && unit != 0x7F;
@@ -1144,6 +1415,9 @@ impl Ui {
         let Some(p) = self.to_menu(x, y) else {
             return Ok(());
         };
+        if self.seek_drag.get() {
+            return self.music.drag_to(&self.gfx, p.X);
+        }
         if self.dragging.get() {
             if let Some(pos) = self.search.position_at(p) {
                 self.search.editor.borrow_mut().set_caret_utf16(pos, true);
@@ -1178,7 +1452,14 @@ impl Ui {
             return Ok(Action::None);
         }
         self.pressed.set(target);
-        if target == Target::Search {
+        if target == Target::Media(CardPart::Seek) {
+            // Grab the seek bar: it follows the mouse until released.
+            self.seek_drag.set(true);
+            self.music.drag_to(&self.gfx, p.X)?;
+            // SAFETY: captures the mouse for our own window while dragging.
+            unsafe { SetCapture(self.hwnd) };
+            self.update_focus_visuals()?;
+        } else if target == Target::Search {
             self.set_focus(Focus::Search)?;
             if let Some(pos) = self.search.position_at(p) {
                 self.search.editor.borrow_mut().set_caret_utf16(pos, shift);
@@ -1199,6 +1480,14 @@ impl Ui {
             let _ = unsafe { ReleaseCapture() };
         }
         let pressed = self.pressed.replace(Target::Nothing);
+        if self.seek_drag.replace(false) {
+            // SAFETY: releases the capture taken in `mouse_down`.
+            let _ = unsafe { ReleaseCapture() };
+            // Seek where it was let go (wherever the mouse is now).
+            let seek = self.music.end_drag();
+            self.sync_seek()?;
+            return Ok(seek.map_or(Action::None, |t| Action::Media(MediaCommand::Seek(t))));
+        }
         let Some(p) = self.to_menu(x, y) else {
             return Ok(Action::None);
         };
@@ -1209,6 +1498,7 @@ impl Ui {
         match pressed {
             Target::Cell(i) => Ok(self.launch_pin(i)),
             Target::Row(i) => Ok(self.launch_result(i)),
+            Target::Media(part) => Ok(self.press_card(part)),
             Target::Profile => Ok(Action::OpenAccountSettings),
             Target::Power if self.strip.is_open() => {
                 self.close_strip(Focus::Search)?;

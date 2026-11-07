@@ -13,6 +13,7 @@ mod apps;
 mod config;
 mod hook;
 mod icons;
+mod media;
 mod power;
 mod search;
 mod settings_watch;
@@ -64,6 +65,7 @@ use windows::core::{Result, w};
 use apps::{AppInfo, ChangeWatch, WM_APP_APPS_CHANGED, WM_APP_APPS_LOADED};
 use config::Config;
 use hook::{HookThread, WM_APP_TOGGLE};
+use media::{Media, WM_APP_MEDIA, WM_APP_MEDIA_INFO, WM_APP_MEDIA_READY};
 use settings_watch::{SettingsWatch, WM_APP_SETTINGS_CHANGED};
 use tray::{Tray, TrayCommand, WM_APP_TRAY};
 use ui::Action;
@@ -115,6 +117,8 @@ struct App {
     rescan: Cell<bool>,
     /// Tells us about installs and uninstalls (None if that failed).
     _app_watch: Option<ChangeWatch>,
+    /// What is playing (the music card).
+    media: Media,
 }
 
 /// WM_TIMER id: an app was installed or removed; wait until things settle.
@@ -187,12 +191,18 @@ impl App {
             log_err("reset", self.ui.reset_closed());
             let p = self.placement();
             log_err("layout", self.ui.set_layout(&p));
+            // Covers are decoded for this monitor's DPI.
+            self.media.set_cover_px(self.ui.cover_px());
             window::show(self.hwnd, &p);
             self.placement.set(Some(p));
             self.is_visible.set(true);
         }
         self.is_open.set(true);
         self.opened_at.set(now_ms());
+        // Fresh playback position (no timeline events arrive while hidden),
+        // and timeline events from now on.
+        self.media.set_open(true);
+        self.push_music();
         log_err(
             "open animation",
             self.ui.animate_open(fresh, self.reduced_motion()),
@@ -255,7 +265,20 @@ impl App {
                 self.ui.record_launch(&id);
                 apps::launch(id);
             }
+            Action::Media(command) => {
+                self.media.command(command);
+                // Switching source changes the card right away; the other
+                // buttons come back as playback events.
+                if command == media::MediaCommand::SwitchSource {
+                    self.push_music();
+                }
+            }
         }
+    }
+
+    /// Shows the current music state on the card.
+    fn push_music(&self) {
+        log_err("music card", self.ui.set_music(self.media.view()));
     }
 
     /// Lists all apps again, on a helper thread.
@@ -276,6 +299,8 @@ impl App {
         self.scanning.set(false);
         if let Some(list) = latest {
             log_err("updating the app list", self.ui.set_apps(list));
+            // "Playing from" can now name the app.
+            self.push_music();
         }
         if self.rescan.replace(false) {
             self.scan_apps();
@@ -306,6 +331,7 @@ impl App {
                 self.scan_apps();
             }
             ui::TIMER_ICONS => self.ui.load_icons(),
+            ui::TIMER_SEEK => log_err("music time", self.ui.music_tick()),
             _ => {}
         }
     }
@@ -332,6 +358,8 @@ impl App {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
         self.closed_at.set(now_ms());
+        // No timeline events while hidden.
+        self.media.set_open(false);
 
         match self.ui.animate_close(self.reduced_motion()) {
             Ok(batch) => {
@@ -385,6 +413,7 @@ impl App {
         let p = self.placement();
         if self.placement.get() != Some(p) {
             log_err("layout", self.ui.set_layout(&p));
+            self.media.set_cover_px(self.ui.cover_px());
             window::show(self.hwnd, &p);
             self.placement.set(Some(p));
         }
@@ -580,6 +609,22 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 app.on_apps_changed(wparam, lparam);
                 return LRESULT(0);
             }
+            WM_APP_MEDIA_READY => {
+                app.media.on_ready();
+                app.push_music();
+                return LRESULT(0);
+            }
+            WM_APP_MEDIA => {
+                app.media.on_changed(wparam.0);
+                app.push_music();
+                return LRESULT(0);
+            }
+            WM_APP_MEDIA_INFO => {
+                if app.media.on_info() {
+                    app.push_music();
+                }
+                return LRESULT(0);
+            }
             WM_TIMER => {
                 app.on_timer(wparam.0);
                 return LRESULT(0);
@@ -686,6 +731,8 @@ fn run() -> Result<()> {
     let scale = window::placement(1.0, 1.0).scale;
     let ui = ui::Ui::new(hwnd, &config, scale)?;
     let settings = SettingsWatch::new(hwnd)?;
+    // Asks Windows for the media sessions; they arrive a moment later.
+    let media = Media::new(hwnd, ui.cover_px());
     let tray = Tray::add(hwnd)?;
     let hook = HookThread::start(hwnd)?;
 
@@ -718,6 +765,7 @@ fn run() -> Result<()> {
         scanning: Cell::new(false),
         rescan: Cell::new(false),
         _app_watch: ChangeWatch::new(hwnd),
+        media,
     });
     app.apply_background();
     // List every installed app in the background (search needs them).
