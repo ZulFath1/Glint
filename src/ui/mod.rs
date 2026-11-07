@@ -23,6 +23,7 @@
 
 pub mod anim;
 pub mod background;
+pub mod context_menu;
 pub mod footer;
 pub mod gfx;
 pub mod grid;
@@ -59,6 +60,7 @@ use crate::search::{self, Query};
 use crate::window::{Edge, Placement};
 use anim::{Animator, Kind, LayoutMotion};
 use background::{Applied, SystemEffects};
+use context_menu::{ContextMenu, MenuTarget};
 use footer::{Footer, PowerStrip, StripState};
 use gfx::Gfx;
 use grid::Grid;
@@ -92,6 +94,9 @@ pub enum Action {
     Launch(String),
     /// A music card button (or its keyboard shortcut).
     Media(MediaCommand),
+    /// "Pin to Glint" / "Unpin from Glint" on this app ID (right-click).
+    Pin(String),
+    Unpin(String),
 }
 
 /// Who has the keyboard.
@@ -124,6 +129,10 @@ enum Target {
     Strip(usize),
     /// The power strip, but not on a button.
     StripPanel,
+    /// The right-click menu's row ("Pin to Glint" / "Unpin from Glint").
+    Context,
+    /// The right-click menu, but not on its row.
+    ContextPanel,
 }
 
 const HOVER_ALPHA: f32 = 0.08;
@@ -132,7 +141,7 @@ const BUTTON_RADIUS: f32 = 10.0;
 const RING_WIDTH: f32 = 2.0;
 
 /// Every installed app, prepared for searching, plus how often each was
-/// launched (in memory only for now; saved to the config in milestone 6).
+/// launched (saved to `[stats]` in config.toml by main.rs).
 #[derive(Default)]
 struct Catalog {
     apps: Vec<AppInfo>,
@@ -140,8 +149,9 @@ struct Catalog {
     items: Vec<search::Item>,
     /// Pinned AUMIDs from the config (pinned apps win ties).
     pinned: Vec<String>,
-    /// Lowercased ID → launches.
-    launches: HashMap<String, u32>,
+    /// Lowercased ID → (the ID as written, launches). Looked up without
+    /// case, saved with the original spelling.
+    launches: HashMap<String, (String, u32)>,
 }
 
 impl Catalog {
@@ -153,18 +163,45 @@ impl Catalog {
         self.apps = apps;
     }
 
+    /// Recomputes every item's pinned flag and launch count (new pins, or
+    /// launch counts from the config file).
+    fn refresh_items(&mut self) {
+        for (i, app) in self.apps.iter().enumerate() {
+            let (pinned, launches) = (self.is_pinned(&app.id), self.launches(&app.id));
+            if let Some(item) = self.items.get_mut(i) {
+                item.pinned = pinned;
+                item.launches = launches;
+            }
+        }
+    }
+
     fn is_pinned(&self, id: &str) -> bool {
         self.pinned.iter().any(|p| p.eq_ignore_ascii_case(id))
     }
 
     fn launches(&self, id: &str) -> u32 {
-        self.launches.get(&id.to_lowercase()).copied().unwrap_or(0)
+        self.launches.get(&id.to_lowercase()).map_or(0, |(_, n)| *n)
+    }
+
+    fn set_launches(&mut self, counts: &HashMap<String, u32>) {
+        self.launches = counts
+            .iter()
+            .map(|(id, &n)| (id.to_lowercase(), (id.clone(), n)))
+            .collect();
+        self.refresh_items();
+    }
+
+    fn launch_counts(&self) -> HashMap<String, u32> {
+        self.launches.values().cloned().collect()
     }
 
     fn record_launch(&mut self, id: &str) {
-        let count = self.launches.entry(id.to_lowercase()).or_insert(0);
-        *count += 1;
-        let count = *count;
+        let entry = self
+            .launches
+            .entry(id.to_lowercase())
+            .or_insert_with(|| (id.to_string(), 0));
+        entry.1 = entry.1.saturating_add(1);
+        let count = entry.1;
         for (app, item) in self.apps.iter().zip(self.items.iter_mut()) {
             if app.id.eq_ignore_ascii_case(id) {
                 item.launches = count;
@@ -182,23 +219,26 @@ struct SearchStats {
 
 pub struct Ui {
     hwnd: HWND,
-    _compositor: Compositor,
+    compositor: Compositor,
     // Keeps our visual tree attached to the window.
     _target: DesktopWindowTarget,
     root: ContainerVisual,
     shell: shell::Shell,
     menu: Visual,
-    animator: Animator,
+    /// Rebuilt when `[animation]` in the config changes.
+    animator: RefCell<Animator>,
     motion: LayoutMotion,
     gfx: Gfx,
     icons: IconCache,
-    max_columns: usize,
+    max_columns: Cell<usize>,
     layout: RefCell<Layout>,
     search: SearchBox,
     grid: Grid,
     results: Results,
     footer: Footer,
     strip: PowerStrip,
+    /// The right-click "Pin / Unpin" menu.
+    context: ContextMenu,
     hover: RoundRect,
     ring: RoundRect,
     focus: Cell<Focus>,
@@ -226,7 +266,7 @@ pub struct Ui {
     /// Whether the music card would show (with the grid).
     music_mode: Cell<Music>,
     /// Use the album cover's color for the background (CLAUDE.md section 6).
-    tint_from_album: bool,
+    tint_from_album: Cell<bool>,
     /// Space just played/paused the music: ignore the WM_CHAR ' ' after it.
     swallow_space: Cell<bool>,
     /// Dragging the music card's seek bar.
@@ -247,7 +287,9 @@ fn input_waiting() -> bool {
     (status >> 16) & QS_INPUT.0 != 0
 }
 impl Ui {
-    pub fn new(hwnd: HWND, config: &Config, scale: f32) -> Result<Self> {
+    /// `accent` is the config's accent color, already resolved (a fixed
+    /// color, or the Windows one for `accent = "system"`).
+    pub fn new(hwnd: HWND, config: &Config, accent: Rgb, scale: f32) -> Result<Self> {
         let compositor = Compositor::new()?;
         let interop: ICompositorDesktopInterop = compositor.cast()?;
         // SAFETY: `hwnd` is our live top-level window, created on this thread.
@@ -289,7 +331,7 @@ impl Ui {
         hover.set_fill(white(HOVER_ALPHA))?;
         hover.show(false)?;
         hover_layer.Children()?.InsertAtTop(&hover.visual)?;
-        let search = SearchBox::new(&compositor, &gfx, &front, layout.search, config.accent)?;
+        let search = SearchBox::new(&compositor, &gfx, &front, layout.search, accent)?;
         let grid = Grid::new(&compositor, &gfx, &front, apps)?;
         let results = Results::new(&compositor, &gfx, &front, &layout, &footer.fill_visual()?)?;
         let music = MusicCard::new(
@@ -297,12 +339,13 @@ impl Ui {
             &gfx,
             &front,
             &footer.fill_visual()?,
-            config.accent,
+            accent,
             &layout,
         )?;
         let strip = PowerStrip::new(&compositor, &gfx, &popup, layout.strip)?;
+        let context = ContextMenu::new(&compositor, &gfx, &popup)?;
         let ring = RoundRect::new(&compositor, CELL_RADIUS, RING_WIDTH)?;
-        ring.set_stroke(gfx::color(config.accent, 1.0))?;
+        ring.set_stroke(gfx::color(accent, 1.0))?;
         ring.show(false)?;
         top.Children()?.InsertAtTop(&ring.visual)?;
 
@@ -316,6 +359,8 @@ impl Ui {
             motion.add(object, kind);
         }
         motion.add(strip.motion_object()?, Kind::Visual);
+        // The grid's cells glide when pins are added or removed.
+        motion.set_group(grid.motion_objects()?)?;
 
         // Until the full app list arrives (a moment after startup), search
         // at least finds the pinned apps.
@@ -323,26 +368,28 @@ impl Ui {
             pinned: config.pinned.clone(),
             ..Default::default()
         };
+        catalog.set_launches(&config.stats.launch_counts);
         catalog.set_apps(grid.apps());
 
         let ui = Self {
             hwnd,
-            _compositor: compositor,
+            compositor,
             _target: target,
             root,
             shell,
             menu,
-            animator,
+            animator: RefCell::new(animator),
             motion,
             gfx,
             icons: IconCache::default(),
-            max_columns: config.max_columns,
+            max_columns: Cell::new(config.max_columns),
             layout: RefCell::new(layout),
             search,
             grid,
             results,
             footer,
             strip,
+            context,
             hover,
             ring,
             focus: Cell::new(Focus::Search),
@@ -361,7 +408,7 @@ impl Ui {
             stats: Cell::new(SearchStats::default()),
             music,
             music_mode: Cell::new(Music::Hidden),
-            tint_from_album: config.background.tint_from_album,
+            tint_from_album: Cell::new(config.background.tint_from_album),
             swallow_space: Cell::new(false),
             seek_drag: Cell::new(false),
             source_cache: RefCell::new(None),
@@ -373,7 +420,7 @@ impl Ui {
     /// The largest the menu gets, in DIPs (the window is made this big, so
     /// it never has to move while the menu grows or shrinks).
     pub fn max_size(&self) -> Vector2 {
-        layout::max_size(self.grid.len(), self.max_columns)
+        layout::max_size(self.grid.len(), self.max_columns.get())
     }
 
     /// The point the power strip grows out of (the power button's top).
@@ -397,6 +444,7 @@ impl Ui {
                 .refresh(&self.gfx, l.strip, Self::strip_origin(&l))?;
             self.results.resize(&self.gfx, &l)?;
             self.music.refresh(&self.gfx, &l)?;
+            self.context.refresh(&self.gfx)?;
             self.place_content()
         })?;
         self.paint_results()?;
@@ -475,6 +523,147 @@ impl Ui {
         self.shell.background.apply(&config.background, effects)
     }
 
+    // -----------------------------------------------------------------------
+    // Settings that change while running (config.toml reloads)
+    // -----------------------------------------------------------------------
+
+    /// New accent color: caret, focused search border, seek bar, focus ring.
+    pub fn set_accent(&self, accent: Rgb) -> Result<()> {
+        self.search.set_accent(&self.gfx, accent)?;
+        self.music.set_accent(accent)?;
+        self.ring.set_stroke(gfx::color(accent, 1.0))
+    }
+
+    /// New open/close timings and bounce: the animations are built again
+    /// (they are only templates, so nothing running is affected).
+    pub fn set_animation(&self, cfg: &crate::config::Animation) -> Result<()> {
+        let animator = Animator::new(&self.compositor, cfg)?;
+        *self.animator.borrow_mut() = animator;
+        Ok(())
+    }
+
+    /// Album tint on or off. Call `set_music` afterwards to apply it.
+    pub fn set_tint_from_album(&self, on: bool) {
+        self.tint_from_album.set(on);
+    }
+
+    /// The launch counts, for saving (IDs as first seen).
+    pub fn launch_counts(&self) -> HashMap<String, u32> {
+        self.catalog.borrow().launch_counts()
+    }
+
+    /// Launch counts from the config file (it was edited by hand).
+    pub fn set_launch_counts(&self, counts: &HashMap<String, u32>) {
+        self.catalog.borrow_mut().set_launches(counts);
+    }
+
+    /// New pins and/or column limit. Cells of apps that stay pinned glide
+    /// to their new place (220 ms) while the menu changes size; a new pin
+    /// pops in. Uninstalled pins are skipped.
+    ///
+    /// The window may have to grow first: `fit_window` gets the new largest
+    /// menu size (DIPs), moves the window if needed and returns its new
+    /// placement. That happens before anything glides, so moving the window
+    /// can't cut a glide short.
+    pub fn set_pins(
+        &self,
+        pins: &[String],
+        max_columns: usize,
+        fit_window: impl FnOnce(Vector2) -> Option<Placement>,
+    ) -> Result<()> {
+        let apps: Vec<crate::apps::App> = pins
+            .iter()
+            .filter_map(|aumid| crate::apps::find(aumid))
+            .collect();
+        let count = apps.len();
+        self.max_columns.set(max_columns);
+        {
+            let mut catalog = self.catalog.borrow_mut();
+            catalog.pinned = pins.to_vec();
+            catalog.refresh_items();
+        }
+        // Things are about to move: no popup or highlight left behind.
+        self.context.reset()?;
+        if self.strip.is_open() {
+            self.strip.reset()?;
+            if matches!(self.focus.get(), Focus::Strip(_)) {
+                self.focus.set(Focus::Search);
+            }
+        }
+        self.hovered.set(Target::Nothing);
+        self.hover.show(false)?;
+        if let Focus::Cell(i) = self.focus.get()
+            && i >= count
+        {
+            self.focus.set(if count > 0 {
+                Focus::Cell(count - 1)
+            } else {
+                Focus::Search
+            });
+        }
+
+        // The window first (instant, the menu stays where it is on screen).
+        if let Some(p) = fit_window(layout::max_size(count, max_columns)) {
+            self.set_layout(&p)?;
+        }
+
+        let (content, music, old_width) = {
+            let l = self.layout.borrow();
+            (l.content, l.music, l.size.X)
+        };
+        let new = layout::layout(count, max_columns, content, music);
+        let added = self.grid.set_apps(&self.gfx, apps)?;
+        // New cells start in their place (painted), then join the gliders.
+        self.grid.place(&self.gfx, &new.cells, &added)?;
+        self.grid.redraw_cells(&self.gfx, &self.icons, &added)?;
+        self.motion.set_group(self.grid.motion_objects()?)?;
+        let cells = new.cells.clone();
+        let width_changed = (new.size.X - old_width).abs() > 0.5;
+        *self.layout.borrow_mut() = new;
+
+        if width_changed {
+            // A different number of columns: the search box, footer and
+            // results change width too, and those are repainted, so this
+            // one happens at once (only with fewer pins than columns).
+            self.results.forget();
+            self.refresh()?;
+            return self.update_search(true);
+        }
+
+        let animate = self.is_open.get() && !self.reduced_motion.get();
+        let place = || {
+            self.grid.set_rects(&self.gfx, &cells)?;
+            self.place_content()
+        };
+        if animate {
+            self.motion.animate(place)?;
+        } else {
+            self.motion.instant(place)?;
+        }
+        // While open, a new pin pops in like the icons do on open (when
+        // closed, the next open's stagger shows it).
+        if self.is_open.get() {
+            let visuals = self.grid.animated_visuals()?;
+            let new_ones: Vec<Visual> = added
+                .iter()
+                .filter_map(|&i| visuals.get(i).cloned())
+                .collect();
+            if animate {
+                for v in &new_ones {
+                    self.animator.borrow().pop_icon(v)?;
+                }
+            } else {
+                Animator::stagger_done(&new_ones)?;
+            }
+        }
+        // Search results show "pinned first" and the list may be wider now.
+        if self.is_list() {
+            self.results.forget();
+            self.update_search(true)?;
+        }
+        self.update_focus_visuals()
+    }
+
     /// Call before showing a fully hidden window: the menu at scale 0, the
     /// search box empty and the pinned grid back (all instant).
     pub fn reset_closed(&self) -> Result<()> {
@@ -502,6 +691,7 @@ impl Ui {
         if fresh {
             // A fresh start: keyboard in the search box, nothing hovered.
             self.strip.reset()?;
+            self.context.reset()?;
             self.keyboard_nav.set(false);
             self.pressed.set(Target::Nothing);
             self.dragging.set(false);
@@ -514,16 +704,16 @@ impl Ui {
                 Animator::stagger_done(&icons)?;
                 Animator::stagger_done(&[card])?;
             } else {
-                self.animator.stagger_in(&icons)?;
+                self.animator.borrow().stagger_in(&icons)?;
                 if self.music_shown() {
                     // 40 ms after the last icon.
-                    self.animator.pop_card(&card, icons.len())?;
+                    self.animator.borrow().pop_card(&card, icons.len())?;
                 }
             }
         }
         self.update_focus_visuals()?;
         self.sync_seek()?;
-        self.animator.open(&self.menu, reduced_motion)
+        self.animator.borrow().open(&self.menu, reduced_motion)
     }
 
     pub fn animate_close(&self, reduced_motion: bool) -> Result<CompositionScopedBatch> {
@@ -550,7 +740,7 @@ impl Ui {
                 stats.slowest.as_micros()
             );
         }
-        self.animator.close(&self.menu, reduced_motion)
+        self.animator.borrow().close(&self.menu, reduced_motion)
     }
 
     // -----------------------------------------------------------------------
@@ -618,7 +808,7 @@ impl Ui {
     /// everything glides to its new place (220 ms) and what appears or
     /// disappears fades.
     fn relayout(&self, content: Content, music: Music) -> Result<()> {
-        let new = layout::layout(self.grid.len(), self.max_columns, content, music);
+        let new = layout::layout(self.grid.len(), self.max_columns.get(), content, music);
         let (old_content, old_music) = {
             let l = self.layout.borrow();
             (l.content, l.music)
@@ -794,7 +984,7 @@ impl Ui {
             .as_ref()
             .and_then(|v| v.info.cover.as_ref())
             .and_then(|c| c.color)
-            .filter(|_| self.tint_from_album);
+            .filter(|_| self.tint_from_album.get());
         let (name, icon) = match &view {
             Some(v) => self.source_app(&v.source_id),
             None => (String::new(), None),
@@ -943,7 +1133,7 @@ impl Ui {
         self.search.set_focused(in_search)?;
         let caret = self.search.caret_visual()?;
         if in_search && self.is_open.get() {
-            self.animator.blink(&caret)?;
+            self.animator.borrow().blink(&caret)?;
         } else {
             Animator::stop_blink(&caret, in_search)?;
         }
@@ -966,6 +1156,7 @@ impl Ui {
             _ => None,
         };
         self.strip.set_hover(strip_button)?;
+        self.context.set_hover(target == Target::Context)?;
         // The card has its own highlight (drawn above its dark panel).
         self.music.set_hover(match target {
             Target::Media(part) => Some(part),
@@ -989,6 +1180,14 @@ impl Ui {
     }
 
     fn hit(&self, p: Vector2) -> Target {
+        if self.context.is_open() {
+            if self.context.row().contains(p) {
+                return Target::Context;
+            }
+            if self.context.rect().contains(p) {
+                return Target::ContextPanel;
+            }
+        }
         if self.strip.is_open() {
             if let Some(i) = self.strip.hit(p) {
                 return Target::Strip(i);
@@ -1024,18 +1223,112 @@ impl Ui {
     }
 
     // -----------------------------------------------------------------------
+    // Right-click menu (Pin / Unpin)
+    // -----------------------------------------------------------------------
+
+    /// WM_CONTEXTMENU: a right-click at (`x`, `y`) window pixels, or `None`
+    /// for the keyboard (Shift+F10 or the Menu key), which uses the focused
+    /// icon or the highlighted search result. Opens the menu for that app,
+    /// or closes it when there is no app there.
+    pub fn context_menu(&self, at: Option<(i32, i32)>) -> Result<()> {
+        if !self.is_open.get() {
+            return Ok(());
+        }
+        let found = match at {
+            Some((x, y)) => {
+                let Some(p) = self.to_menu(x, y) else {
+                    return Ok(());
+                };
+                let id = match self.hit(p) {
+                    // A right-click on the menu itself does nothing.
+                    Target::Context | Target::ContextPanel => return Ok(()),
+                    Target::Cell(i) => self.grid.aumid(i),
+                    Target::Row(i) => self.result_id(i),
+                    _ => None,
+                };
+                id.map(|id| (id, p))
+            }
+            None => {
+                let (id, rect) = match self.focus.get() {
+                    Focus::Cell(i) => (self.grid.aumid(i), self.grid.rect(i)),
+                    Focus::Search if self.is_list() => {
+                        let row = self.selected.get();
+                        (self.result_id(row), self.results.rect(row))
+                    }
+                    _ => (None, None),
+                };
+                // Out of the lower part of the icon or row.
+                id.zip(rect).map(|(id, r)| {
+                    let p = Vector2 {
+                        X: r.x + r.w / 2.0,
+                        Y: r.y + r.h * 0.75,
+                    };
+                    (id, p)
+                })
+            }
+        };
+        let Some((id, p)) = found else {
+            return self.close_context();
+        };
+        if self.strip.is_open() {
+            self.close_strip(self.focus.get())?;
+        }
+        let pinned = self.catalog.borrow().is_pinned(&id);
+        let size = self.layout.borrow().size;
+        self.context.open(
+            &self.gfx,
+            &self.animator.borrow(),
+            MenuTarget { id, pinned },
+            p,
+            size,
+            self.reduced_motion.get(),
+        )?;
+        // The mouse may already be over the new row.
+        self.hovered.set(Target::Nothing);
+        Ok(())
+    }
+
+    fn close_context(&self) -> Result<()> {
+        if !self.context.is_open() {
+            return Ok(());
+        }
+        self.context
+            .close(&self.animator.borrow(), self.reduced_motion.get())?;
+        if matches!(self.hovered.get(), Target::Context | Target::ContextPanel) {
+            self.set_hovered(Target::Nothing)?;
+        }
+        Ok(())
+    }
+
+    /// The menu's row was clicked (or Enter): pin or unpin, and close it.
+    fn activate_context(&self) -> Result<Action> {
+        let Some(target) = self.context.target() else {
+            return Ok(Action::None);
+        };
+        self.close_context()?;
+        Ok(if target.pinned {
+            Action::Unpin(target.id)
+        } else {
+            Action::Pin(target.id)
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // Power strip
     // -----------------------------------------------------------------------
 
     fn open_strip(&self) -> Result<()> {
-        self.strip
-            .open(&self.gfx, &self.animator, self.reduced_motion.get())?;
+        self.strip.open(
+            &self.gfx,
+            &self.animator.borrow(),
+            self.reduced_motion.get(),
+        )?;
         self.set_focus(Focus::Strip(0))
     }
 
     fn close_strip(&self, focus_after: Focus) -> Result<()> {
         self.strip
-            .close(&self.animator, self.reduced_motion.get())?;
+            .close(&self.animator.borrow(), self.reduced_motion.get())?;
         if matches!(self.hovered.get(), Target::Strip(_) | Target::StripPanel) {
             self.set_hovered(Target::Nothing)?;
         }
@@ -1083,6 +1376,23 @@ impl Ui {
         let vk = VIRTUAL_KEY(vk);
         if vk != VK_SPACE {
             self.swallow_space.set(false);
+        }
+        // The right-click menu takes Enter / Space / Esc; any other key
+        // closes it and then does its normal job.
+        if self.context.is_open() {
+            match vk {
+                VK_RETURN => return self.activate_context(),
+                VK_SPACE => {
+                    // Its WM_CHAR must not type a space.
+                    self.swallow_space.set(true);
+                    return self.activate_context();
+                }
+                VK_ESCAPE => {
+                    self.close_context()?;
+                    return Ok(Action::None);
+                }
+                _ => self.close_context()?,
+            }
         }
         if vk == VK_ESCAPE {
             // Esc closes the innermost thing: strip, then text, then menu.
@@ -1322,6 +1632,7 @@ impl Ui {
         if !is_text {
             return Ok(());
         }
+        self.close_context()?;
         if self.focus.get() != Focus::Search {
             if self.strip.is_open() {
                 self.close_strip(Focus::Search)?;
@@ -1340,7 +1651,7 @@ impl Ui {
     fn after_edit(&self) -> Result<()> {
         self.search.redraw_text(&self.gfx)?;
         if self.is_open.get() && self.focus.get() == Focus::Search {
-            self.animator.blink(&self.search.caret_visual()?)?;
+            self.animator.borrow().blink(&self.search.caret_visual()?)?;
         }
         self.update_search(false)
     }
@@ -1445,6 +1756,12 @@ impl Ui {
         // The mouse is in charge now: hide the focus ring.
         self.keyboard_nav.set(false);
         let target = self.hit(p);
+        if self.context.is_open() && !matches!(target, Target::Context | Target::ContextPanel) {
+            // A click outside the right-click menu only closes it.
+            self.close_context()?;
+            self.pressed.set(Target::Nothing);
+            return Ok(Action::None);
+        }
         if self.strip.is_open() && !matches!(target, Target::Strip(_) | Target::StripPanel) {
             // A click outside the strip only closes the strip.
             self.close_strip(Focus::Search)?;
@@ -1509,6 +1826,7 @@ impl Ui {
                 Ok(Action::None)
             }
             Target::Strip(i) => self.press_strip(i),
+            Target::Context => self.activate_context(),
             _ => Ok(Action::None),
         }
     }

@@ -5,7 +5,9 @@
 //! moves only the inner one (rise, grow, fade in), so the layout and the
 //! animation never fight over the same property.
 
-use windows::UI::Composition::{Compositor, ContainerVisual, Visual};
+use std::cell::RefCell;
+
+use windows::UI::Composition::{CompositionObject, Compositor, ContainerVisual, Visual};
 use windows::Win32::Graphics::Direct2D::D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, IDWriteTextFormat,
@@ -34,10 +36,12 @@ struct Cell {
 }
 
 pub struct Grid {
+    compositor: Compositor,
     /// Holds every cell; faded out while search results show.
     root: ContainerVisual,
-    cells: Vec<Cell>,
-    rects: std::cell::RefCell<Vec<Rect>>,
+    /// Changes when pins are added or removed (config reload, right-click).
+    cells: RefCell<Vec<Cell>>,
+    rects: RefCell<Vec<Rect>>,
     label_format: IDWriteTextFormat,
 }
 
@@ -49,45 +53,90 @@ impl Grid {
         parent: &ContainerVisual,
         apps: Vec<App>,
     ) -> Result<Self> {
-        let size = Vector2 { X: CELL, Y: CELL };
         let root = c.CreateContainerVisual()?;
         parent.Children()?.InsertAtTop(&root)?;
-        let mut cells = Vec::with_capacity(apps.len());
-        for app in apps {
-            let outer = c.CreateContainerVisual()?;
-            outer.SetSize(size)?;
-            let canvas = Canvas::new(c, gfx, size)?;
-            // Grow from the cell's center.
-            canvas.visual.SetCenterPoint(Vector3 {
-                X: CELL / 2.0,
-                Y: CELL / 2.0,
-                Z: 0.0,
-            })?;
-            outer.Children()?.InsertAtTop(&canvas.visual)?;
-            root.Children()?.InsertAtTop(&outer)?;
-            cells.push(Cell { outer, canvas, app });
-        }
-        Ok(Self {
+        let grid = Self {
+            compositor: c.clone(),
             root,
-            cells,
+            cells: RefCell::new(Vec::with_capacity(apps.len())),
             rects: Default::default(),
             label_format: gfx.text_format(LABEL_SIZE, DWRITE_FONT_WEIGHT_NORMAL)?,
-        })
+        };
+        let cells = apps
+            .into_iter()
+            .map(|app| grid.new_cell(gfx, app))
+            .collect::<Result<Vec<_>>>()?;
+        *grid.cells.borrow_mut() = cells;
+        Ok(grid)
+    }
+
+    /// A cell for `app`, added to the grid's visual tree (not yet painted
+    /// or placed).
+    fn new_cell(&self, gfx: &Gfx, app: App) -> Result<Cell> {
+        let size = Vector2 { X: CELL, Y: CELL };
+        let outer = self.compositor.CreateContainerVisual()?;
+        outer.SetSize(size)?;
+        let canvas = Canvas::new(&self.compositor, gfx, size)?;
+        // Grow from the cell's center.
+        canvas.visual.SetCenterPoint(Vector3 {
+            X: CELL / 2.0,
+            Y: CELL / 2.0,
+            Z: 0.0,
+        })?;
+        outer.Children()?.InsertAtTop(&canvas.visual)?;
+        self.root.Children()?.InsertAtTop(&outer)?;
+        Ok(Cell { outer, canvas, app })
+    }
+
+    /// Replaces the pinned apps with `apps`, in that order. Cells of apps
+    /// that stay pinned are kept (the same visuals, so they can glide to
+    /// their new place); the others are removed. Returns the indexes of the
+    /// new cells: they still need to be placed and painted.
+    pub fn set_apps(&self, gfx: &Gfx, apps: Vec<App>) -> Result<Vec<usize>> {
+        let mut old = std::mem::take(&mut *self.cells.borrow_mut());
+        let mut cells = Vec::with_capacity(apps.len());
+        let mut added = Vec::new();
+        for app in apps {
+            let same = |c: &Cell| c.app.aumid.eq_ignore_ascii_case(&app.aumid);
+            match old.iter().position(same) {
+                Some(i) => cells.push(old.remove(i)),
+                None => {
+                    added.push(cells.len());
+                    cells.push(self.new_cell(gfx, app)?);
+                }
+            }
+        }
+        let children = self.root.Children()?;
+        for gone in old {
+            children.Remove(&gone.outer)?;
+        }
+        *self.cells.borrow_mut() = cells;
+        Ok(added)
     }
 
     pub fn len(&self) -> usize {
-        self.cells.len()
+        self.cells.borrow().len()
     }
 
     /// The AUMID of pin `i` (what `shell:AppsFolder\…` launches).
     pub fn aumid(&self, i: usize) -> Option<String> {
-        self.cells.get(i).map(|c| c.app.aumid.clone())
+        self.cells.borrow().get(i).map(|c| c.app.aumid.clone())
     }
 
     /// The pinned apps, as plain data (the search list before the full app
     /// list has loaded).
     pub fn apps(&self) -> Vec<crate::apps::AppInfo> {
-        self.cells.iter().filter_map(|c| c.app.info()).collect()
+        self.cells
+            .borrow()
+            .iter()
+            .filter_map(|c| c.app.info())
+            .collect()
+    }
+
+    /// Each cell's outer visual: these glide when the grid is laid out
+    /// again (see `LayoutMotion::set_group`).
+    pub fn motion_objects(&self) -> Result<Vec<CompositionObject>> {
+        self.cells.borrow().iter().map(|c| c.outer.cast()).collect()
     }
 
     /// The container of all cells (faded out while searching).
@@ -106,28 +155,51 @@ impl Grid {
 
     /// The inner (animated) visual of every cell, in order.
     pub fn animated_visuals(&self) -> Result<Vec<Visual>> {
-        self.cells.iter().map(|c| c.canvas.visual.cast()).collect()
+        self.cells
+            .borrow()
+            .iter()
+            .map(|c| c.canvas.visual.cast())
+            .collect()
     }
 
     /// Places the cells. `rects` comes from the layout, one per cell.
     pub fn set_rects(&self, gfx: &Gfx, rects: &[Rect]) -> Result<()> {
+        let all: Vec<usize> = (0..rects.len()).collect();
+        self.place(gfx, rects, &all)?;
+        *self.rects.borrow_mut() = rects.to_vec();
+        Ok(())
+    }
+
+    /// Moves only the cells `which` to their place in `rects` (so a new
+    /// cell starts where it belongs instead of gliding in from a corner).
+    pub fn place(&self, gfx: &Gfx, rects: &[Rect], which: &[usize]) -> Result<()> {
         let s = gfx.scale();
-        for (cell, r) in self.cells.iter().zip(rects) {
+        let cells = self.cells.borrow();
+        for &i in which {
+            let (Some(cell), Some(r)) = (cells.get(i), rects.get(i)) else {
+                continue;
+            };
             cell.outer.SetOffset(Vector3 {
                 X: gfx::snap(r.x, s),
                 Y: gfx::snap(r.y, s),
                 Z: 0.0,
             })?;
         }
-        *self.rects.borrow_mut() = rects.to_vec();
         Ok(())
     }
 
     /// Paints every cell at the current DPI scale.
     pub fn redraw(&self, gfx: &Gfx, icons: &IconCache) -> Result<()> {
+        let all: Vec<usize> = (0..self.len()).collect();
+        self.redraw_cells(gfx, icons, &all)
+    }
+
+    /// Paints the cells `which` at the current DPI scale.
+    pub fn redraw_cells(&self, gfx: &Gfx, icons: &IconCache, which: &[usize]) -> Result<()> {
         let size = Vector2 { X: CELL, Y: CELL };
         let icon_px = gfx.px(ICON);
-        for cell in &self.cells {
+        let cells = self.cells.borrow();
+        for cell in which.iter().filter_map(|&i| cells.get(i)) {
             cell.canvas.resize(gfx, size)?;
             let icon = icons
                 .get(gfx, &cell.app.aumid, &cell.app.item, icon_px)

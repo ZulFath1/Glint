@@ -120,7 +120,7 @@ fn account_picture(px: i32) -> Option<String> {
     bigger.or_else(|| SIZES.iter().rev().find_map(|&s| read(s)))
 }
 
-fn draw_text(
+pub(super) fn draw_text(
     ctx: &ID2D1DeviceContext,
     gfx: &Gfx,
     text: &str,

@@ -1,36 +1,48 @@
-//! Notification-area (tray) icon with a right-click menu.
+//! Notification-area (tray) icon with a right-click menu, and small
+//! non-blocking notices (balloons / toasts) such as "config.toml has an
+//! error on line 12".
 
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, IDI_APPLICATION, LoadIconW,
-    MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, SetForegroundWindow,
-    TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, IDI_APPLICATION, LoadIconW,
+    MF_SEPARATOR, MF_STRING, PostMessageW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_NULL,
 };
-use windows::core::{HSTRING, PCWSTR, Result, w};
-
-use crate::config::{BackgroundMode, Preset, TINT_STEPS};
+use windows::core::{Result, w};
 
 /// Tray events arrive at the window as this message.
 pub const WM_APP_TRAY: u32 = WM_APP + 2;
 
 const ICON_ID: u32 = 1;
 const CMD_QUIT: usize = 1;
-const CMD_MODE_BASE: usize = 100;
-const CMD_PRESET_BASE: usize = 200;
-const CMD_TINT_BASE: usize = 300;
+const CMD_OPEN_CONFIG: usize = 2;
+const CMD_RELOAD_CONFIG: usize = 3;
 
 pub enum TrayCommand {
     Quit,
-    SetMode(BackgroundMode),
-    SetPreset(Preset),
-    SetTint(f32),
+    OpenConfig,
+    ReloadConfig,
 }
 
 pub struct Tray {
     hwnd: HWND,
+}
+
+/// Copies `text` into a fixed-size UTF-16 field, cut short (with "…") if
+/// it doesn't fit, always leaving room for the terminating zero.
+fn fill(field: &mut [u16], text: &str) {
+    let max = field.len() - 1;
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    if units.len() > max {
+        units.truncate(max - 1);
+        units.push('…' as u16);
+    }
+    field[..units.len()].copy_from_slice(&units);
+    field[units.len()] = 0;
 }
 
 impl Tray {
@@ -59,62 +71,38 @@ impl Tray {
             hIcon: unsafe { LoadIconW(None, IDI_APPLICATION)? },
             ..Default::default()
         };
-        let tip: Vec<u16> = "Glint".encode_utf16().collect();
-        data.szTip[..tip.len()].copy_from_slice(&tip);
+        fill(&mut data.szTip, "Glint");
         Ok(data)
     }
 
+    /// Shows a small notice next to the tray icon (a Windows notification).
+    /// It never blocks: Windows shows and hides it on its own.
+    pub fn notify(&self, title: &str, text: &str, warning: bool) {
+        let Ok(mut data) = self.data() else {
+            return;
+        };
+        data.uFlags = NIF_INFO;
+        data.dwInfoFlags = if warning { NIIF_WARNING } else { NIIF_INFO };
+        fill(&mut data.szInfoTitle, title);
+        fill(&mut data.szInfo, text);
+        // SAFETY: `data` is a fully initialized NOTIFYICONDATAW for our icon.
+        if let Err(e) = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data).ok() } {
+            log_warn!("tray notice failed: {e}");
+        }
+    }
+
     /// Shows the right-click menu at the cursor and returns the chosen item.
-    /// The Background/Preset submenus are a testing convenience until the
-    /// config file arrives (milestone 6).
-    pub fn show_menu(
-        &self,
-        mode: BackgroundMode,
-        preset: Preset,
-        tint: f32,
-    ) -> Option<TrayCommand> {
-        // SAFETY: creates, shows and destroys menus owned by this function
-        // (destroying the main menu also destroys its submenus). Item labels
-        // are HSTRINGs that outlive the AppendMenuW calls. The
-        // SetForegroundWindow / WM_NULL dance is the documented way to make
-        // tray menus close when the user clicks elsewhere.
+    pub fn show_menu(&self) -> Option<TrayCommand> {
+        // SAFETY: creates, shows and destroys a menu owned by this function.
+        // The labels are static strings. The SetForegroundWindow / WM_NULL
+        // dance is the documented way to make tray menus close when the user
+        // clicks elsewhere.
         unsafe {
             let menu = CreatePopupMenu().ok()?;
-            let add = |m: HMENU, id: usize, label: &str, checked: bool| {
-                let label = HSTRING::from(label);
-                let flags = if checked {
-                    MF_STRING | MF_CHECKED
-                } else {
-                    MF_STRING
-                };
-                let _ = AppendMenuW(m, flags, id, PCWSTR(label.as_ptr()));
-            };
-
-            if let Ok(modes) = CreatePopupMenu() {
-                for (i, m) in BackgroundMode::ALL.into_iter().enumerate() {
-                    add(modes, CMD_MODE_BASE + i, m.name(), m == mode);
-                }
-                let _ = AppendMenuW(menu, MF_POPUP, modes.0 as usize, w!("Background"));
-            }
-            if let Ok(presets) = CreatePopupMenu() {
-                for (i, p) in Preset::BUILT_IN.into_iter().enumerate() {
-                    add(presets, CMD_PRESET_BASE + i, p.name(), p == preset);
-                }
-                let _ = AppendMenuW(menu, MF_POPUP, presets.0 as usize, w!("Preset"));
-            }
-            if let Ok(tints) = CreatePopupMenu() {
-                for (i, &t) in TINT_STEPS.iter().enumerate() {
-                    let label = if t == 0.0 {
-                        "0% (colourless glass)".to_string()
-                    } else {
-                        format!("{:.0}%", t * 100.0)
-                    };
-                    add(tints, CMD_TINT_BASE + i, &label, (t - tint).abs() < 0.01);
-                }
-                let _ = AppendMenuW(menu, MF_POPUP, tints.0 as usize, w!("Glass tint"));
-            }
+            let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_CONFIG, w!("Open config file"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_RELOAD_CONFIG, w!("Reload config"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            add(menu, CMD_QUIT, "Quit Glint", false);
+            let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit Glint"));
 
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
@@ -130,29 +118,14 @@ impl Tray {
             );
             let _ = PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
             let _ = DestroyMenu(menu);
-            command_for(chosen.0 as usize)
+            match chosen.0 as usize {
+                CMD_QUIT => Some(TrayCommand::Quit),
+                CMD_OPEN_CONFIG => Some(TrayCommand::OpenConfig),
+                CMD_RELOAD_CONFIG => Some(TrayCommand::ReloadConfig),
+                _ => None,
+            }
         }
     }
-}
-
-fn command_for(id: usize) -> Option<TrayCommand> {
-    if id == CMD_QUIT {
-        return Some(TrayCommand::Quit);
-    }
-    if let Some(&m) = id
-        .checked_sub(CMD_MODE_BASE)
-        .and_then(|i| BackgroundMode::ALL.get(i))
-    {
-        return Some(TrayCommand::SetMode(m));
-    }
-    id.checked_sub(CMD_PRESET_BASE)
-        .and_then(|i| Preset::BUILT_IN.get(i))
-        .map(|&p| TrayCommand::SetPreset(p))
-        .or_else(|| {
-            id.checked_sub(CMD_TINT_BASE)
-                .and_then(|i| TINT_STEPS.get(i))
-                .map(|&t| TrayCommand::SetTint(t))
-        })
 }
 
 impl Drop for Tray {
@@ -163,5 +136,24 @@ impl Drop for Tray {
                 let _ = Shell_NotifyIconW(NIM_DELETE, &data);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fill;
+
+    #[test]
+    fn long_notice_text_is_cut_with_an_ellipsis() {
+        let mut field = [1u16; 8];
+        fill(&mut field, "short");
+        assert_eq!(
+            &field[..6],
+            &"short\0".encode_utf16().collect::<Vec<_>>()[..]
+        );
+        fill(&mut field, "much too long");
+        assert_eq!(field[7], 0);
+        assert_eq!(field[6], '…' as u16);
+        assert_eq!(String::from_utf16_lossy(&field[..6]), "much t");
     }
 }

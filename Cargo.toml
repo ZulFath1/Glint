@@ -10,6 +10,11 @@ publish = false
 # Part of windows-rs: the Vector2/Vector3 types that the `windows` crate's
 # Composition APIs take. Already pulled in by `windows`; adds no extra code.
 windows-numerics = "0.3"
+# Milestone 6: config.toml. `serde` turns the file into our Config struct;
+# `toml_edit` parses it (with error positions, for "line 12") and edits it
+# while keeping the user's comments and formatting. One TOML parser only.
+serde = { version = "1", features = ["derive"] }
+toml_edit = { version = "0.25", features = ["serde"] }
 
 [dependencies.windows]
 version = "0.62"
@@ -45,6 +50,10 @@ features = [
   # Display name (GetUserNameExW) and the account picture lookup.
   "Win32_Security_Authentication_Identity",
   "Win32_Security_Authorization",
+  # Milestone 6: watching config.toml (ReadDirectoryChangesW) and the
+  # atomic save (MoveFileExW).
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
   "Win32_System_Com",
   # Clipboard for the search box.
   "Win32_System_DataExchange",

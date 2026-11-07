@@ -1,5 +1,6 @@
 //! Watches the Windows settings that change how the menu looks or moves:
-//! "Transparency effects", battery saver and "Animation effects".
+//! "Transparency effects", battery saver and "Animation effects", plus the
+//! Windows accent color (for `accent = "system"`).
 //!
 //! Event-driven only: Windows tells us when something changes, and we post a
 //! message to the UI window, which re-applies the background.
@@ -7,7 +8,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, Ordering};
 use windows::Foundation::TypedEventHandler;
-use windows::UI::ViewManagement::UISettings;
+use windows::UI::ViewManagement::{UIColorType, UISettings};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, WPARAM};
 
 use windows::Win32::System::Power::{
@@ -20,6 +21,7 @@ use windows::Win32::System::SystemServices::GUID_POWER_SAVING_STATUS;
 use windows::Win32::UI::WindowsAndMessaging::{DEVICE_NOTIFY_WINDOW_HANDLE, PostMessageW, WM_APP};
 use windows::core::Result;
 
+use crate::config::Rgb;
 use crate::ui::background::SystemEffects;
 
 /// Posted to the UI window when transparency or battery saver changed.
@@ -102,6 +104,17 @@ impl SettingsWatch {
     /// Windows "Animation effects" setting. Off = reduced motion.
     pub fn animations_enabled(&self) -> bool {
         self.ui_settings.AnimationsEnabled().unwrap_or(true)
+    }
+
+    /// The Windows accent color, in the lighter shade Windows itself uses
+    /// for accent text on dark backgrounds (readable on our dark menu).
+    /// For `accent = "system"`. Re-read on WM_SETTINGCHANGE.
+    pub fn accent(&self) -> Option<Rgb> {
+        self.ui_settings
+            .GetColorValue(UIColorType::AccentLight2)
+            .inspect_err(|e| log_warn!("can't read the Windows accent color: {e}"))
+            .ok()
+            .map(|c| Rgb::new(c.R, c.G, c.B))
     }
 }
 

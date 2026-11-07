@@ -248,6 +248,47 @@ pub fn launch(id: String) {
     }
 }
 
+/// Opens a file with its default app (for config.toml), on a short-lived
+/// thread. If no app is set for that file type, it opens in Notepad.
+pub fn open_document(path: std::path::PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("glint-open".into())
+        .spawn(move || {
+            let _com = ComGuard::new();
+            let file = HSTRING::from(path.as_os_str());
+            // SAFETY: `file` lives across the calls; no window, no pointers
+            // kept by the shell.
+            let code = unsafe { ShellExecuteW(None, w!("open"), &file, None, None, SW_SHOWNORMAL) };
+            // ShellExecute returns a value > 32 on success.
+            if code.0 as isize > 32 {
+                return;
+            }
+            log_info!(
+                "no app opens {} ({}); using Notepad",
+                path.display(),
+                code.0 as isize
+            );
+            let quoted = HSTRING::from(format!("\"{}\"", path.display()));
+            // SAFETY: as above.
+            let code = unsafe {
+                ShellExecuteW(
+                    None,
+                    w!("open"),
+                    w!("notepad.exe"),
+                    &quoted,
+                    None,
+                    SW_SHOWNORMAL,
+                )
+            };
+            if code.0 as isize <= 32 {
+                log_error!("opening {} failed ({})", path.display(), code.0 as isize);
+            }
+        });
+    if let Err(e) = spawned {
+        log_error!("could not start the open thread: {e}");
+    }
+}
+
 /// Watches the AppsFolder and both Start-menu "Programs" folders. The shell
 /// then posts [`WM_APP_APPS_CHANGED`] to our window when something changes.
 /// No polling: the shell tells us.

@@ -22,8 +22,8 @@ use std::time::Instant;
 
 use windows::Foundation::TimeSpan;
 use windows::UI::Composition::{
-    CompositionEasingFunction, CompositionObject, Compositor, ContainerVisual,
-    ScalarKeyFrameAnimation, SpriteVisual, Visual,
+    CompositionColorBrush, CompositionEasingFunction, CompositionObject, Compositor,
+    ContainerVisual, ScalarKeyFrameAnimation, SpriteVisual, Visual,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT, ID2D1Bitmap1, ID2D1DeviceContext,
@@ -430,6 +430,14 @@ impl MusicCard {
 
     pub fn view(&self) -> Option<MusicView> {
         self.view.borrow().clone()
+    }
+
+    /// A new accent color (config reload): the seek bar's fill.
+    pub fn set_accent(&self, accent: Rgb) -> Result<()> {
+        self.fill
+            .Brush()?
+            .cast::<CompositionColorBrush>()?
+            .SetColor(gfx::color(accent, 1.0))
     }
 
     pub fn is_playing(&self) -> bool {

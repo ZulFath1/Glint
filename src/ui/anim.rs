@@ -192,6 +192,11 @@ impl Animator {
         v.StartAnimation(h!("Scale"), &s.scale)
     }
 
+    /// Pops one newly pinned icon in (the menu is already open).
+    pub fn pop_icon(&self, visual: &Visual) -> Result<()> {
+        self.pop_after(visual, 0)
+    }
+
     /// Shows the icons at rest, with no animation (reduced motion).
     pub fn stagger_done(visuals: &[Visual]) -> Result<()> {
         for v in visuals {
@@ -435,6 +440,9 @@ pub struct LayoutMotion {
     fade_in: ScalarKeyFrameAnimation,
     fade_out: ScalarKeyFrameAnimation,
     objects: std::cell::RefCell<Vec<(CompositionObject, Kind)>>,
+    /// Visuals that come and go (the pinned grid's cells); replaced as a
+    /// whole by [`LayoutMotion::set_group`].
+    group: std::cell::RefCell<Vec<CompositionObject>>,
     attached: std::cell::Cell<bool>,
 }
 
@@ -479,6 +487,7 @@ impl LayoutMotion {
             fade_in: fade(1.0)?,
             fade_out: fade(0.0)?,
             objects: Default::default(),
+            group: Default::default(),
             attached: Default::default(),
         })
     }
@@ -486,6 +495,38 @@ impl LayoutMotion {
     /// Registers an object whose layout properties should glide.
     pub fn add(&self, object: CompositionObject, kind: Kind) {
         self.objects.borrow_mut().push((object, kind));
+    }
+
+    /// Replaces the group of visuals that come and go (the grid's cells).
+    /// Call it after a new visual has been put in its starting place, so it
+    /// doesn't glide there from a corner.
+    pub fn set_group(&self, visuals: Vec<CompositionObject>) -> Result<()> {
+        let attached = self.attached.get();
+        for v in &visuals {
+            if attached {
+                v.SetImplicitAnimations(&self.visual)?;
+            }
+        }
+        // The ones that left: no implicit animations kept alive by them.
+        let old = std::mem::replace(&mut *self.group.borrow_mut(), visuals);
+        for v in old {
+            if !self.group.borrow().contains(&v) {
+                v.SetImplicitAnimations(None::<&ImplicitAnimationCollection>)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every registered object, the group included.
+    fn all(&self) -> Vec<(CompositionObject, Kind)> {
+        let mut all = self.objects.borrow().clone();
+        all.extend(
+            self.group
+                .borrow()
+                .iter()
+                .map(|v| (v.clone(), Kind::Visual)),
+        );
+        all
     }
 
     fn collection(&self, kind: Kind) -> &ImplicitAnimationCollection {
@@ -500,8 +541,8 @@ impl LayoutMotion {
     /// glides there over 220 ms.
     pub fn animate<T>(&self, change: impl FnOnce() -> Result<T>) -> Result<T> {
         if !self.attached.replace(true) {
-            for (object, kind) in self.objects.borrow().iter() {
-                if let Err(e) = object.SetImplicitAnimations(self.collection(*kind)) {
+            for (object, kind) in self.all() {
+                if let Err(e) = object.SetImplicitAnimations(self.collection(kind)) {
                     log_warn!("layout animation not supported on a {kind:?}: {e}");
                 }
             }
@@ -513,12 +554,13 @@ impl LayoutMotion {
     /// once. Glides still running are stopped first (a running animation
     /// would otherwise keep overriding the new value).
     pub fn instant<T>(&self, change: impl FnOnce() -> Result<T>) -> Result<T> {
+        let all = self.all();
         if self.attached.replace(false) {
-            for (object, _) in self.objects.borrow().iter() {
+            for (object, _) in &all {
                 object.SetImplicitAnimations(None::<&ImplicitAnimationCollection>)?;
             }
         }
-        for (object, kind) in self.objects.borrow().iter() {
+        for (object, kind) in &all {
             for property in kind.properties() {
                 object.StopAnimation(&HSTRING::from(*property))?;
             }

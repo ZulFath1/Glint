@@ -494,6 +494,17 @@ impl SearchBox {
         self.caret.cast()
     }
 
+    /// A new accent color (config reload): caret, focused border, selection.
+    pub fn set_accent(&self, gfx: &Gfx, accent: Rgb) -> Result<()> {
+        self.accent.set(accent);
+        self.caret
+            .Brush()?
+            .cast::<windows::UI::Composition::CompositionColorBrush>()?
+            .SetColor(gfx::color(accent, 1.0))?;
+        self.set_focused(self.focused.get())?;
+        self.redraw_text(gfx)
+    }
+
     /// The search box has the keyboard: accent border, caret shown.
     pub fn set_focused(&self, focused: bool) -> Result<()> {
         self.focused.set(focused);

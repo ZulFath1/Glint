@@ -1,8 +1,9 @@
 //! Glint: a tiny, smooth Start menu for Windows 11.
 //!
 //! Startup order: single-instance check → DPI awareness → WinRT + dispatcher
-//! queue → hidden window → composition tree (and painting the content) →
-//! tray icon → keyboard hook → message loop.
+//! queue → config.toml (created on first run) → hidden window → composition
+//! tree (and painting the content) → config watcher → tray icon → keyboard
+//! hook → hotkey → message loop.
 
 // Release builds have no console window.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -11,6 +12,7 @@
 mod log;
 mod apps;
 mod config;
+mod config_watch;
 mod hook;
 mod icons;
 mod media;
@@ -22,6 +24,7 @@ mod ui;
 mod window;
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -47,23 +50,26 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::Ime::ISC_SHOWUICOMPOSITIONWINDOW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_SHIFT,
+    GetKeyState, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, TME_LEAVE,
+    TRACKMOUSEEVENT, TrackMouseEvent, UnregisterHotKey, VK_CONTROL, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW, HTCLIENT,
     IDC_IBEAM, KillTimer, LoadCursorW, MSG, PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE,
     PostMessageW, PostQuitMessage, RegisterWindowMessageW, SC_KEYMENU, SW_SHOWNORMAL, SetCursor,
-    SetTimer, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_DPICHANGED,
-    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_POWERBROADCAST,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER,
-    WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK,
+    SetTimer, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE,
+    WM_CONTEXTMENU, WM_DPICHANGED, WM_ENDSESSION, WM_HOTKEY, WM_IME_COMPOSITION,
+    WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_POWERBROADCAST, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WM_WTSSESSION_CHANGE,
+    WTS_SESSION_UNLOCK,
 };
 use windows::core::{Result, w};
 
 use apps::{AppInfo, ChangeWatch, WM_APP_APPS_CHANGED, WM_APP_APPS_LOADED};
-use config::Config;
+use config::{Accent, Config, ConfigError, Rgb};
+use config_watch::{ConfigWatch, WM_APP_CONFIG_CHANGED};
 use hook::{HookThread, WM_APP_TOGGLE};
 use media::{Media, WM_APP_MEDIA, WM_APP_MEDIA_INFO, WM_APP_MEDIA_READY};
 use settings_watch::{SettingsWatch, WM_APP_SETTINGS_CHANGED};
@@ -119,12 +125,78 @@ struct App {
     _app_watch: Option<ChangeWatch>,
     /// What is playing (the music card).
     media: Media,
+    /// `%APPDATA%\Glint\config.toml` (None if APPDATA isn't set: then the
+    /// defaults are used and nothing is saved).
+    config_path: Option<PathBuf>,
+    /// Tells us when config.toml changes (None if that failed).
+    _config_watch: Option<ConfigWatch>,
+    /// Launches not written to config.toml yet.
+    stats_dirty: Cell<bool>,
+    /// The `hotkey` from the config is registered.
+    hotkey_on: Cell<bool>,
+    /// The accent color in use (resolved, also for `accent = "system"`).
+    accent: Cell<Rgb>,
 }
 
 /// WM_TIMER id: an app was installed or removed; wait until things settle.
 const TIMER_APPS_SETTLE: usize = 1;
 /// Installers create and delete many files; scan only after 2 s of quiet.
 const APPS_SETTLE_MS: u32 = 2000;
+/// WM_TIMER id: config.toml changed; reload after a short quiet moment.
+/// (Ids 2 and 3 are the UI's.)
+const TIMER_CONFIG: usize = 4;
+/// Editors save in several steps (temp file, rename...): wait this long.
+const CONFIG_SETTLE_MS: u32 = 300;
+/// WM_TIMER id: write the launch counts to config.toml.
+const TIMER_SAVE_STATS: usize = 5;
+/// Not on every launch: a few seconds after the last one.
+const SAVE_STATS_MS: u32 = 5000;
+/// RegisterHotKey id for the `hotkey` setting.
+const HOTKEY_ID: i32 = 1;
+
+/// The accent color to draw with.
+fn resolve_accent(config: &Config, settings: &SettingsWatch) -> Rgb {
+    match config.accent {
+        Accent::Color(c) => c,
+        Accent::System => settings.accent().unwrap_or(config::DEFAULT_ACCENT),
+    }
+}
+
+/// The default pins that are installed on this PC (for a new config file).
+fn installed_default_pins() -> Vec<String> {
+    config::DEFAULT_PINS
+        .iter()
+        .filter(|aumid| apps::find(aumid).is_some())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Writes a fresh config.toml and returns the settings it holds.
+fn write_default_config(path: &std::path::Path) -> Config {
+    let pins = installed_default_pins();
+    match config::create_default(path, &pins) {
+        Ok(()) => log_info!("created {} with the default settings", path.display()),
+        Err(e) => log_error!("{e}"),
+    }
+    Config {
+        pinned: pins,
+        ..Config::default()
+    }
+}
+
+/// The settings at startup, and an error to show (and log) once the tray
+/// icon exists. A broken file means the defaults until it is fixed.
+fn load_startup_config(path: Option<&std::path::Path>) -> (Config, Option<ConfigError>) {
+    let Some(path) = path else {
+        log_warn!("APPDATA is not set; using the default settings (nothing is saved)");
+        return (Config::default(), None);
+    };
+    match config::load(path) {
+        Ok(Some(config)) => (config, None),
+        Ok(None) => (write_default_config(path), None),
+        Err(e) => (Config::default(), Some(e)),
+    }
+}
 
 /// Is this key held down right now (as of the current message)?
 fn key_held(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> bool {
@@ -264,7 +336,14 @@ impl App {
                 self.close();
                 self.ui.record_launch(&id);
                 apps::launch(id);
+                // Saved to config.toml a few seconds after the last launch.
+                self.stats_dirty.set(true);
+                // SAFETY: a one-shot timer on our own window (killed when it
+                // fires); setting it again restarts the wait.
+                unsafe { SetTimer(Some(self.hwnd), TIMER_SAVE_STATS, SAVE_STATS_MS, None) };
             }
+            Action::Pin(id) => self.change_pin(id, true),
+            Action::Unpin(id) => self.change_pin(id, false),
             Action::Media(command) => {
                 self.media.command(command);
                 // Switching source changes the card right away; the other
@@ -276,9 +355,236 @@ impl App {
         }
     }
 
-    /// Shows the current music state on the card.
+    /// Shows the current music state on the card (`[music] enabled =
+    /// false`: never).
     fn push_music(&self) {
-        log_err("music card", self.ui.set_music(self.media.view()));
+        let enabled = self.config.borrow().music.enabled;
+        let view = if enabled { self.media.view() } else { None };
+        log_err("music card", self.ui.set_music(view));
+    }
+
+    // -----------------------------------------------------------------------
+    // config.toml
+    // -----------------------------------------------------------------------
+
+    /// config.toml changed (the watcher said so): reload once the editor
+    /// has finished saving (300 ms of quiet).
+    fn on_config_changed(&self) {
+        // SAFETY: a one-shot timer on our own window (killed when it
+        // fires); setting it again restarts the wait.
+        unsafe { SetTimer(Some(self.hwnd), TIMER_CONFIG, CONFIG_SETTLE_MS, None) };
+    }
+
+    /// Reads config.toml again and applies what changed. A broken file
+    /// changes nothing: the last good settings stay. `manual` = from the
+    /// tray's "Reload config" (then success is shown too).
+    fn reload_config(&self, manual: bool) {
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        match config::load(&path) {
+            Ok(Some(new)) => {
+                self.apply_config(new);
+                if manual {
+                    self.tray.notify("Glint", "config.toml reloaded.", false);
+                }
+            }
+            Ok(None) => {
+                // Deleted: back to the defaults (that's what deleting means).
+                log_info!("config.toml was deleted; writing the defaults again");
+                let fresh = write_default_config(&path);
+                self.apply_config(fresh);
+            }
+            Err(e) => self.config_error(&e, false),
+        }
+    }
+
+    /// Logs the problem and shows a small notice next to the tray icon.
+    /// `startup` = there are no good settings yet, so the defaults are used.
+    fn config_error(&self, e: &ConfigError, startup: bool) {
+        let fallback = if startup {
+            "Glint uses the default settings until it is fixed."
+        } else {
+            "Glint keeps using the last good settings."
+        };
+        log_error!("config.toml {e}. {fallback}");
+        let title = match e.line {
+            Some(line) => format!("config.toml has an error on line {line}"),
+            None => "config.toml has an error".to_string(),
+        };
+        let text = match &e.snippet {
+            Some(snippet) => format!("{snippet}\n{}\n{fallback}", e.message),
+            None => format!("{}\n{fallback}", e.message),
+        };
+        self.tray.notify(&title, &text, true);
+    }
+
+    /// Switches to `new`, changing only what is different. Reloading the
+    /// file Glint itself just saved therefore does nothing.
+    fn apply_config(&self, new: Config) {
+        let old = self.config.replace(new.clone());
+        let mut changed = Vec::new();
+        if old.background != new.background {
+            changed.push("background");
+            self.apply_background();
+        }
+        if old.accent != new.accent {
+            changed.push("accent");
+            self.apply_accent();
+        }
+        if old.animation != new.animation {
+            changed.push("animation");
+            log_err("animation", self.ui.set_animation(&new.animation));
+        }
+        if old.pinned != new.pinned || old.max_columns != new.max_columns {
+            changed.push("pins");
+            self.apply_pins();
+        }
+        if old.hotkey != new.hotkey {
+            changed.push("hotkey");
+            self.register_hotkey();
+        }
+        if old.music != new.music
+            || old.background.tint_from_album != new.background.tint_from_album
+        {
+            changed.push("music");
+            self.ui.set_tint_from_album(new.background.tint_from_album);
+            self.push_music();
+        }
+        if old.stats != new.stats {
+            // Edited by hand. Launches not saved yet win: they are written
+            // in a moment anyway.
+            if !self.stats_dirty.get() {
+                changed.push("launch counts");
+                self.ui.set_launch_counts(&new.stats.launch_counts);
+            }
+        }
+        if !changed.is_empty() {
+            log_info!("config.toml reloaded: {}", changed.join(", "));
+        }
+    }
+
+    /// The accent color again (config changed, or the Windows accent for
+    /// `accent = "system"`).
+    fn apply_accent(&self) {
+        let accent = resolve_accent(&self.config.borrow(), &self.settings);
+        if self.accent.replace(accent) != accent {
+            log_err("accent color", self.ui.set_accent(accent));
+        }
+    }
+
+    /// Pins or max_columns changed: the grid follows, gliding while open.
+    fn apply_pins(&self) {
+        let (pins, columns) = {
+            let c = self.config.borrow();
+            (c.pinned.clone(), c.max_columns)
+        };
+        let shown = self.is_visible.get();
+        let result = self.ui.set_pins(&pins, columns, |size| {
+            // A hidden menu is placed fresh on the next open.
+            if !shown {
+                return None;
+            }
+            let p = window::placement(size.X, size.Y);
+            if self.placement.get() == Some(p) {
+                return None;
+            }
+            window::show(self.hwnd, &p);
+            self.placement.set(Some(p));
+            Some(p)
+        });
+        log_err("updating the pins", result);
+    }
+
+    /// "Pin to Glint" / "Unpin from Glint": saved to config.toml (keeping
+    /// its comments), then shown.
+    fn change_pin(&self, id: String, pin: bool) {
+        let mut pins = self.config.borrow().pinned.clone();
+        let has = pins.iter().any(|p| p.eq_ignore_ascii_case(&id));
+        if pin == has {
+            return;
+        }
+        if pin {
+            pins.push(id.clone());
+        } else {
+            pins.retain(|p| !p.eq_ignore_ascii_case(&id));
+        }
+        if let Some(path) = &self.config_path
+            && let Err(e) = config::edit(path, |doc| config::set_pins(doc, &pins))
+        {
+            // Not saved = not done, so what you see matches the file.
+            log_error!("saving the pins failed: config.toml {e}");
+            let what = if pin { "Pin" } else { "Unpin" };
+            self.tray.notify(
+                &format!("{what} didn't work"),
+                &format!("config.toml {e}\nFix the file, then try again."),
+                true,
+            );
+            return;
+        }
+        log_info!("{} {id}", if pin { "pinned" } else { "unpinned" });
+        self.config.borrow_mut().pinned = pins;
+        self.apply_pins();
+    }
+
+    /// Writes the launch counts to `[stats]` in config.toml, if any are new.
+    fn save_stats(&self) {
+        // SAFETY: stops our own one-shot timer (if it is running).
+        let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SAVE_STATS) };
+        if !self.stats_dirty.get() {
+            return;
+        }
+        let Some(path) = &self.config_path else {
+            self.stats_dirty.set(false);
+            return;
+        };
+        let counts = self.ui.launch_counts();
+        match config::edit(path, |doc| config::set_launch_counts(doc, &counts)) {
+            Ok(()) => {
+                self.config.borrow_mut().stats.launch_counts = counts;
+                self.stats_dirty.set(false);
+            }
+            // Tried again after the next launch, and on quit.
+            Err(e) => log_warn!("saving launch counts failed: config.toml {e}"),
+        }
+    }
+
+    /// Registers the `hotkey` from the config (and drops the old one).
+    fn register_hotkey(&self) {
+        if self.hotkey_on.replace(false) {
+            // SAFETY: removes the hotkey we registered on our own window.
+            let _ = unsafe { UnregisterHotKey(Some(self.hwnd), HOTKEY_ID) };
+        }
+        let Some(key) = self.config.borrow().hotkey.clone() else {
+            return;
+        };
+        let mut mods = MOD_NOREPEAT;
+        for (on, m) in [
+            (key.ctrl, MOD_CONTROL),
+            (key.alt, MOD_ALT),
+            (key.shift, MOD_SHIFT),
+            (key.win, MOD_WIN),
+        ] {
+            if on {
+                mods |= m;
+            }
+        }
+        // SAFETY: registers a hotkey for our own window; Windows frees it
+        // when the window is destroyed.
+        match unsafe { RegisterHotKey(Some(self.hwnd), HOTKEY_ID, mods, u32::from(key.vk)) } {
+            Ok(()) => {
+                self.hotkey_on.set(true);
+                log_info!("hotkey {} registered", key.text);
+            }
+            Err(e) => {
+                log_warn!("hotkey {} not available: {e}", key.text);
+                self.tray.notify(
+                    "Glint hotkey not available",
+                    &format!("{} is already used by Windows or another app.", key.text),
+                    true,
+                );
+            }
+        }
     }
 
     /// Lists all apps again, on a helper thread.
@@ -330,6 +636,12 @@ impl App {
                 log_info!("apps changed; listing them again");
                 self.scan_apps();
             }
+            TIMER_CONFIG => {
+                // SAFETY: stops our own timer; it is one-shot.
+                let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_CONFIG) };
+                self.reload_config(false);
+            }
+            TIMER_SAVE_STATS => self.save_stats(),
             ui::TIMER_ICONS => self.ui.load_icons(),
             ui::TIMER_SEEK => log_err("music time", self.ui.music_tick()),
             _ => {}
@@ -455,29 +767,19 @@ impl App {
             }
             WM_RBUTTONUP => {
                 self.close();
-                let (mode, preset, tint) = {
-                    let c = &self.config.borrow().background;
-                    (c.mode, c.preset, c.tint)
-                };
-                let Some(command) = self.tray.show_menu(mode, preset, tint) else {
-                    return;
-                };
-                {
-                    let bg = &mut self.config.borrow_mut().background;
-                    match command {
-                        TrayCommand::Quit => {
-                            // SAFETY: posts WM_QUIT to this (the UI) thread.
-                            unsafe { PostQuitMessage(0) };
-                            return;
-                        }
-                        TrayCommand::SetMode(m) => bg.mode = m,
-                        TrayCommand::SetPreset(p) => bg.preset = p,
-                        TrayCommand::SetTint(t) => bg.tint = t,
+                match self.tray.show_menu() {
+                    Some(TrayCommand::Quit) => {
+                        self.save_stats();
+                        // SAFETY: posts WM_QUIT to this (the UI) thread.
+                        unsafe { PostQuitMessage(0) };
                     }
+                    Some(TrayCommand::OpenConfig) => match &self.config_path {
+                        Some(path) => apps::open_document(path.clone()),
+                        None => log_warn!("no config file (APPDATA is not set)"),
+                    },
+                    Some(TrayCommand::ReloadConfig) => self.reload_config(true),
+                    None => {}
                 }
-                // Show the new look right away.
-                self.apply_background();
-                self.open();
             }
             _ => {}
         }
@@ -533,7 +835,35 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 app.finish_close(wparam.0 as u64);
                 return LRESULT(0);
             }
-            WM_APP_SETTINGS_CHANGED | WM_SETTINGCHANGE => app.apply_background(),
+            WM_APP_SETTINGS_CHANGED | WM_SETTINGCHANGE => {
+                app.apply_background();
+                // The Windows accent color may have changed.
+                app.apply_accent();
+            }
+            WM_APP_CONFIG_CHANGED => {
+                app.on_config_changed();
+                return LRESULT(0);
+            }
+            WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => {
+                app.toggle();
+                return LRESULT(0);
+            }
+            // Right-click (sent by Windows after WM_RBUTTONUP), Shift+F10 or
+            // the Menu key (then lParam is -1): the Pin / Unpin menu.
+            WM_CONTEXTMENU => {
+                let at = (lparam.0 != -1).then(|| {
+                    let (x, y) = mouse_xy(lparam);
+                    let mut pt = windows::Win32::Foundation::POINT { x, y };
+                    // SAFETY: converts a point to our own window's client
+                    // coordinates; valid out-pointer.
+                    let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt) };
+                    (pt.x, pt.y)
+                });
+                log_err("right-click menu", app.ui.context_menu(at));
+                return LRESULT(0);
+            }
+            // Shutdown or sign-out: save what isn't saved yet.
+            WM_ENDSESSION if wparam.0 != 0 => app.save_stats(),
             WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => app.on_deactivate(lparam),
             WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => app.on_button_down(msg, lparam),
             WM_LBUTTONUP if app.is_open.get() => {
@@ -724,13 +1054,21 @@ fn run() -> Result<()> {
     unsafe { RoInitialize(RO_INIT_SINGLETHREADED)? };
     let _dispatcher = create_dispatcher_queue()?;
 
-    let config = Config::from_args(std::env::args().skip(1));
+    // config.toml (written with the defaults on first run).
+    let config_path = config::path();
+    let (config, config_problem) = load_startup_config(config_path.as_deref());
     let hwnd = window::create(Some(wndproc))?;
+    let settings = SettingsWatch::new(hwnd)?;
+    let accent = resolve_accent(&config, &settings);
     // Paint the content now, at the DPI of the monitor it will most likely
     // open on, so the first open is instant.
     let scale = window::placement(1.0, 1.0).scale;
-    let ui = ui::Ui::new(hwnd, &config, scale)?;
-    let settings = SettingsWatch::new(hwnd)?;
+    let ui = ui::Ui::new(hwnd, &config, accent, scale)?;
+    let config_watch = config_path
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .filter(|dir| dir.is_dir())
+        .and_then(|dir| ConfigWatch::start(hwnd, dir.to_path_buf()));
     // Asks Windows for the media sessions; they arrive a moment later.
     let media = Media::new(hwnd, ui.cover_px());
     let tray = Tray::add(hwnd)?;
@@ -766,8 +1104,17 @@ fn run() -> Result<()> {
         rescan: Cell::new(false),
         _app_watch: ChangeWatch::new(hwnd),
         media,
+        config_path,
+        _config_watch: config_watch,
+        stats_dirty: Cell::new(false),
+        hotkey_on: Cell::new(false),
+        accent: Cell::new(accent),
     });
     app.apply_background();
+    app.register_hotkey();
+    if let Some(e) = &config_problem {
+        app.config_error(e, true);
+    }
     // List every installed app in the background (search needs them).
     app.scan_apps();
     APP.with(|a| *a.borrow_mut() = Some(app));
@@ -787,6 +1134,10 @@ fn run() -> Result<()> {
     // while the window is destroyed. Dropping the app removes the tray icon,
     // the settings subscriptions and stops the hook thread.
     let app = APP.with(|a| a.borrow_mut().take());
+    // Launches not saved yet (however we were asked to quit).
+    if let Some(app) = &app {
+        app.save_stats();
+    }
     // SAFETY: unregisters and destroys our own window.
     unsafe {
         let _ = WTSUnRegisterSessionNotification(hwnd);
