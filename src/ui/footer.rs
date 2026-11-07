@@ -6,7 +6,9 @@
 
 use std::cell::{Cell, RefCell};
 
-use windows::UI::Composition::{Compositor, ContainerVisual, SpriteVisual, Visual};
+use windows::UI::Composition::{
+    CompositionObject, Compositor, ContainerVisual, SpriteVisual, Visual,
+};
 use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ELLIPSE, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT, ID2D1DeviceContext,
@@ -24,7 +26,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{HSTRING, Interface, PWSTR, Result};
 use windows_numerics::{Vector2, Vector3};
 
-use super::anim::{Animator, POP_FROM_SCALE};
+use super::anim::{Animator, Kind, POP_FROM_SCALE};
 use super::gfx::{self, Canvas, Gfx, TEXT_PRIMARY, TEXT_SECONDARY};
 use super::layout::{self, AVATAR, Layout, POWER_BUTTON, Rect};
 use super::shape::RoundRect;
@@ -230,6 +232,15 @@ impl Footer {
 
     /// Positions and paints everything (layout or DPI change).
     pub fn refresh(&self, gfx: &Gfx, layout: &Layout) -> Result<()> {
+        self.avatar.resize(gfx, AVATAR_SIZE)?;
+        self.name.resize(gfx, layout.name.size())?;
+        self.power.resize(gfx, layout.power.size())?;
+        self.move_to(gfx, layout)?;
+        self.redraw(gfx)
+    }
+
+    /// Only moves things (the menu got taller or shorter): no repaint.
+    pub fn move_to(&self, gfx: &Gfx, layout: &Layout) -> Result<()> {
         *self.layout.borrow_mut() = layout.clone();
         let f = layout.footer;
         let s = gfx.scale();
@@ -245,15 +256,28 @@ impl Footer {
             Z: 0.0,
         })?;
         self.divider.SetSize(Vector2 { X: f.w, Y: 1.0 })?;
-
-        self.avatar.resize(gfx, AVATAR_SIZE)?;
         self.avatar
             .set_offset(gfx, layout.avatar.x, layout.avatar.y)?;
-        self.name.resize(gfx, layout.name.size())?;
         self.name.set_offset(gfx, layout.name.x, layout.name.y)?;
-        self.power.resize(gfx, layout.power.size())?;
-        self.power.set_offset(gfx, layout.power.x, layout.power.y)?;
-        self.redraw(gfx)
+        self.power.set_offset(gfx, layout.power.x, layout.power.y)
+    }
+
+    /// The footer's background: its top edge is where the footer starts,
+    /// even while it glides.
+    pub fn fill_visual(&self) -> Result<Visual> {
+        self.fill.cast()
+    }
+
+    /// What moves when the menu's height changes (layout animation).
+    pub fn motion_objects(&self) -> Result<Vec<(CompositionObject, Kind)>> {
+        let mut list = Vec::new();
+        for v in [&self.fill, &self.divider] {
+            list.push((v.cast()?, Kind::Visual));
+        }
+        for c in [&self.avatar, &self.name, &self.power] {
+            list.push((c.visual.cast()?, Kind::Visual));
+        }
+        Ok(list)
     }
 
     fn redraw(&self, gfx: &Gfx) -> Result<()> {
@@ -450,6 +474,19 @@ impl PowerStrip {
     /// Positions it (and repaints). `grow_from` is the point it grows out
     /// of (the power button's center), in menu coordinates.
     pub fn refresh(&self, gfx: &Gfx, rect: Rect, grow_from: Vector2) -> Result<()> {
+        self.move_to(gfx, rect, grow_from)?;
+        self.panel.set_rect(Rect::new(0.0, 0.0, rect.w, rect.h))?;
+        self.content.resize(gfx, rect.size())?;
+        self.redraw(gfx)
+    }
+
+    /// The root visual, for the layout animation.
+    pub fn motion_object(&self) -> Result<CompositionObject> {
+        self.root.cast()
+    }
+
+    /// Only moves it (the menu got taller or shorter): no repaint.
+    pub fn move_to(&self, gfx: &Gfx, rect: Rect, grow_from: Vector2) -> Result<()> {
         self.rect.set(rect);
         let s = gfx.scale();
         self.root.SetOffset(Vector3 {
@@ -462,10 +499,7 @@ impl PowerStrip {
             X: (grow_from.X - rect.x).clamp(0.0, rect.w),
             Y: rect.h,
             Z: 0.0,
-        })?;
-        self.panel.set_rect(Rect::new(0.0, 0.0, rect.w, rect.h))?;
-        self.content.resize(gfx, rect.size())?;
-        self.redraw(gfx)
+        })
     }
 
     fn redraw(&self, gfx: &Gfx) -> Result<()> {

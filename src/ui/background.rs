@@ -18,12 +18,13 @@ use std::cell::{Cell, RefCell};
 use windows::UI::Color;
 use windows::UI::Composition::{
     CompositionBackdropBrush, CompositionColorBrush, CompositionLinearGradientBrush,
-    CompositionMappingMode, CompositionRoundedRectangleGeometry, CompositionSpriteShape,
-    Compositor, ContainerVisual, ShapeVisual, SpriteVisual,
+    CompositionMappingMode, CompositionObject, CompositionRoundedRectangleGeometry,
+    CompositionSpriteShape, Compositor, ContainerVisual, ShapeVisual, SpriteVisual,
 };
-use windows::core::Result;
+use windows::core::{Interface, Result};
 use windows_numerics::Vector2;
 
+use super::anim::Kind;
 use crate::config::{self, Rgb};
 
 /// Primary text color (#f4f4f5) that must stay readable on the background.
@@ -262,6 +263,21 @@ impl Background {
         self.gradient.SetStartPoint(start)?;
         self.gradient.SetEndPoint(end)?;
         self.set_border(self.border_width.get())
+    }
+
+    /// Everything that changes when the menu's height changes, for the
+    /// 220 ms layout animation.
+    pub fn motion_objects(&self) -> Result<Vec<(CompositionObject, Kind)>> {
+        let mut list = Vec::new();
+        for layer in [&self.backdrop, &self.tint, &self.overlay, &self.sheen] {
+            list.push((layer.cast()?, Kind::Visual));
+        }
+        list.push((self.border_visual.cast()?, Kind::Visual));
+        list.push((self.border_geometry.cast()?, Kind::Geometry));
+        for brush in [&self.gradient, &self.sheen_brush, &self.rim] {
+            list.push((brush.cast()?, Kind::Brush));
+        }
+        Ok(list)
     }
 
     /// The top layer (border / glass rim). The menu's content goes just

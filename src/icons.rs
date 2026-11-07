@@ -35,17 +35,24 @@ pub struct IconCache {
 }
 
 impl IconCache {
+    /// The icon if it is already cached (marks it as recently used), or
+    /// `None`. Never asks the shell, so it is always fast.
+    pub fn peek(&self, aumid: &str, px: i32) -> Option<ID2D1Bitmap1> {
+        let mut entries = self.entries.borrow_mut();
+        let i = entries
+            .iter()
+            .position(|(a, s, _)| *s == px && a.eq_ignore_ascii_case(aumid))?;
+        // Move to the back: most recently used.
+        let entry = entries.remove(i);
+        let bitmap = entry.2.clone();
+        entries.push(entry);
+        Some(bitmap)
+    }
+
     /// The icon of `item` at `px` × `px` physical pixels.
     pub fn get(&self, gfx: &Gfx, aumid: &str, item: &IShellItem, px: i32) -> Result<ID2D1Bitmap1> {
-        {
-            let mut entries = self.entries.borrow_mut();
-            if let Some(i) = entries.iter().position(|(a, s, _)| a == aumid && *s == px) {
-                // Move to the back: most recently used.
-                let entry = entries.remove(i);
-                let bitmap = entry.2.clone();
-                entries.push(entry);
-                return Ok(bitmap);
-            }
+        if let Some(bitmap) = self.peek(aumid, px) {
+            return Ok(bitmap);
         }
         let bitmap = extract(gfx, item, px)?;
         let mut entries = self.entries.borrow_mut();

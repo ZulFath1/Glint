@@ -11,10 +11,11 @@
 use windows::Foundation::TimeSpan;
 use windows::UI::Composition::{
     AnimationDelayBehavior, AnimationIterationBehavior, CompositionBatchTypes,
-    CompositionEasingFunction, CompositionScopedBatch, Compositor, ScalarKeyFrameAnimation,
+    CompositionEasingFunction, CompositionObject, CompositionScopedBatch, Compositor,
+    ICompositionAnimationBase, ImplicitAnimationCollection, ScalarKeyFrameAnimation,
     Vector3KeyFrameAnimation, Visual,
 };
-use windows::core::{Interface, Result, h};
+use windows::core::{HSTRING, Interface, Result, h};
 use windows_numerics::{Vector2, Vector3};
 
 use crate::config;
@@ -364,4 +365,156 @@ fn caret_blink(
     a.SetDuration(ms(2 * CARET_HALF_MS))?;
     a.SetIterationBehavior(AnimationIterationBehavior::Forever)?;
     Ok(a)
+}
+
+// ---------------------------------------------------------------------------
+// Layout changes while open: 220 ms, cubic-bezier(0.2, 0, 0, 1)
+// ---------------------------------------------------------------------------
+
+/// How long a layout change takes (search results appear, the list grows).
+pub const LAYOUT_MS: u32 = 220;
+
+/// What kind of object a layout animation is attached to; each kind has
+/// its own animatable properties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A visual: `Offset`, `Size`, `CenterPoint`.
+    Visual,
+    /// A shape or clip geometry: `Size`.
+    Geometry,
+    /// A gradient brush: `StartPoint`, `EndPoint`.
+    Brush,
+}
+
+impl Kind {
+    fn properties(self) -> &'static [&'static str] {
+        match self {
+            Kind::Visual => &["Offset", "Size", "CenterPoint"],
+            Kind::Geometry => &["Size"],
+            Kind::Brush => &["StartPoint", "EndPoint"],
+        }
+    }
+}
+
+/// Smooth layout changes with implicit animations (CLAUDE.md section 4).
+///
+/// An "implicit" animation is attached to a property once; after that,
+/// every time we *set* that property, the compositor glides from the
+/// current value to the new one by itself, starting from wherever it is
+/// (so typing fast never makes anything jump).
+///
+/// Some changes must be instant, though: getting a hidden menu ready, or a
+/// DPI change. [`LayoutMotion::instant`] detaches the animations first.
+pub struct LayoutMotion {
+    visual: ImplicitAnimationCollection,
+    geometry: ImplicitAnimationCollection,
+    brush: ImplicitAnimationCollection,
+    fade_in: ScalarKeyFrameAnimation,
+    fade_out: ScalarKeyFrameAnimation,
+    objects: std::cell::RefCell<Vec<(CompositionObject, Kind)>>,
+    attached: std::cell::Cell<bool>,
+}
+
+impl LayoutMotion {
+    pub fn new(c: &Compositor) -> Result<Self> {
+        let ease = cubic(c, 0.2, 0.0, 0.0, 1.0)?;
+        let vec3 = |target: &str| -> Result<ICompositionAnimationBase> {
+            let a = c.CreateVector3KeyFrameAnimation()?;
+            a.InsertExpressionKeyFrameWithEasingFunction(1.0, h!("this.FinalValue"), &ease)?;
+            a.SetDuration(ms(LAYOUT_MS))?;
+            a.SetTarget(&HSTRING::from(target))?;
+            a.cast()
+        };
+        let vec2 = |target: &str| -> Result<ICompositionAnimationBase> {
+            let a = c.CreateVector2KeyFrameAnimation()?;
+            a.InsertExpressionKeyFrameWithEasingFunction(1.0, h!("this.FinalValue"), &ease)?;
+            a.SetDuration(ms(LAYOUT_MS))?;
+            a.SetTarget(&HSTRING::from(target))?;
+            a.cast()
+        };
+        let visual = c.CreateImplicitAnimationCollection()?;
+        visual.Insert(h!("Offset"), &vec3("Offset")?)?;
+        visual.Insert(h!("CenterPoint"), &vec3("CenterPoint")?)?;
+        visual.Insert(h!("Size"), &vec2("Size")?)?;
+        let geometry = c.CreateImplicitAnimationCollection()?;
+        geometry.Insert(h!("Size"), &vec2("Size")?)?;
+        let brush = c.CreateImplicitAnimationCollection()?;
+        brush.Insert(h!("StartPoint"), &vec2("StartPoint")?)?;
+        brush.Insert(h!("EndPoint"), &vec2("EndPoint")?)?;
+
+        let fade = |to: f32| -> Result<ScalarKeyFrameAnimation> {
+            let a = c.CreateScalarKeyFrameAnimation()?;
+            a.InsertExpressionKeyFrame(0.0, h!("this.StartingValue"))?;
+            a.InsertKeyFrameWithEasingFunction(1.0, to, &ease)?;
+            a.SetDuration(ms(LAYOUT_MS))?;
+            Ok(a)
+        };
+        Ok(Self {
+            visual,
+            geometry,
+            brush,
+            fade_in: fade(1.0)?,
+            fade_out: fade(0.0)?,
+            objects: Default::default(),
+            attached: Default::default(),
+        })
+    }
+
+    /// Registers an object whose layout properties should glide.
+    pub fn add(&self, object: CompositionObject, kind: Kind) {
+        self.objects.borrow_mut().push((object, kind));
+    }
+
+    fn collection(&self, kind: Kind) -> &ImplicitAnimationCollection {
+        match kind {
+            Kind::Visual => &self.visual,
+            Kind::Geometry => &self.geometry,
+            Kind::Brush => &self.brush,
+        }
+    }
+
+    /// Runs `change` with the animations attached: everything it sets
+    /// glides there over 220 ms.
+    pub fn animate<T>(&self, change: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.attached.replace(true) {
+            for (object, kind) in self.objects.borrow().iter() {
+                if let Err(e) = object.SetImplicitAnimations(self.collection(*kind)) {
+                    log_warn!("layout animation not supported on a {kind:?}: {e}");
+                }
+            }
+        }
+        change()
+    }
+
+    /// Runs `change` with no animation: everything it sets is there at
+    /// once. Glides still running are stopped first (a running animation
+    /// would otherwise keep overriding the new value).
+    pub fn instant<T>(&self, change: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.attached.replace(false) {
+            for (object, _) in self.objects.borrow().iter() {
+                object.SetImplicitAnimations(None::<&ImplicitAnimationCollection>)?;
+            }
+        }
+        for (object, kind) in self.objects.borrow().iter() {
+            for property in kind.properties() {
+                object.StopAnimation(&HSTRING::from(*property))?;
+            }
+        }
+        change()
+    }
+
+    /// Fades a visual in or out with the layout curve (the grid ↔ results
+    /// cross-fade). `animate` false = at once.
+    pub fn fade(&self, visual: &Visual, visible: bool, animate: bool) -> Result<()> {
+        if animate {
+            let a = if visible {
+                &self.fade_in
+            } else {
+                &self.fade_out
+            };
+            return visual.StartAnimation(h!("Opacity"), a);
+        }
+        visual.StopAnimation(h!("Opacity"))?;
+        visual.SetOpacity(if visible { 1.0 } else { 0.0 })
+    }
 }

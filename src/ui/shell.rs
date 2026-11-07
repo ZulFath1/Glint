@@ -13,14 +13,13 @@
 //! No drop shadow: the owner found it looked odd over light backgrounds
 //! (a deliberate change from CLAUDE.md section 5).
 
-use std::cell::Cell;
-
 use windows::UI::Composition::{
-    CompositionRoundedRectangleGeometry, Compositor, ContainerVisual, Visual,
+    CompositionObject, CompositionRoundedRectangleGeometry, Compositor, ContainerVisual, Visual,
 };
 use windows::core::{Interface, Result};
 use windows_numerics::Vector2;
 
+use super::anim::Kind;
 use super::background::Background;
 
 /// Corner radius of the menu (DIPs).
@@ -31,7 +30,6 @@ pub struct Shell {
     content: ContainerVisual,
     clip_shape: CompositionRoundedRectangleGeometry,
     body: ContainerVisual,
-    size: Cell<Vector2>,
     pub background: Background,
 }
 
@@ -67,7 +65,6 @@ impl Shell {
             content,
             clip_shape,
             body,
-            size: Cell::new(size),
             background,
         })
     }
@@ -85,13 +82,22 @@ impl Shell {
         &self.body
     }
 
-    pub fn size(&self) -> Vector2 {
-        self.size.get()
+    /// Everything that changes when the menu's height changes (the
+    /// background layers included), for the 220 ms layout animation.
+    pub fn motion_objects(&self) -> Result<Vec<(CompositionObject, Kind)>> {
+        let mut list = vec![
+            (self.host.cast()?, Kind::Visual),
+            (self.content.cast()?, Kind::Visual),
+            (self.body.cast()?, Kind::Visual),
+            (self.clip_shape.cast()?, Kind::Geometry),
+        ];
+        list.extend(self.background.motion_objects()?);
+        Ok(list)
     }
 
-    /// The content changed size (e.g. a different number of pins).
+    /// The content changed size (a different number of pins, search
+    /// results). Inside `LayoutMotion::animate` this glides.
     pub fn set_size(&self, size: Vector2) -> Result<()> {
-        self.size.set(size);
         self.host.SetSize(size)?;
         self.content.SetSize(size)?;
         self.body.SetSize(size)?;

@@ -34,6 +34,8 @@ struct Cell {
 }
 
 pub struct Grid {
+    /// Holds every cell; faded out while search results show.
+    root: ContainerVisual,
     cells: Vec<Cell>,
     rects: std::cell::RefCell<Vec<Rect>>,
     label_format: IDWriteTextFormat,
@@ -48,6 +50,8 @@ impl Grid {
         apps: Vec<App>,
     ) -> Result<Self> {
         let size = Vector2 { X: CELL, Y: CELL };
+        let root = c.CreateContainerVisual()?;
+        parent.Children()?.InsertAtTop(&root)?;
         let mut cells = Vec::with_capacity(apps.len());
         for app in apps {
             let outer = c.CreateContainerVisual()?;
@@ -60,10 +64,11 @@ impl Grid {
                 Z: 0.0,
             })?;
             outer.Children()?.InsertAtTop(&canvas.visual)?;
-            parent.Children()?.InsertAtTop(&outer)?;
+            root.Children()?.InsertAtTop(&outer)?;
             cells.push(Cell { outer, canvas, app });
         }
         Ok(Self {
+            root,
             cells,
             rects: Default::default(),
             label_format: gfx.text_format(LABEL_SIZE, DWRITE_FONT_WEIGHT_NORMAL)?,
@@ -74,8 +79,20 @@ impl Grid {
         self.cells.len()
     }
 
-    pub fn name(&self, i: usize) -> Option<String> {
-        self.cells.get(i).map(|c| c.app.name.clone())
+    /// The AUMID of pin `i` (what `shell:AppsFolder\…` launches).
+    pub fn aumid(&self, i: usize) -> Option<String> {
+        self.cells.get(i).map(|c| c.app.aumid.clone())
+    }
+
+    /// The pinned apps, as plain data (the search list before the full app
+    /// list has loaded).
+    pub fn apps(&self) -> Vec<crate::apps::AppInfo> {
+        self.cells.iter().filter_map(|c| c.app.info()).collect()
+    }
+
+    /// The container of all cells (faded out while searching).
+    pub fn visual(&self) -> Result<Visual> {
+        self.root.cast()
     }
 
     pub fn rect(&self, i: usize) -> Option<Rect> {

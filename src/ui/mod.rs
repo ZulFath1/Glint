@@ -8,10 +8,14 @@
 //! ```text
 //! back    footer fill + divider
 //! hover   the mouse-hover highlight (one, moved around)
-//! front   search box, pinned grid, avatar / name / power icon
+//! front   search box, pinned grid / search results, avatar / name / power
 //! popup   the power strip
 //! top     the keyboard focus ring (one, moved around)
 //! ```
+//!
+//! The middle of the menu shows either the pinned grid (search box empty)
+//! or the search results. Switching cross-fades the two and glides the
+//! menu to its new height (220 ms, see `anim::LayoutMotion`).
 //!
 //! Input methods never call anything that could run a message loop (like
 //! ShellExecute). Instead they return an [`Action`] for main.rs to carry
@@ -23,11 +27,14 @@ pub mod footer;
 pub mod gfx;
 pub mod grid;
 pub mod layout;
+pub mod results;
 pub mod search_box;
 pub mod shape;
 pub mod shell;
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{CompositionScopedBatch, Compositor, ContainerVisual, Visual};
@@ -37,36 +44,48 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
     VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GetQueueStatus, KillTimer, QS_INPUT, SetTimer};
 use windows::core::{Interface, Result};
 use windows_numerics::{Vector2, Vector3};
 
+use crate::apps::AppInfo;
 use crate::config::{Config, Rgb};
 use crate::icons::IconCache;
 use crate::power::PowerAction;
+use crate::search::{self, Query};
 use crate::window::{Edge, Placement};
-use anim::Animator;
+use anim::{Animator, Kind, LayoutMotion};
 use background::{Applied, SystemEffects};
 use footer::{Footer, PowerStrip, StripState};
 use gfx::Gfx;
 use grid::Grid;
-use layout::{Layout, Rect};
+use layout::{Content, Layout, MAX_RESULTS, Rect};
+use results::Results;
 use search_box::SearchBox;
 use shape::RoundRect;
 
+/// The timer that fills in result icons a moment after typing (WM_TIMER id).
+pub const TIMER_ICONS: usize = 2;
+/// At most this long per WM_TIMER spent loading icons, so the thread is
+/// never busy for longer than a frame.
+const ICON_BUDGET: Duration = Duration::from_millis(8);
+
 /// Something main.rs should do after an input event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     None,
     Close,
     OpenAccountSettings,
     Power(PowerAction),
-    /// Launch the pinned app with this index (milestone 4).
-    Launch(usize),
+    /// Launch the app with this AppsFolder ID (AUMID).
+    Launch(String),
 }
 
 /// Who has the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
+    /// The search box (while there are results, Up/Down move the result
+    /// highlight and Enter launches it).
     Search,
     Cell(usize),
     Profile,
@@ -81,6 +100,8 @@ enum Target {
     Nothing,
     Search,
     Cell(usize),
+    /// A search result row.
+    Row(usize),
     Profile,
     Power,
     Strip(usize),
@@ -93,6 +114,55 @@ const CELL_RADIUS: f32 = 12.0;
 const BUTTON_RADIUS: f32 = 10.0;
 const RING_WIDTH: f32 = 2.0;
 
+/// Every installed app, prepared for searching, plus how often each was
+/// launched (in memory only for now; saved to the config in milestone 6).
+#[derive(Default)]
+struct Catalog {
+    apps: Vec<AppInfo>,
+    /// `items[i]` is `apps[i]`, prepared for the matcher.
+    items: Vec<search::Item>,
+    /// Pinned AUMIDs from the config (pinned apps win ties).
+    pinned: Vec<String>,
+    /// Lowercased ID → launches.
+    launches: HashMap<String, u32>,
+}
+
+impl Catalog {
+    fn set_apps(&mut self, apps: Vec<AppInfo>) {
+        self.items = apps
+            .iter()
+            .map(|a| search::Item::new(&a.name, self.is_pinned(&a.id), self.launches(&a.id)))
+            .collect();
+        self.apps = apps;
+    }
+
+    fn is_pinned(&self, id: &str) -> bool {
+        self.pinned.iter().any(|p| p.eq_ignore_ascii_case(id))
+    }
+
+    fn launches(&self, id: &str) -> u32 {
+        self.launches.get(&id.to_lowercase()).copied().unwrap_or(0)
+    }
+
+    fn record_launch(&mut self, id: &str) {
+        let count = self.launches.entry(id.to_lowercase()).or_insert(0);
+        *count += 1;
+        let count = *count;
+        for (app, item) in self.apps.iter().zip(self.items.iter_mut()) {
+            if app.id.eq_ignore_ascii_case(id) {
+                item.launches = count;
+            }
+        }
+    }
+}
+
+/// How fast the search was while the menu was open (logged on close).
+#[derive(Default, Clone, Copy)]
+struct SearchStats {
+    queries: u32,
+    slowest: Duration,
+}
+
 pub struct Ui {
     hwnd: HWND,
     _compositor: Compositor,
@@ -102,11 +172,14 @@ pub struct Ui {
     shell: shell::Shell,
     menu: Visual,
     animator: Animator,
+    motion: LayoutMotion,
     gfx: Gfx,
     icons: IconCache,
+    max_columns: usize,
     layout: RefCell<Layout>,
     search: SearchBox,
     grid: Grid,
+    results: Results,
     footer: Footer,
     strip: PowerStrip,
     hover: RoundRect,
@@ -122,12 +195,29 @@ pub struct Ui {
     placement: Cell<Option<Placement>>,
     is_open: Cell<bool>,
     reduced_motion: Cell<bool>,
+    catalog: RefCell<Catalog>,
+    /// The search the results are for.
+    query: RefCell<String>,
+    /// The results: indexes into `catalog.apps`, best first.
+    hits: RefCell<Vec<usize>>,
+    /// The highlighted result.
+    selected: Cell<usize>,
+    /// Apps whose icon could not be loaded (not retried).
+    failed_icons: RefCell<HashSet<String>>,
+    stats: Cell<SearchStats>,
 }
 
 fn white(alpha: f32) -> windows::UI::Color {
     gfx::color(Rgb::new(255, 255, 255), alpha)
 }
 
+/// True if a key press or mouse click is waiting in our message queue.
+fn input_waiting() -> bool {
+    // SAFETY: GetQueueStatus has no preconditions. The high word lists the
+    // kinds of messages currently in the queue.
+    let status = unsafe { GetQueueStatus(QS_INPUT) };
+    (status >> 16) & QS_INPUT.0 != 0
+}
 impl Ui {
     pub fn new(hwnd: HWND, config: &Config, scale: f32) -> Result<Self> {
         let compositor = Compositor::new()?;
@@ -145,13 +235,14 @@ impl Ui {
             .iter()
             .filter_map(|aumid| crate::apps::find(aumid))
             .collect();
-        let layout = layout::layout(apps.len(), config.max_columns);
+        let layout = layout::layout(apps.len(), config.max_columns, Content::Grid);
 
         let shell = shell::Shell::new(&compositor, layout.size)?;
         root.Children()?.InsertAtTop(shell.host())?;
         let menu = shell.host_visual()?;
         Animator::reset_closed(&menu)?;
         let animator = Animator::new(&compositor, &config.animation)?;
+        let motion = LayoutMotion::new(&compositor)?;
         let gfx = Gfx::new(&compositor, hwnd, scale)?;
 
         let new_layer = || -> Result<ContainerVisual> {
@@ -172,11 +263,30 @@ impl Ui {
         hover_layer.Children()?.InsertAtTop(&hover.visual)?;
         let search = SearchBox::new(&compositor, &gfx, &front, layout.search, config.accent)?;
         let grid = Grid::new(&compositor, &gfx, &front, apps)?;
+        let results = Results::new(&compositor, &gfx, &front, &layout, &footer.fill_visual()?)?;
         let strip = PowerStrip::new(&compositor, &gfx, &popup, layout.strip)?;
         let ring = RoundRect::new(&compositor, CELL_RADIUS, RING_WIDTH)?;
         ring.set_stroke(gfx::color(config.accent, 1.0))?;
         ring.show(false)?;
         top.Children()?.InsertAtTop(&ring.visual)?;
+
+        // Everything that moves or resizes when the menu height changes.
+        for (object, kind) in shell
+            .motion_objects()?
+            .into_iter()
+            .chain(footer.motion_objects()?)
+        {
+            motion.add(object, kind);
+        }
+        motion.add(strip.motion_object()?, Kind::Visual);
+
+        // Until the full app list arrives (a moment after startup), search
+        // at least finds the pinned apps.
+        let mut catalog = Catalog {
+            pinned: config.pinned.clone(),
+            ..Default::default()
+        };
+        catalog.set_apps(grid.apps());
 
         let ui = Self {
             hwnd,
@@ -186,11 +296,14 @@ impl Ui {
             shell,
             menu,
             animator,
+            motion,
             gfx,
             icons: IconCache::default(),
+            max_columns: config.max_columns,
             layout: RefCell::new(layout),
             search,
             grid,
+            results,
             footer,
             strip,
             hover,
@@ -203,60 +316,77 @@ impl Ui {
             placement: Cell::new(None),
             is_open: Cell::new(false),
             reduced_motion: Cell::new(false),
+            catalog: RefCell::new(catalog),
+            query: RefCell::new(String::new()),
+            hits: RefCell::new(Vec::new()),
+            selected: Cell::new(0),
+            failed_icons: RefCell::new(HashSet::new()),
+            stats: Cell::new(SearchStats::default()),
         };
         ui.refresh()?;
         Ok(ui)
     }
 
-    /// The menu's size in DIPs (it follows the content).
-    pub fn size(&self) -> Vector2 {
-        self.layout.borrow().size
+    /// The largest the menu gets, in DIPs (the window is made this big, so
+    /// it never has to move while the menu grows or shrinks).
+    pub fn max_size(&self) -> Vector2 {
+        layout::max_size(self.grid.len(), self.max_columns)
     }
 
-    /// Positions and paints everything at the current DPI scale.
+    /// The point the power strip grows out of (the power button's top).
+    fn strip_origin(l: &Layout) -> Vector2 {
+        Vector2 {
+            X: l.power.x + l.power.w / 2.0,
+            Y: l.power.y,
+        }
+    }
+
+    /// Positions and paints everything at the current DPI scale. Instant:
+    /// nothing glides.
     fn refresh(&self) -> Result<()> {
         let l = self.layout.borrow().clone();
-        self.shell.set_size(l.size)?;
-        self.search.set_rect(&self.gfx, l.search)?;
-        self.grid.set_rects(&self.gfx, &l.cells)?;
-        self.grid.redraw(&self.gfx, &self.icons)?;
-        self.footer.refresh(&self.gfx, &l)?;
-        let power = l.power;
-        let grow_from = Vector2 {
-            X: power.x + power.w / 2.0,
-            Y: power.y,
-        };
-        self.strip.refresh(&self.gfx, l.strip, grow_from)?;
+        self.motion.instant(|| {
+            self.search.set_rect(&self.gfx, l.search)?;
+            self.grid.set_rects(&self.gfx, &l.cells)?;
+            self.grid.redraw(&self.gfx, &self.icons)?;
+            self.footer.refresh(&self.gfx, &l)?;
+            self.strip
+                .refresh(&self.gfx, l.strip, Self::strip_origin(&l))?;
+            self.results.resize(&self.gfx, &l)?;
+            self.place_content()
+        })?;
+        self.paint_results()?;
         self.update_focus_visuals()
     }
 
-    /// The GPU device was replaced: every surface is empty, every cached
-    /// bitmap useless. Paint it all again.
-    pub fn device_replaced(&self) -> Result<()> {
-        self.icons.clear();
-        self.refresh()
+    /// Moves everything that depends on the menu's height (no repainting).
+    /// Inside `motion.animate` these glide; inside `motion.instant` they jump.
+    fn place_content(&self) -> Result<()> {
+        let l = self.layout.borrow().clone();
+        self.shell.set_size(l.size)?;
+        self.footer.move_to(&self.gfx, &l)?;
+        self.strip
+            .move_to(&self.gfx, l.strip, Self::strip_origin(&l))?;
+        // Going back to the grid, the rows stay as they are while they fade.
+        if let Content::List(n) = l.content {
+            self.results.set_rows(&self.gfx, &l, n == 0)?;
+        }
+        self.place_menu()
     }
 
-    /// Applies the DPI scale and the menu's position inside the window, and
-    /// puts the scale origin on the edge nearest the taskbar.
-    pub fn set_layout(&self, p: &Placement) -> Result<()> {
-        if (p.scale - self.gfx.scale()).abs() > 0.001 {
-            log_info!("DPI scale {} -> {}: repainting", self.gfx.scale(), p.scale);
-            self.gfx.set_scale(p.scale);
-            self.refresh()?;
-        }
-        self.placement.set(Some(*p));
-        self.root.SetScale(Vector3 {
-            X: p.scale,
-            Y: p.scale,
-            Z: 1.0,
-        })?;
+    /// The menu's position inside the window, and its scale origin on the
+    /// edge nearest the taskbar. A menu shorter than the window keeps its
+    /// taskbar-side edge where it is.
+    fn place_menu(&self) -> Result<()> {
+        let Some(p) = self.placement.get() else {
+            return Ok(());
+        };
+        let s = self.layout.borrow().size;
         self.menu.SetOffset(Vector3 {
             X: p.menu_x as f32 / p.scale,
-            Y: p.menu_y as f32 / p.scale,
+            Y: p.menu_top(s.Y) as f32 / p.scale,
             Z: 0.0,
         })?;
-        let s = self.shell.size();
         let (x, y) = match p.edge {
             Edge::Bottom => (s.X / 2.0, s.Y),
             Edge::Top => (s.X / 2.0, 0.0),
@@ -267,13 +397,50 @@ impl Ui {
         self.menu.SetCenterPoint(Vector3 { X: x, Y: y, Z: 0.0 })
     }
 
+    /// The GPU device was replaced: every surface is empty, every cached
+    /// bitmap useless. Paint it all again.
+    pub fn device_replaced(&self) -> Result<()> {
+        self.icons.clear();
+        self.refresh()
+    }
+
+    /// Applies the DPI scale and the menu's position inside the window.
+    pub fn set_layout(&self, p: &Placement) -> Result<()> {
+        self.placement.set(Some(*p));
+        if (p.scale - self.gfx.scale()).abs() > 0.001 {
+            log_info!("DPI scale {} -> {}: repainting", self.gfx.scale(), p.scale);
+            self.gfx.set_scale(p.scale);
+            self.refresh()?;
+        }
+        self.root.SetScale(Vector3 {
+            X: p.scale,
+            Y: p.scale,
+            Z: 1.0,
+        })?;
+        self.motion.instant(|| self.place_menu())
+    }
+
     pub fn apply_background(&self, config: &Config, effects: SystemEffects) -> Result<Applied> {
         self.shell.background.apply(&config.background, effects)
     }
 
-    /// Call before showing a fully hidden window, so the open starts at 0.
+    /// Call before showing a fully hidden window: the menu at scale 0, the
+    /// search box empty and the pinned grid back (all instant).
     pub fn reset_closed(&self) -> Result<()> {
-        Animator::reset_closed(&self.menu)
+        Animator::reset_closed(&self.menu)?;
+        self.is_open.set(false);
+        self.search.editor.borrow_mut().clear();
+        self.search.redraw_text(&self.gfx)?;
+        self.update_search(true)
+    }
+
+    /// Is this point (window pixels) on the menu, rather than on the
+    /// transparent space around it?
+    pub fn menu_contains(&self, x: i32, y: i32) -> bool {
+        let h = self.layout.borrow().size.Y;
+        self.placement
+            .get()
+            .is_some_and(|p| p.menu_contains(x, y, h))
     }
 
     /// Gets the content ready and starts the open animation. `fresh` = the
@@ -282,9 +449,7 @@ impl Ui {
         self.reduced_motion.set(reduced_motion);
         self.is_open.set(true);
         if fresh {
-            // A fresh start: empty search with the keyboard, nothing hovered.
-            self.search.editor.borrow_mut().clear();
-            self.search.redraw_text(&self.gfx)?;
+            // A fresh start: keyboard in the search box, nothing hovered.
             self.strip.reset()?;
             self.keyboard_nav.set(false);
             self.pressed.set(Target::Nothing);
@@ -312,12 +477,213 @@ impl Ui {
             // SAFETY: releases the mouse capture we took; no pointers.
             let _ = unsafe { ReleaseCapture() };
         }
+        let stats = self.stats.take();
+        if stats.queries > 0 {
+            log_info!(
+                "search: {} queries, slowest {} us",
+                stats.queries,
+                stats.slowest.as_micros()
+            );
+        }
         self.animator.close(&self.menu, reduced_motion)
     }
 
-    /// The display name of pinned app `i` (for logging).
-    pub fn app_name(&self, i: usize) -> String {
-        self.grid.name(i).unwrap_or_default()
+    // -----------------------------------------------------------------------
+    // Search
+    // -----------------------------------------------------------------------
+
+    /// A new list of installed apps (startup, or after an install or
+    /// uninstall). If a search is showing, it is run again.
+    pub fn set_apps(&self, apps: Vec<AppInfo>) -> Result<()> {
+        if apps.is_empty() {
+            log_warn!("the app list came back empty; keeping the old one");
+            return Ok(());
+        }
+        self.catalog.borrow_mut().set_apps(apps);
+        self.results.forget();
+        self.update_search(true)
+    }
+
+    /// Counts a launch (more launches = higher in ties).
+    pub fn record_launch(&self, id: &str) {
+        self.catalog.borrow_mut().record_launch(id);
+    }
+
+    fn is_list(&self) -> bool {
+        matches!(self.layout.borrow().content, Content::List(_))
+    }
+
+    /// Runs the search for the text in the box, unless it is the same as
+    /// last time (`force` runs it anyway, e.g. for a new app list).
+    fn update_search(&self, force: bool) -> Result<()> {
+        let text = self.search.editor.borrow().text().to_string();
+        if !force && *self.query.borrow() == text {
+            return Ok(());
+        }
+        let q = Query::new(&text);
+        *self.query.borrow_mut() = text;
+        if q.is_empty() {
+            self.hits.borrow_mut().clear();
+            return self.set_content(Content::Grid);
+        }
+        let started = Instant::now();
+        let hits = search::rank(&self.catalog.borrow().items, &q, MAX_RESULTS);
+        let took = started.elapsed();
+        let mut stats = self.stats.get();
+        stats.queries += 1;
+        stats.slowest = stats.slowest.max(took);
+        self.stats.set(stats);
+
+        let n = hits.len();
+        *self.hits.borrow_mut() = hits;
+        self.selected.set(0);
+        self.set_content(Content::List(n))?;
+        self.paint_results()
+    }
+
+    /// Switches the middle of the menu to `content`. While open, the menu
+    /// glides to its new height and the grid and list cross-fade.
+    fn set_content(&self, content: Content) -> Result<()> {
+        let old = self.layout.borrow().content;
+        if old == content {
+            return Ok(());
+        }
+        *self.layout.borrow_mut() = layout::layout(self.grid.len(), self.max_columns, content);
+        let animate = self.is_open.get() && !self.reduced_motion.get();
+        if animate {
+            self.motion.animate(|| self.place_content())?;
+        } else {
+            self.motion.instant(|| self.place_content())?;
+        }
+        let list = matches!(content, Content::List(_));
+        if matches!(old, Content::List(_)) != list {
+            self.motion.fade(&self.grid.visual()?, !list, animate)?;
+            self.motion.fade(&self.results.visual()?, list, animate)?;
+            if list && matches!(self.focus.get(), Focus::Cell(_)) {
+                self.focus.set(Focus::Search);
+            }
+        }
+        // Things moved under the mouse: the next mouse move finds the new
+        // target.
+        self.hovered.set(Target::Nothing);
+        self.hover.show(false)?;
+        self.update_focus_visuals()
+    }
+
+    /// Paints the result rows that changed. Rows never wait for an icon:
+    /// missing ones are loaded a moment later (`load_icons`).
+    fn paint_results(&self) -> Result<()> {
+        let hits = self.hits.borrow();
+        let px = self.gfx.px(results::ICON);
+        let mut missing = false;
+        {
+            let catalog = self.catalog.borrow();
+            let failed = self.failed_icons.borrow();
+            for (row, &i) in hits.iter().enumerate() {
+                let Some(app) = catalog.apps.get(i) else {
+                    continue;
+                };
+                let icon = self.icons.peek(&app.id, px);
+                if icon.is_none() && !failed.contains(&app.id) {
+                    missing = true;
+                }
+                if !self.results.shows(row, &app.id, icon.is_some()) {
+                    self.results
+                        .paint_row(&self.gfx, row, &app.id, &app.name, icon.as_ref())?;
+                }
+            }
+        }
+        let selected = (!hits.is_empty()).then(|| self.selected.get());
+        self.results.set_selected(selected)?;
+        if missing {
+            // SAFETY: a timer on our own window. WM_TIMER only comes when no
+            // other messages (typing!) are waiting.
+            unsafe { SetTimer(Some(self.hwnd), TIMER_ICONS, 1, None) };
+        }
+        Ok(())
+    }
+
+    /// WM_TIMER for [`TIMER_ICONS`]: loads the icons the results are
+    /// missing, one by one, stopping as soon as a key press or click is
+    /// waiting (it comes first). When none are left, the timer is stopped.
+    pub fn load_icons(&self) {
+        let more = self.load_some_icons().unwrap_or_else(|e| {
+            log_error!("loading result icons failed: {e}");
+            false
+        });
+        if !more {
+            // SAFETY: stops the timer started in `paint_results`.
+            let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_ICONS) };
+        }
+    }
+
+    fn load_some_icons(&self) -> Result<bool> {
+        if !self.is_open.get() || !self.is_list() {
+            return Ok(false);
+        }
+        let deadline = Instant::now() + ICON_BUDGET;
+        let px = self.gfx.px(results::ICON);
+        loop {
+            if input_waiting() {
+                return Ok(true);
+            }
+            // The first row still without its icon.
+            let next = {
+                let catalog = self.catalog.borrow();
+                let failed = self.failed_icons.borrow();
+                self.hits
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row, &i)| catalog.apps.get(i).map(|a| (row, a)))
+                    .find(|(_, a)| !failed.contains(&a.id) && self.icons.peek(&a.id, px).is_none())
+                    .map(|(row, a)| (row, a.clone()))
+            };
+            let Some((row, app)) = next else {
+                return Ok(false);
+            };
+            let icon = app
+                .shell_item()
+                .and_then(|item| self.icons.get(&self.gfx, &app.id, &item, px));
+            match icon {
+                Ok(icon) => {
+                    self.results
+                        .paint_row(&self.gfx, row, &app.id, &app.name, Some(&icon))?
+                }
+                Err(e) => {
+                    log_warn!("no icon for {}: {e}", app.id);
+                    self.failed_icons.borrow_mut().insert(app.id);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(true);
+            }
+        }
+    }
+
+    /// The ID of result `row`, to launch it.
+    fn result_id(&self, row: usize) -> Option<String> {
+        let i = *self.hits.borrow().get(row)?;
+        self.catalog.borrow().apps.get(i).map(|a| a.id.clone())
+    }
+
+    fn launch_result(&self, row: usize) -> Action {
+        self.result_id(row).map_or(Action::None, Action::Launch)
+    }
+
+    fn launch_pin(&self, i: usize) -> Action {
+        self.grid.aumid(i).map_or(Action::None, Action::Launch)
+    }
+
+    /// Moves the result highlight (wrapping around).
+    fn move_selection(&self, delta: isize) -> Result<()> {
+        let n = self.hits.borrow().len();
+        if n == 0 {
+            return Ok(());
+        }
+        self.selected
+            .set(search::step(self.selected.get(), n, delta));
+        self.results.set_selected(Some(self.selected.get()))
     }
 
     // -----------------------------------------------------------------------
@@ -370,6 +736,7 @@ impl Ui {
         self.strip.set_hover(strip_button)?;
         let highlight = match target {
             Target::Cell(i) => self.grid.rect(i).map(|r| (r, CELL_RADIUS)),
+            Target::Row(i) => self.results.rect(i).map(|r| (r, results::ROW_RADIUS)),
             Target::Profile => Some((self.footer.profile_rect(), BUTTON_RADIUS)),
             Target::Power => Some((self.footer.power_rect(), BUTTON_RADIUS)),
             _ => None,
@@ -395,7 +762,9 @@ impl Ui {
         }
         if self.search.rect().contains(p) {
             Target::Search
-        } else if let Some(i) = self.grid.hit(p) {
+        } else if let Some(i) = self.results.hit(p).filter(|_| self.is_list()) {
+            Target::Row(i)
+        } else if let Some(i) = self.grid.hit(p).filter(|_| !self.is_list()) {
             Target::Cell(i)
         } else if self.footer.profile_rect().contains(p) {
             Target::Profile
@@ -411,7 +780,7 @@ impl Ui {
         let p = self.placement.get()?;
         Some(Vector2 {
             X: (x - p.menu_x) as f32 / p.scale,
-            Y: (y - p.menu_y) as f32 / p.scale,
+            Y: (y - p.menu_top(self.layout.borrow().size.Y)) as f32 / p.scale,
         })
     }
 
@@ -514,6 +883,22 @@ impl Ui {
         const KEY_V: VIRTUAL_KEY = VIRTUAL_KEY(b'V' as u16);
         const KEY_X: VIRTUAL_KEY = VIRTUAL_KEY(b'X' as u16);
 
+        // With results showing: Up/Down move the highlight (wrapping
+        // around), Enter launches it, Tab goes to the footer.
+        if self.is_list() {
+            match vk {
+                VK_DOWN => return self.move_selection(1).map(|()| Action::None),
+                VK_UP => return self.move_selection(-1).map(|()| Action::None),
+                VK_RETURN => return Ok(self.launch_result(self.selected.get())),
+                VK_TAB => {
+                    self.keyboard_nav.set(true);
+                    let next = if shift { Focus::Power } else { Focus::Profile };
+                    return self.set_focus(next).map(|()| Action::None);
+                }
+                _ => {}
+            }
+        }
+
         // Leaving the search box.
         match vk {
             VK_DOWN | VK_TAB if !shift => {
@@ -529,7 +914,7 @@ impl Ui {
                 self.keyboard_nav.set(true);
                 return self.set_focus(Focus::Power).map(|()| Action::None);
             }
-            // Enter launches the top search result in milestone 4.
+            // Nothing typed, nothing to launch.
             VK_RETURN => return Ok(Action::None),
             _ => {}
         }
@@ -606,7 +991,7 @@ impl Ui {
             VK_TAB if shift => Focus::Cell(i - 1),
             VK_TAB if i + 1 < n => Focus::Cell(i + 1),
             VK_TAB => Focus::Profile,
-            VK_RETURN => return Ok(Action::Launch(i)),
+            VK_RETURN => return Ok(self.launch_pin(i)),
             _ => return Ok(Action::None),
         };
         self.set_focus(next)?;
@@ -615,7 +1000,9 @@ impl Ui {
 
     fn footer_key(&self, focus: Focus, vk: VIRTUAL_KEY, shift: bool) -> Result<Action> {
         let n = self.grid.len();
-        let above = if n > 0 {
+        // Above the footer: the last pin, or the search box (no pins, or
+        // search results showing).
+        let above = if n > 0 && !self.is_list() {
             Focus::Cell(n - 1)
         } else {
             Focus::Search
@@ -678,13 +1065,13 @@ impl Ui {
     }
 
     /// The text or caret changed: repaint, restart the blink (solid while
-    /// typing), and keep the IME windows next to the caret.
+    /// typing), and search again if the text changed.
     fn after_edit(&self) -> Result<()> {
         self.search.redraw_text(&self.gfx)?;
         if self.is_open.get() && self.focus.get() == Focus::Search {
             self.animator.blink(&self.search.caret_visual()?)?;
         }
-        Ok(())
+        self.update_search(false)
     }
 
     // -----------------------------------------------------------------------
@@ -696,13 +1083,14 @@ impl Ui {
         let p = self.placement.get()?;
         let r = self.search.caret_rect();
         let s = p.scale;
+        let menu_top = p.menu_top(self.layout.borrow().size.Y);
         let left = p.menu_x + (r.x * s).round() as i32;
-        let top = p.menu_y + (r.y * s).round() as i32;
+        let top = menu_top + (r.y * s).round() as i32;
         Some(RECT {
             left,
             top,
             right: left + (r.w * s).ceil().max(1.0) as i32,
-            bottom: p.menu_y + (r.bottom() * s).round() as i32,
+            bottom: menu_top + (r.bottom() * s).round() as i32,
         })
     }
 
@@ -819,7 +1207,8 @@ impl Ui {
             return Ok(Action::None);
         }
         match pressed {
-            Target::Cell(i) => Ok(Action::Launch(i)),
+            Target::Cell(i) => Ok(self.launch_pin(i)),
+            Target::Row(i) => Ok(self.launch_result(i)),
             Target::Profile => Ok(Action::OpenAccountSettings),
             Target::Power if self.strip.is_open() => {
                 self.close_strip(Focus::Search)?;

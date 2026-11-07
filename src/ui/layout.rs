@@ -1,8 +1,13 @@
 //! Where everything goes inside the menu (CLAUDE.md section 5).
 //!
-//! Pure math, no Windows calls: give it the number of pins and it returns
-//! every rectangle in DIPs, measured from the menu's top-left corner. The
-//! menu size follows the content, so fewer pins means a smaller menu.
+//! Pure math, no Windows calls: give it the number of pins and what the
+//! middle of the menu shows (the pinned grid, or a list of search results),
+//! and it returns every rectangle in DIPs, measured from the menu's top-left
+//! corner. The menu size follows the content, so fewer pins means a smaller
+//! menu, and a search with 3 results is shorter than one with 8.
+//!
+//! The width never changes between the grid and the list (only the height
+//! does), so the menu doesn't jump sideways while you type.
 
 use windows_numerics::Vector2;
 
@@ -20,6 +25,11 @@ const MIN_WIDTH: f32 = 320.0;
 const WIDTH_EXTRA: f32 = 24.0;
 /// Space between the grid and the footer.
 const GRID_BELOW: f32 = 12.0;
+
+/// Search results: rows 40 tall, at most 8, 12 in from the menu's sides.
+pub const ROW_HEIGHT: f32 = 40.0;
+pub const MAX_RESULTS: usize = 8;
+const LIST_SIDE: f32 = 12.0;
 
 pub const FOOTER_HEIGHT: f32 = 60.0;
 pub const AVATAR: f32 = 30.0;
@@ -70,8 +80,18 @@ impl Rect {
     }
 }
 
+/// What the middle of the menu shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Content {
+    /// The pinned apps (the search box is empty).
+    Grid,
+    /// Search results: this many rows (0 = the "No apps found" row).
+    List(usize),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
+    pub content: Content,
     /// The whole menu.
     pub size: Vector2,
     pub search: Rect,
@@ -79,6 +99,10 @@ pub struct Layout {
     pub rows: usize,
     /// One rectangle per pinned app, in order (row by row).
     pub cells: Vec<Rect>,
+    /// One rectangle per search result row (empty for the grid).
+    pub result_rows: Vec<Rect>,
+    /// Where "No apps found" goes.
+    pub no_results: Rect,
     pub footer: Rect,
     pub avatar: Rect,
     /// Where the display name may go (it is trimmed with "…" to fit).
@@ -89,8 +113,19 @@ pub struct Layout {
     pub strip: Rect,
 }
 
-/// The menu layout for `pins` pinned apps.
-pub fn layout(pins: usize, max_columns: usize) -> Layout {
+/// The window has to fit the tallest menu, so it never has to move or grow
+/// while the menu is open: the grid or 8 results, whichever is taller.
+pub fn max_size(pins: usize, max_columns: usize) -> Vector2 {
+    let grid = layout(pins, max_columns, Content::Grid).size;
+    let list = layout(pins, max_columns, Content::List(MAX_RESULTS)).size;
+    Vector2 {
+        X: grid.X.max(list.X),
+        Y: grid.Y.max(list.Y),
+    }
+}
+
+/// The menu layout for `pins` pinned apps, showing `content`.
+pub fn layout(pins: usize, max_columns: usize, content: Content) -> Layout {
     let columns = pins.min(max_columns.max(1));
     let rows = if columns == 0 {
         0
@@ -127,7 +162,25 @@ pub fn layout(pins: usize, max_columns: usize) -> Layout {
         rows as f32 * CELL_STEP - CELL_GAP
     };
 
-    let footer_top = grid_top + grid_height + GRID_BELOW;
+    // The results list starts where the grid starts.
+    let row = |i: usize| {
+        Rect::new(
+            LIST_SIDE,
+            grid_top + i as f32 * ROW_HEIGHT,
+            width - 2.0 * LIST_SIDE,
+            ROW_HEIGHT,
+        )
+    };
+    let (middle_height, result_rows) = match content {
+        Content::Grid => (grid_height, Vec::new()),
+        Content::List(n) => {
+            let n = n.min(MAX_RESULTS);
+            // No results still takes one row, for the message.
+            (n.max(1) as f32 * ROW_HEIGHT, (0..n).map(row).collect())
+        }
+    };
+
+    let footer_top = grid_top + middle_height + GRID_BELOW;
     let footer = Rect::new(0.0, footer_top, width, FOOTER_HEIGHT);
     let mid = footer_top + FOOTER_HEIGHT / 2.0;
     let power = Rect::new(
@@ -153,6 +206,7 @@ pub fn layout(pins: usize, max_columns: usize) -> Layout {
     );
 
     Layout {
+        content,
         size: Vector2 {
             X: width,
             Y: footer.bottom(),
@@ -161,6 +215,8 @@ pub fn layout(pins: usize, max_columns: usize) -> Layout {
         columns,
         rows,
         cells,
+        result_rows,
+        no_results: row(0),
         footer,
         avatar,
         name,
@@ -199,7 +255,7 @@ mod tests {
 
     #[test]
     fn six_pins_make_a_4_by_2_grid() {
-        let l = layout(6, 4);
+        let l = layout(6, 4, Content::Grid);
         assert_eq!((l.columns, l.rows), (4, 2));
         assert_eq!(l.size.X, 360.0); // 4 × 84 + 24
         assert_eq!(l.size.Y, 64.0 + 164.0 + 12.0 + 60.0);
@@ -209,28 +265,28 @@ mod tests {
 
     #[test]
     fn few_pins_keep_the_minimum_width_and_center_the_grid() {
-        let l = layout(1, 4);
+        let l = layout(1, 4, Content::Grid);
         assert_eq!((l.columns, l.rows), (1, 1));
         assert_eq!(l.size.X, 320.0);
         assert_eq!(l.cells[0].x, 120.0); // (320 - 80) / 2
-        let l3 = layout(3, 4);
+        let l3 = layout(3, 4, Content::Grid);
         assert_eq!(l3.size.X, 320.0);
         // Fewer rows means a shorter menu.
-        assert!(layout(4, 4).size.Y < layout(5, 4).size.Y);
-        assert_eq!(layout(4, 4).size.Y, l.size.Y);
+        assert!(layout(4, 4, Content::Grid).size.Y < layout(5, 4, Content::Grid).size.Y);
+        assert_eq!(layout(4, 4, Content::Grid).size.Y, l.size.Y);
     }
 
     #[test]
     fn many_pins_add_rows_not_columns() {
-        let l = layout(9, 4);
+        let l = layout(9, 4, Content::Grid);
         assert_eq!((l.columns, l.rows), (4, 3));
         assert_eq!(l.size.X, 360.0);
-        assert_eq!(layout(9, 3).columns, 3);
+        assert_eq!(layout(9, 3, Content::Grid).columns, 3);
     }
 
     #[test]
     fn no_pins_is_search_plus_footer() {
-        let l = layout(0, 4);
+        let l = layout(0, 4, Content::Grid);
         assert_eq!((l.columns, l.rows), (0, 0));
         assert!(l.cells.is_empty());
         assert_eq!(
@@ -243,16 +299,54 @@ mod tests {
     }
 
     #[test]
+    fn search_results_keep_the_width_and_follow_the_row_count() {
+        let grid = layout(6, 4, Content::Grid);
+        let three = layout(6, 4, Content::List(3));
+        let eight = layout(6, 4, Content::List(8));
+        assert_eq!(three.size.X, grid.size.X);
+        assert_eq!(three.result_rows.len(), 3);
+        assert_eq!(three.result_rows[0], Rect::new(12.0, 64.0, 336.0, 40.0));
+        assert_eq!(three.result_rows[2].y, 64.0 + 80.0);
+        assert_eq!(three.size.Y, 64.0 + 120.0 + 12.0 + 60.0);
+        // 8 rows (320) are taller than 2 rows of icons (164).
+        assert_eq!(eight.size.Y, 64.0 + 320.0 + 12.0 + 60.0);
+        // More than 8 is capped.
+        assert_eq!(
+            layout(6, 4, Content::List(20)).result_rows,
+            eight.result_rows
+        );
+        // No results: one row for the message.
+        let none = layout(6, 4, Content::List(0));
+        assert!(none.result_rows.is_empty());
+        assert_eq!(none.size.Y, 64.0 + 40.0 + 12.0 + 60.0);
+        assert_eq!(none.no_results, three.result_rows[0]);
+        // The pinned grid stays where it was (it's only faded out).
+        assert_eq!(three.cells, grid.cells);
+    }
+
+    #[test]
+    fn the_window_fits_the_tallest_menu() {
+        assert_eq!(max_size(6, 4), layout(6, 4, Content::List(8)).size);
+        // 5 rows of icons are taller than 8 results.
+        assert_eq!(max_size(20, 4), layout(20, 4, Content::Grid).size);
+    }
+
+    #[test]
     fn footer_and_strip_fit_inside_the_menu() {
-        for pins in 0..13 {
-            let l = layout(pins, 4);
-            assert_eq!(l.footer.bottom(), l.size.Y);
-            assert!(l.power.right() <= l.size.X && l.power.bottom() <= l.size.Y);
-            assert!(l.strip.y >= 0.0, "{pins} pins");
-            assert!(l.strip.bottom() < l.footer.y);
-            let buttons = strip_buttons(l.strip);
-            assert!(buttons[STRIP_BUTTONS - 1].right() <= l.strip.w + 0.01);
-            assert!(confirm_buttons(l.strip)[0].x > 100.0);
+        for content in [Content::Grid, Content::List(0), Content::List(8)] {
+            for pins in 0..13 {
+                let l = layout(pins, 4, content);
+                assert_eq!(l.footer.bottom(), l.size.Y);
+                assert!(l.power.right() <= l.size.X && l.power.bottom() <= l.size.Y);
+                assert!(l.strip.y >= 0.0, "{pins} pins");
+                assert!(l.strip.bottom() < l.footer.y);
+                let buttons = strip_buttons(l.strip);
+                assert!(buttons[STRIP_BUTTONS - 1].right() <= l.strip.w + 0.01);
+                assert!(confirm_buttons(l.strip)[0].x > 100.0);
+                for r in &l.result_rows {
+                    assert!(r.bottom() < l.footer.y);
+                }
+            }
         }
     }
 }

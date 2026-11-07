@@ -14,6 +14,7 @@ mod config;
 mod hook;
 mod icons;
 mod power;
+mod search;
 mod settings_watch;
 mod tray;
 mod ui;
@@ -21,6 +22,7 @@ mod window;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use windows::Foundation::TypedEventHandler;
 use windows::System::DispatcherQueueController;
@@ -49,16 +51,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW, HTCLIENT,
-    IDC_IBEAM, LoadCursorW, MSG, PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE, PostMessageW,
-    PostQuitMessage, RegisterWindowMessageW, SC_KEYMENU, SW_SHOWNORMAL, SetCursor,
-    TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_DPICHANGED,
+    IDC_IBEAM, KillTimer, LoadCursorW, MSG, PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE,
+    PostMessageW, PostQuitMessage, RegisterWindowMessageW, SC_KEYMENU, SW_SHOWNORMAL, SetCursor,
+    SetTimer, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_DPICHANGED,
     WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
     WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_POWERBROADCAST,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER,
     WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK,
 };
 use windows::core::{Result, w};
 
+use apps::{AppInfo, ChangeWatch, WM_APP_APPS_CHANGED, WM_APP_APPS_LOADED};
 use config::Config;
 use hook::{HookThread, WM_APP_TOGGLE};
 use settings_watch::{SettingsWatch, WM_APP_SETTINGS_CHANGED};
@@ -103,7 +106,21 @@ struct App {
     msg_taskbar_created: u32,
     /// We asked Windows for a WM_MOUSELEAVE (it sends one per request).
     tracking_mouse: Cell<bool>,
+    /// The app list: scanned on a helper thread, delivered through here.
+    apps_tx: Sender<Vec<AppInfo>>,
+    apps_rx: Receiver<Vec<AppInfo>>,
+    /// A scan is running; `rescan` = something changed meanwhile, so scan
+    /// once more when it's done.
+    scanning: Cell<bool>,
+    rescan: Cell<bool>,
+    /// Tells us about installs and uninstalls (None if that failed).
+    _app_watch: Option<ChangeWatch>,
 }
+
+/// WM_TIMER id: an app was installed or removed; wait until things settle.
+const TIMER_APPS_SETTLE: usize = 1;
+/// Installers create and delete many files; scan only after 2 s of quiet.
+const APPS_SETTLE_MS: u32 = 2000;
 
 /// Is this key held down right now (as of the current message)?
 fn key_held(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> bool {
@@ -153,8 +170,10 @@ impl App {
         !self.settings.animations_enabled()
     }
 
+    /// The window fits the tallest the menu can get (8 search results or
+    /// the grid), so it never moves while the menu grows or shrinks.
     fn placement(&self) -> Placement {
-        let size = self.ui.size();
+        let size = self.ui.max_size();
         window::placement(size.X, size.Y)
     }
 
@@ -162,11 +181,12 @@ impl App {
         self.generation.set(self.generation.get() + 1);
         let fresh = !self.is_visible.get();
         if fresh {
-            // Fully hidden: pick the monitor and position fresh. (If we are
-            // interrupting a close, stay where we are and just reverse.)
+            // Fully hidden: empty search and the grid back, then pick the
+            // monitor and position fresh. (If we are interrupting a close,
+            // stay where we are and just reverse.)
+            log_err("reset", self.ui.reset_closed());
             let p = self.placement();
             log_err("layout", self.ui.set_layout(&p));
-            log_err("reset", self.ui.reset_closed());
             window::show(self.hwnd, &p);
             self.placement.set(Some(p));
             self.is_visible.set(true);
@@ -228,13 +248,65 @@ impl App {
                 self.close();
                 power::run(power_action);
             }
-            Action::Launch(i) => {
-                // Launching apps arrives in milestone 4.
-                log_info!(
-                    "launch requested: {} (not yet, milestone 4)",
-                    self.ui.app_name(i)
-                );
+            Action::Launch(id) => {
+                // Close first (the close animation runs in DWM, so it stays
+                // smooth), then start the app on a helper thread.
+                self.close();
+                self.ui.record_launch(&id);
+                apps::launch(id);
             }
+        }
+    }
+
+    /// Lists all apps again, on a helper thread.
+    fn scan_apps(&self) {
+        if self.scanning.replace(true) {
+            self.rescan.set(true);
+            return;
+        }
+        apps::scan_in_background(self.hwnd, self.apps_tx.clone());
+    }
+
+    /// The scan thread is done: use the newest list.
+    fn on_apps_loaded(&self) {
+        let mut latest = None;
+        while let Ok(list) = self.apps_rx.try_recv() {
+            latest = Some(list);
+        }
+        self.scanning.set(false);
+        if let Some(list) = latest {
+            log_err("updating the app list", self.ui.set_apps(list));
+        }
+        if self.rescan.replace(false) {
+            self.scan_apps();
+        } else if !self.is_visible.get() {
+            // A scan touches memory it never needs again (the shell's own
+            // bookkeeping); hand it back, like the startup trim. Scans are
+            // rare (startup, installs), so this costs nothing. Measured
+            // (milestone 4): idle 10.3 MB after startup and +3.5 MB after
+            // the first rescan without this.
+            trim_memory();
+        }
+    }
+
+    /// The shell says something changed in the Start menu folders: wait for
+    /// 2 s of quiet (restarting the wait on every change), then scan.
+    fn on_apps_changed(&self, wparam: WPARAM, lparam: LPARAM) {
+        ChangeWatch::acknowledge(wparam, lparam);
+        // SAFETY: a one-shot timer on our own window (killed when it fires).
+        unsafe { SetTimer(Some(self.hwnd), TIMER_APPS_SETTLE, APPS_SETTLE_MS, None) };
+    }
+
+    fn on_timer(&self, id: usize) {
+        match id {
+            TIMER_APPS_SETTLE => {
+                // SAFETY: stops our own timer; it is one-shot.
+                let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_APPS_SETTLE) };
+                log_info!("apps changed; listing them again");
+                self.scan_apps();
+            }
+            ui::TIMER_ICONS => self.ui.load_icons(),
+            _ => {}
         }
     }
 
@@ -390,7 +462,7 @@ impl App {
             return;
         }
         let (x, y) = mouse_xy(lparam);
-        let on_menu = self.placement.get().is_some_and(|p| p.menu_contains(x, y));
+        let on_menu = self.ui.menu_contains(x, y);
         if !on_menu {
             self.close();
         } else if msg == WM_LBUTTONDOWN {
@@ -500,6 +572,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 app.retry_focus();
                 return LRESULT(0);
             }
+            WM_APP_APPS_LOADED => {
+                app.on_apps_loaded();
+                return LRESULT(0);
+            }
+            WM_APP_APPS_CHANGED => {
+                app.on_apps_changed(wparam, lparam);
+                return LRESULT(0);
+            }
+            WM_TIMER => {
+                app.on_timer(wparam.0);
+                return LRESULT(0);
+            }
             WM_APP_REDRAW => {
                 log_warn!("graphics device replaced; repainting");
                 log_err("repaint", app.ui.device_replaced());
@@ -544,9 +628,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 /// loading fonts, asking the shell for icons. Measured (milestone 3): about
 /// 21 MB right after startup, but an open/close cycle afterwards needs only
 /// about 5 MB. Handing the rest back to Windows keeps idle RAM low.
+/// The same after each app scan (see `App::on_apps_loaded`).
 /// (Not done after every close: that would only make each open fault the
 /// same 5 MB back in.)
-fn trim_startup_memory() {
+fn trim_memory() {
     // SAFETY: (-1, -1) = "trim what you can" for our own process.
     if let Err(e) = unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) }
     {
@@ -609,6 +694,7 @@ fn run() -> Result<()> {
         log_warn!("WTSRegisterSessionNotification failed: {e}");
     }
 
+    let (apps_tx, apps_rx) = channel();
     let app = Rc::new(App {
         hwnd,
         ui,
@@ -627,11 +713,18 @@ fn run() -> Result<()> {
         // SAFETY: registers (or looks up) a well-known message name.
         msg_taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
         tracking_mouse: Cell::new(false),
+        apps_tx,
+        apps_rx,
+        scanning: Cell::new(false),
+        rescan: Cell::new(false),
+        _app_watch: ChangeWatch::new(hwnd),
     });
     app.apply_background();
+    // List every installed app in the background (search needs them).
+    app.scan_apps();
     APP.with(|a| *a.borrow_mut() = Some(app));
     log_info!("Glint started (pid {})", std::process::id());
-    trim_startup_memory();
+    trim_memory();
 
     let mut msg = MSG::default();
     // SAFETY: standard message loop with a valid MSG out-pointer.

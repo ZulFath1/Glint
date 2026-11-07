@@ -53,11 +53,23 @@ pub struct Placement {
 }
 
 impl Placement {
+    /// The window is made for the tallest menu (`menu_height`). A shorter
+    /// one (`height` DIPs) sits against the taskbar: with the taskbar at the
+    /// bottom it is pushed down to the bottom of that space. Returns the
+    /// top edge in window pixels.
+    pub fn menu_top(&self, height: f32) -> i32 {
+        match self.edge {
+            Edge::Bottom => self.menu_y + self.menu_height - (height * self.scale).round() as i32,
+            _ => self.menu_y,
+        }
+    }
+
     /// True if a point in window (client) coordinates is on the menu itself
-    /// rather than on the transparent margin around it.
-    pub fn menu_contains(&self, x: i32, y: i32) -> bool {
-        (self.menu_x..self.menu_x + self.menu_width).contains(&x)
-            && (self.menu_y..self.menu_y + self.menu_height).contains(&y)
+    /// (`height` DIPs tall) rather than on the transparent space around it.
+    pub fn menu_contains(&self, x: i32, y: i32, height: f32) -> bool {
+        let top = self.menu_top(height);
+        let bottom = top + (height * self.scale).round() as i32;
+        (self.menu_x..self.menu_x + self.menu_width).contains(&x) && (top..bottom).contains(&y)
     }
 }
 
@@ -395,7 +407,24 @@ mod tests {
         assert_eq!(p.width, 360 + 64);
         assert_eq!(p.x + p.width / 2, 960);
         assert_eq!((p.menu_x, p.menu_y), (32, 32));
-        assert!(p.menu_contains(32, 32) && !p.menu_contains(10, 100));
+        assert!(p.menu_contains(32, 32, 320.0) && !p.menu_contains(10, 100, 320.0));
+        // A shorter menu (e.g. 3 search results instead of 8) keeps its
+        // bottom edge above the taskbar; the space above it is not "menu".
+        assert_eq!(p.menu_top(200.0), 32 + 120);
+        assert!(!p.menu_contains(100, 100, 200.0) && p.menu_contains(100, 160, 200.0));
+    }
+
+    #[test]
+    fn shorter_menus_stay_at_the_top_with_a_top_taskbar() {
+        let p = compute_placement(
+            rect(0, 0, 1920, 1080),
+            rect(0, 48, 1920, 1080),
+            1.0,
+            360.0,
+            320.0,
+        );
+        assert_eq!(p.edge, Edge::Top);
+        assert_eq!(p.menu_top(200.0), p.menu_top(320.0));
     }
 
     #[test]
