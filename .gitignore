@@ -9,6 +9,7 @@ log.txt
 
 # The owner's real config (never commit)
 config.toml
+config.toml.tmp
 
 # Editor / environment
 .vscode/
@@ -20,4 +21,6 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
+# Notes for the AI assistant (kept local)
 CLAUDE.md
+.claude/

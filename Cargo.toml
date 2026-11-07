@@ -2,8 +2,13 @@
 name = "glint"
 version = "0.1.0"
 edition = "2024"
-description = "A tiny, buttery-smooth Start menu for Windows 11"
+description = "A tiny, buttery-smooth Start menu for Windows 11, written in Rust"
+authors = ["ZulFath1"]
 license = "MIT"
+repository = "https://github.com/ZulFath1/Glint"
+readme = "README.md"
+keywords = ["windows", "start-menu", "launcher", "windows-11", "composition"]
+categories = ["gui", "os::windows-apis"]
 publish = false
 
 [dependencies]
