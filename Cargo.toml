@@ -1,6 +1,6 @@
 [package]
 name = "glint"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A tiny, buttery-smooth Start menu for Windows 11, written in Rust"
 authors = ["ZulFath1"]
