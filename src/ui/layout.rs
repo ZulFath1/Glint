@@ -11,7 +11,7 @@
 
 use windows_numerics::Vector2;
 
-use crate::theme::{FooterStyle, Theme};
+use crate::theme::{FooterStyle, LayoutKind, Theme};
 
 /// Search bar: 16 from the top and the sides, 40 tall, 8 below.
 pub const SEARCH_PAD: f32 = 16.0;
@@ -58,6 +58,29 @@ pub const QUICK_LABELS: [&str; 3] = ["[ lock ]", "[ restart ]", "[ off ]"];
 const QUICK_TEXT_HEIGHT: f32 = 30.0;
 const MONO_CHAR: f32 = 7.2;
 const QUICK_TEXT_PAD: f32 = 8.0;
+
+/// The list layout (nord): rows of 48 with a 28 px icon, a "PINNED" label
+/// and an icon-only strip of 56 px cells (34 px icons), and a one-line music
+/// row in the bottom bar.
+pub const LIST_ROW: f32 = 48.0;
+pub const LIST_ICON: f32 = 28.0;
+pub const STRIP_CELL: f32 = 56.0;
+pub const STRIP_ICON: f32 = 34.0;
+const STRIP_STEP: f32 = STRIP_CELL + 4.0;
+const LIST_MIN_WIDTH: f32 = 400.0;
+const LIST_SECTION_ABOVE: f32 = 10.0;
+pub const MUSIC_ROW: f32 = 44.0;
+/// How many most-used apps the list shows while nothing is typed.
+pub const MOST_USED: usize = 5;
+
+/// The sidebar layout (tokyo-night): a 64 px rail, and a header with a
+/// greeting, a big clock and the date above the search box.
+pub const RAIL: f32 = 64.0;
+pub const HEADER_HEIGHT: f32 = 84.0;
+const HEADER_BELOW: f32 = 12.0;
+const SIDEBAR_BOTTOM: f32 = 16.0;
+/// Tall enough for the rail's 5 buttons.
+const SIDEBAR_MIN_HEIGHT: f32 = 300.0;
 
 /// The power strip: a row of 4 buttons above the footer
 /// (Lock, Sleep, Restart, Shut down; the owner never signs out, so that one
@@ -222,6 +245,20 @@ pub fn card_parts(w: f32, sources: bool) -> CardParts {
     }
 }
 
+/// The parts of the one-line music row (list layout), `w` wide: a small
+/// cover, "Title · Artist" and Play/Pause. Everything else is empty.
+pub fn row_parts(w: f32) -> CardParts {
+    let cover = Rect::new(6.0, (MUSIC_ROW - 28.0) / 2.0, 28.0, 28.0);
+    let play = Rect::new(w - MEDIA_BUTTON_W, 0.0, MEDIA_BUTTON_W, MUSIC_ROW);
+    let text_x = cover.right() + 10.0;
+    CardParts {
+        cover,
+        title: Rect::new(text_x, 0.0, (play.x - 4.0 - text_x).max(0.0), MUSIC_ROW),
+        buttons: [Rect::default(), play, Rect::default()],
+        ..CardParts::default()
+    }
+}
+
 /// How tall the music card is.
 pub fn card_height(music: Music) -> f32 {
     let base = 2.0 * CARD_PAD_Y + COVER + CARD_ROW_GAP + SEEK_ROW;
@@ -234,6 +271,8 @@ pub fn card_height(music: Music) -> f32 {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
+    /// Which arrangement (the theme's).
+    pub kind: LayoutKind,
     pub content: Content,
     /// The music card as it shows (always `Hidden` with search results).
     pub music: Music,
@@ -241,6 +280,8 @@ pub struct Layout {
     /// fade out in place).
     pub card: Rect,
     pub card_parts: CardParts,
+    /// The card is the one-line music row of the list layout's bottom bar.
+    pub card_compact: bool,
     /// The whole menu.
     pub size: Vector2,
     pub search: Rect,
@@ -254,8 +295,13 @@ pub struct Layout {
     pub no_results: Rect,
     /// The title strip (terminal themes; empty otherwise).
     pub title: Rect,
-    /// The "── pinned ──" label (terminal themes; empty otherwise).
+    /// The "── pinned ──" / "PINNED" label (terminal and list layouts).
     pub section: Rect,
+    /// Greeting, big clock and date (sidebar layout; empty otherwise).
+    pub header: Rect,
+    /// The sidebar's rail and its Apps button (empty otherwise).
+    pub rail: Rect,
+    pub apps: Rect,
     pub footer: Rect,
     pub avatar: Rect,
     /// Where the display name may go (it is trimmed with "…" to fit).
@@ -271,37 +317,179 @@ pub struct Layout {
     pub strip: Rect,
 }
 
+impl Layout {
+    /// Lock / Restart / Shut down are separate footer buttons (catppuccin,
+    /// gruvbox), so there is no power button and no 4-button strip.
+    pub fn separate_power_buttons(&self) -> bool {
+        self.quick.len() == QUICK_LABELS.len()
+    }
+}
+
 /// The window has to fit the tallest menu, so it never has to move or grow
 /// while the menu is open: the grid with the biggest music card, or 8
 /// results, whichever is taller.
 pub fn max_size(pins: usize, max_columns: usize, theme: &Theme) -> Vector2 {
-    let grid = layout(
-        pins,
-        max_columns,
-        Content::Grid,
-        Music::CardWithSources,
-        theme,
-    )
-    .size;
-    let list = layout(
-        pins,
-        max_columns,
-        Content::List(MAX_RESULTS),
-        Music::Hidden,
-        theme,
-    )
-    .size;
-    Vector2 {
-        X: grid.X.max(list.X),
-        Y: grid.Y.max(list.Y),
+    let mut max = Vector2 { X: 0.0, Y: 0.0 };
+    for content in [Content::Grid, Content::List(MAX_RESULTS)] {
+        let s = layout(pins, max_columns, content, Music::CardWithSources, theme).size;
+        max.X = max.X.max(s.X);
+        max.Y = max.Y.max(s.Y);
     }
+    max
 }
 
 /// The menu layout for `pins` pinned apps, showing `content`, with the music
-/// card as `music` says (the card only shows with the grid, never with search
-/// results), for `theme` (a terminal theme adds a title strip and a section
-/// label; its footer style places the buttons).
+/// card as `music` says, arranged the way `theme` wants (IMPROVE.md 9.1):
+///
+/// - grid: search → pinned grid (or results) → music card → footer. The
+///   card only shows with the grid, never with search results. A terminal
+///   theme adds a title strip and a section label.
+/// - list: search → rows (results, or the most-used apps) → "PINNED" and
+///   an icon-only strip → a bottom bar holding a one-line music row.
+/// - sidebar: a rail on the left; on the right a greeting with a big clock,
+///   then search → grid (or results) → music card.
 pub fn layout(
+    pins: usize,
+    max_columns: usize,
+    content: Content,
+    music: Music,
+    theme: &Theme,
+) -> Layout {
+    match theme.layout {
+        LayoutKind::Grid => grid_layout(pins, max_columns, content, music, theme),
+        LayoutKind::List => list_layout(pins, max_columns, content, music, theme),
+        LayoutKind::Sidebar => sidebar_layout(pins, max_columns, content, music),
+    }
+}
+
+/// Columns and rows for `pins` icons, at most `max_columns` wide.
+fn grid_shape(pins: usize, max_columns: usize) -> (usize, usize) {
+    let columns = pins.min(max_columns.max(1));
+    let rows = if columns == 0 {
+        0
+    } else {
+        pins.div_ceil(columns)
+    };
+    (columns, rows)
+}
+
+/// Where a block of icon cells goes.
+struct CellBlock {
+    columns: usize,
+    /// Cell size and the distance from one cell to the next.
+    cell: f32,
+    step: f32,
+    /// The block is centered between `left` and `left + width`.
+    left: f32,
+    width: f32,
+    top: f32,
+}
+
+/// `pins` cells laid out as `b` says, row by row.
+fn cells(pins: usize, b: &CellBlock) -> Vec<Rect> {
+    let columns = b.columns.max(1);
+    let used = columns as f32 * b.step - (b.step - b.cell);
+    let x0 = (b.left + (b.width - used) / 2.0).round();
+    (0..pins)
+        .map(|i| {
+            let (row, col) = (i / columns, i % columns);
+            Rect::new(
+                x0 + col as f32 * b.step,
+                b.top + row as f32 * b.step,
+                b.cell,
+                b.cell,
+            )
+        })
+        .collect()
+}
+
+/// The height of `rows` rows of cells `step` apart.
+fn cells_height(rows: usize, cell: f32, step: f32) -> f32 {
+    if rows == 0 {
+        0.0
+    } else {
+        rows as f32 * step - (step - cell)
+    }
+}
+
+/// The music card at (`x`, `y`), `w` wide (a "Card"-sized one while hidden,
+/// so it can fade out in place).
+fn card_at(x: f32, y: f32, w: f32, music: Music) -> (Rect, CardParts) {
+    let kind = if music == Music::Hidden {
+        Music::Card
+    } else {
+        music
+    };
+    let card = Rect::new(x, y, w, card_height(kind));
+    (card, card_parts(card.w, kind == Music::CardWithSources))
+}
+
+/// Profile, gear, power (or separate buttons) along a footer bar.
+struct FooterParts {
+    avatar: Rect,
+    name: Rect,
+    profile: Rect,
+    settings: Rect,
+    power: Rect,
+    quick: Vec<Rect>,
+}
+
+fn footer_parts(footer: Rect, style: FooterStyle) -> FooterParts {
+    let width = footer.w;
+    let mid = footer.y + FOOTER_HEIGHT / 2.0;
+    let power = Rect::new(
+        width - FOOTER_INSET - POWER_BUTTON,
+        mid - POWER_BUTTON / 2.0,
+        POWER_BUTTON,
+        POWER_BUTTON,
+    );
+    let quick = quick_buttons(style, width, mid);
+    // The Settings gear, just left of the power button (or the first
+    // separate button), same size.
+    let gear_right = quick
+        .first()
+        .map_or(power.x - BUTTON_GAP, |q| q.x - QUICK_GAP);
+    let settings = Rect::new(
+        gear_right - POWER_BUTTON,
+        power.y,
+        POWER_BUTTON,
+        POWER_BUTTON,
+    );
+    let avatar = Rect::new(16.0, mid - AVATAR / 2.0, AVATAR, AVATAR);
+    let name_x = avatar.right() + 10.0;
+    let name = Rect::new(
+        name_x,
+        mid - 10.0,
+        (settings.x - 12.0 - name_x).max(0.0),
+        20.0,
+    );
+    let profile = Rect::new(
+        FOOTER_INSET,
+        footer.y + FOOTER_INSET,
+        (settings.x - 8.0 - FOOTER_INSET).max(AVATAR + 16.0),
+        FOOTER_HEIGHT - 2.0 * FOOTER_INSET,
+    );
+    FooterParts {
+        avatar,
+        name,
+        profile,
+        settings,
+        power,
+        quick,
+    }
+}
+
+/// The power strip, just above `bottom`, between `left` and `right`.
+fn strip_above(left: f32, right: f32, bottom: f32) -> Rect {
+    Rect::new(
+        left + STRIP_SIDE,
+        bottom - STRIP_ABOVE_FOOTER - STRIP_HEIGHT,
+        right - left - 2.0 * STRIP_SIDE,
+        STRIP_HEIGHT,
+    )
+}
+
+fn grid_layout(
     pins: usize,
     max_columns: usize,
     content: Content,
@@ -313,12 +501,7 @@ pub fn layout(
     } else {
         Music::Hidden
     };
-    let columns = pins.min(max_columns.max(1));
-    let rows = if columns == 0 {
-        0
-    } else {
-        pins.div_ceil(columns)
-    };
+    let (columns, rows) = grid_shape(pins, max_columns);
     let width = MIN_WIDTH
         .max(columns as f32 * CELL_STEP + WIDTH_EXTRA)
         .max(footer_min_width(theme.footer));
@@ -351,25 +534,16 @@ pub fn layout(
         (Rect::default(), search.bottom() + SEARCH_BELOW)
     };
 
-    // The grid is centered; its height is the rows minus the last gap.
-    let grid_width = columns as f32 * CELL_STEP - CELL_GAP;
-    let grid_left = ((width - grid_width) / 2.0).round();
-    let cells = (0..pins)
-        .map(|i| {
-            let (row, col) = (i / columns, i % columns);
-            Rect::new(
-                grid_left + col as f32 * CELL_STEP,
-                grid_top + row as f32 * CELL_STEP,
-                CELL,
-                CELL,
-            )
-        })
-        .collect();
-    let grid_height = if rows == 0 {
-        0.0
-    } else {
-        rows as f32 * CELL_STEP - CELL_GAP
+    let block = CellBlock {
+        columns,
+        cell: CELL,
+        step: CELL_STEP,
+        left: 0.0,
+        width,
+        top: grid_top,
     };
+    let cells = cells(pins, &block);
+    let grid_height = cells_height(rows, CELL, CELL_STEP);
 
     // The results list starts where the grid starts.
     let row = |i: usize| {
@@ -390,76 +564,31 @@ pub fn layout(
     };
 
     let below_middle = grid_top + middle_height + GRID_BELOW;
-    // The card's place, also while hidden (a "Card"-sized one then).
-    let card_kind = if music == Music::Hidden {
-        Music::Card
-    } else {
-        music
-    };
-    let card = Rect::new(
-        CARD_MARGIN,
-        below_middle,
-        width - 2.0 * CARD_MARGIN,
-        card_height(card_kind),
-    );
-    let card_parts = card_parts(card.w, card_kind == Music::CardWithSources);
+    let (card, card_parts) = card_at(CARD_MARGIN, below_middle, width - 2.0 * CARD_MARGIN, music);
     let footer_top = if music == Music::Hidden {
         below_middle
     } else {
         card.bottom() + CARD_MARGIN
     };
     let footer = Rect::new(0.0, footer_top, width, FOOTER_HEIGHT);
-    let mid = footer_top + FOOTER_HEIGHT / 2.0;
-    let power = Rect::new(
-        width - FOOTER_INSET - POWER_BUTTON,
-        mid - POWER_BUTTON / 2.0,
-        POWER_BUTTON,
-        POWER_BUTTON,
-    );
-    let quick = quick_buttons(theme.footer, width, mid);
-    // The Settings gear, just left of the power button (or the first
-    // separate button), same size.
-    let gear_right = quick
-        .first()
-        .map_or(power.x - BUTTON_GAP, |q| q.x - QUICK_GAP);
-    let settings = Rect::new(
-        gear_right - POWER_BUTTON,
-        power.y,
-        POWER_BUTTON,
-        POWER_BUTTON,
-    );
-    let avatar = Rect::new(16.0, mid - AVATAR / 2.0, AVATAR, AVATAR);
-    let name_x = avatar.right() + 10.0;
-    let name = Rect::new(
-        name_x,
-        mid - 10.0,
-        (settings.x - 12.0 - name_x).max(0.0),
-        20.0,
-    );
-    let profile = Rect::new(
-        FOOTER_INSET,
-        footer_top + FOOTER_INSET,
-        (settings.x - 8.0 - FOOTER_INSET).max(AVATAR + 16.0),
-        FOOTER_HEIGHT - 2.0 * FOOTER_INSET,
-    );
-    let strip = Rect::new(
-        STRIP_SIDE,
-        footer_top - STRIP_ABOVE_FOOTER - STRIP_HEIGHT,
-        width - 2.0 * STRIP_SIDE,
-        STRIP_HEIGHT,
-    );
+    let f = footer_parts(footer, theme.footer);
 
     Layout {
+        kind: LayoutKind::Grid,
         content,
         music,
         card,
         card_parts,
+        card_compact: false,
         size: Vector2 {
             X: width,
             Y: footer.bottom(),
         },
         title,
         section,
+        header: Rect::default(),
+        rail: Rect::default(),
+        apps: Rect::default(),
         search,
         columns,
         rows,
@@ -467,13 +596,229 @@ pub fn layout(
         result_rows,
         no_results: row(0),
         footer,
+        avatar: f.avatar,
+        name: f.name,
+        profile: f.profile,
+        settings: f.settings,
+        power: f.power,
+        quick: f.quick,
+        strip: strip_above(0.0, width, footer_top),
+    }
+}
+
+fn list_layout(
+    pins: usize,
+    max_columns: usize,
+    content: Content,
+    music: Music,
+    theme: &Theme,
+) -> Layout {
+    let (columns, rows) = grid_shape(pins, max_columns);
+    let width = LIST_MIN_WIDTH
+        .max(columns as f32 * STRIP_STEP + WIDTH_EXTRA)
+        .max(footer_min_width(theme.footer));
+    let search = Rect::new(
+        SEARCH_PAD,
+        SEARCH_PAD,
+        width - 2.0 * SEARCH_PAD,
+        SEARCH_HEIGHT,
+    );
+
+    // The rows: search results, or the most-used apps (always a list here).
+    let rows_top = search.bottom() + SEARCH_BELOW;
+    let row = |i: usize| {
+        Rect::new(
+            LIST_SIDE,
+            rows_top + i as f32 * LIST_ROW,
+            width - 2.0 * LIST_SIDE,
+            LIST_ROW,
+        )
+    };
+    let n = match content {
+        Content::Grid => 0,
+        Content::List(n) => n.min(MAX_RESULTS),
+    };
+    let rows_bottom = rows_top + n.max(1) as f32 * LIST_ROW;
+
+    // "PINNED" and the icon strip, under the rows.
+    let (section, strip_bottom, cells) = if pins == 0 {
+        (Rect::default(), rows_bottom, Vec::new())
+    } else {
+        let section = Rect::new(
+            SEARCH_PAD,
+            rows_bottom + LIST_SECTION_ABOVE,
+            width - 2.0 * SEARCH_PAD,
+            SECTION_HEIGHT,
+        );
+        let top = section.bottom() + SECTION_BELOW;
+        let block = CellBlock {
+            columns,
+            cell: STRIP_CELL,
+            step: STRIP_STEP,
+            left: 0.0,
+            width,
+            top,
+        };
+        let cells = cells(pins, &block);
+        (
+            section,
+            top + cells_height(rows, STRIP_CELL, STRIP_STEP),
+            cells,
+        )
+    };
+
+    let footer = Rect::new(0.0, strip_bottom + GRID_BELOW, width, FOOTER_HEIGHT);
+    let mut f = footer_parts(footer, theme.footer);
+    // Music lives in the bottom bar, in place of the profile.
+    let card = Rect::new(
+        FOOTER_INSET,
+        footer.y + (FOOTER_HEIGHT - MUSIC_ROW) / 2.0,
+        (f.settings.x - 8.0 - FOOTER_INSET).max(0.0),
+        MUSIC_ROW,
+    );
+    if music != Music::Hidden {
+        f.avatar = Rect::default();
+        f.name = Rect::default();
+        f.profile = Rect::default();
+    }
+
+    Layout {
+        kind: LayoutKind::List,
+        content,
+        music,
+        card,
+        card_parts: row_parts(card.w),
+        card_compact: true,
+        size: Vector2 {
+            X: width,
+            Y: footer.bottom(),
+        },
+        title: Rect::default(),
+        section,
+        header: Rect::default(),
+        rail: Rect::default(),
+        apps: Rect::default(),
+        search,
+        columns,
+        rows,
+        cells,
+        result_rows: (0..n).map(row).collect(),
+        no_results: row(0),
+        footer,
+        avatar: f.avatar,
+        name: f.name,
+        profile: f.profile,
+        settings: f.settings,
+        power: f.power,
+        quick: f.quick,
+        strip: strip_above(0.0, width, footer.y),
+    }
+}
+
+fn sidebar_layout(pins: usize, max_columns: usize, content: Content, music: Music) -> Layout {
+    let music = if content == Content::Grid {
+        music
+    } else {
+        Music::Hidden
+    };
+    let (columns, rows) = grid_shape(pins, max_columns);
+    // The right side is as wide as the grid menu would be; the rail adds to it.
+    let side = MIN_WIDTH.max(columns as f32 * CELL_STEP + WIDTH_EXTRA);
+    let x0 = RAIL;
+    let width = x0 + side;
+
+    let header = Rect::new(
+        x0 + SEARCH_PAD,
+        SEARCH_PAD,
+        side - 2.0 * SEARCH_PAD,
+        HEADER_HEIGHT,
+    );
+    let search = Rect::new(
+        x0 + SEARCH_PAD,
+        header.bottom() + HEADER_BELOW,
+        side - 2.0 * SEARCH_PAD,
+        SEARCH_HEIGHT,
+    );
+    let grid_top = search.bottom() + SEARCH_BELOW;
+    let block = CellBlock {
+        columns,
+        cell: CELL,
+        step: CELL_STEP,
+        left: x0,
+        width: side,
+        top: grid_top,
+    };
+    let cells = cells(pins, &block);
+    let row = |i: usize| {
+        Rect::new(
+            x0 + LIST_SIDE,
+            grid_top + i as f32 * ROW_HEIGHT,
+            side - 2.0 * LIST_SIDE,
+            ROW_HEIGHT,
+        )
+    };
+    let (middle_height, result_rows) = match content {
+        Content::Grid => (cells_height(rows, CELL, CELL_STEP), Vec::new()),
+        Content::List(n) => {
+            let n = n.min(MAX_RESULTS);
+            (n.max(1) as f32 * ROW_HEIGHT, (0..n).map(row).collect())
+        }
+    };
+    let below_middle = grid_top + middle_height + GRID_BELOW;
+    let (card, card_parts) = card_at(
+        x0 + CARD_MARGIN,
+        below_middle,
+        side - 2.0 * CARD_MARGIN,
+        music,
+    );
+    let content_bottom = if music == Music::Hidden {
+        below_middle
+    } else {
+        card.bottom() + CARD_MARGIN
+    };
+    let height = (content_bottom + SIDEBAR_BOTTOM).max(SIDEBAR_MIN_HEIGHT);
+
+    // The rail, top to bottom: avatar, Apps, Settings ... Lock, Power.
+    let button = |y: f32| Rect::new((RAIL - POWER_BUTTON) / 2.0, y, POWER_BUTTON, POWER_BUTTON);
+    let avatar = Rect::new((RAIL - AVATAR) / 2.0, 18.0, AVATAR, AVATAR);
+    let profile = Rect::new(8.0, 12.0, RAIL - 16.0, 42.0);
+    let apps = button(64.0);
+    let settings = button(112.0);
+    let power = button(height - 12.0 - POWER_BUTTON);
+    let lock = button(power.y - 6.0 - POWER_BUTTON);
+
+    Layout {
+        kind: LayoutKind::Sidebar,
+        content,
+        music,
+        card,
+        card_parts,
+        card_compact: false,
+        size: Vector2 {
+            X: width,
+            Y: height,
+        },
+        title: Rect::default(),
+        section: Rect::default(),
+        header,
+        rail: Rect::new(0.0, 0.0, RAIL, height),
+        apps,
+        search,
+        columns,
+        rows,
+        cells,
+        result_rows,
+        no_results: row(0),
+        // No footer bar: an empty one at the bottom edge (results and the
+        // card are cut off at its top, which is the menu's bottom here).
+        footer: Rect::new(x0, height, side, 0.0),
         avatar,
-        name,
+        name: Rect::default(),
         profile,
         settings,
         power,
-        quick,
-        strip,
+        quick: vec![lock],
+        strip: strip_above(x0, width, height),
     }
 }
 
@@ -541,7 +886,7 @@ pub fn confirm_buttons(strip: Rect) -> [Rect; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{CATPPUCCIN, GLINT, GRUVBOX};
+    use crate::theme::{CATPPUCCIN, GLINT, GRUVBOX, NORD, TOKYO_NIGHT};
 
     #[test]
     fn six_pins_make_a_4_by_2_grid() {
@@ -784,5 +1129,84 @@ mod tests {
                 .quick
                 .is_empty()
         );
+    }
+
+    /// Everything stays inside the menu, and nothing overlaps the footer.
+    fn inside(l: &Layout) {
+        let in_menu = |r: &Rect| {
+            r.x >= 0.0
+                && r.y >= 0.0
+                && r.right() <= l.size.X + 0.01
+                && r.bottom() <= l.size.Y + 0.01
+        };
+        for r in l.cells.iter().chain(&l.result_rows).chain(&l.quick) {
+            assert!(in_menu(r), "{r:?} in {:?}", l.size);
+        }
+        for r in [
+            l.search, l.settings, l.power, l.strip, l.section, l.header, l.rail,
+        ] {
+            assert!(in_menu(&r), "{r:?} in {:?}", l.size);
+        }
+    }
+
+    #[test]
+    fn the_list_layout_has_rows_a_pinned_strip_and_a_bottom_bar() {
+        let l = layout(7, 7, Content::List(5), Music::Hidden, &NORD);
+        assert_eq!(l.kind, LayoutKind::List);
+        assert_eq!(l.result_rows.len(), 5);
+        assert_eq!(l.result_rows[0].h, LIST_ROW);
+        assert_eq!(l.result_rows[0].y, l.search.bottom() + 8.0);
+        // "PINNED", then the strip of small cells, then the bottom bar.
+        assert!(l.section.y > l.result_rows[4].bottom());
+        assert_eq!(l.cells[0].w, STRIP_CELL);
+        assert!(l.cells[0].y >= l.section.bottom());
+        assert!(l.footer.y > l.cells[0].bottom());
+        assert_eq!(l.size.Y, l.footer.bottom());
+        inside(&l);
+        // The music row sits in the bottom bar, instead of the profile.
+        let m = layout(7, 7, Content::List(5), Music::Card, &NORD);
+        assert_eq!(m.size, l.size);
+        assert!(m.card_compact && m.card.y > m.footer.y && m.card.bottom() < m.footer.bottom());
+        assert!(m.card.right() < m.settings.x);
+        assert_eq!(m.profile, Rect::default());
+        assert!(l.profile.w > 0.0);
+        // Typing changes only the rows; the strip moves down with them.
+        let eight = layout(7, 7, Content::List(8), Music::Hidden, &NORD);
+        assert_eq!(eight.size.X, l.size.X);
+        assert_eq!(eight.size.Y - l.size.Y, 3.0 * LIST_ROW);
+        assert_eq!(max_size(7, 7, &NORD), eight.size);
+        // No pins: no label, no strip.
+        let none = layout(0, 7, Content::List(0), Music::Hidden, &NORD);
+        assert_eq!(none.section, Rect::default());
+        inside(&none);
+    }
+
+    #[test]
+    fn the_sidebar_layout_has_a_rail_and_a_header() {
+        let l = layout(6, 6, Content::Grid, Music::Hidden, &TOKYO_NIGHT);
+        assert_eq!(l.kind, LayoutKind::Sidebar);
+        assert_eq!(l.rail, Rect::new(0.0, 0.0, RAIL, l.size.Y));
+        assert_eq!(l.size.X, RAIL + 528.0);
+        assert!(l.header.x >= RAIL && l.search.y > l.header.bottom());
+        assert!(l.cells.iter().all(|c| c.x >= RAIL));
+        // The rail: avatar, Apps, Settings at the top; Lock, Power at the bottom.
+        for r in [l.avatar, l.apps, l.settings, l.quick[0], l.power] {
+            assert!(r.right() <= RAIL, "{r:?}");
+        }
+        assert!(l.avatar.bottom() < l.apps.y && l.apps.bottom() < l.settings.y);
+        assert!(l.settings.bottom() < l.quick[0].y && l.quick[0].bottom() < l.power.y);
+        assert_eq!(l.name, Rect::default());
+        inside(&l);
+        // Few pins still leave room for the rail's buttons.
+        let small = layout(0, 6, Content::Grid, Music::Hidden, &TOKYO_NIGHT);
+        assert!(small.settings.bottom() < small.quick[0].y);
+        inside(&small);
+        // Results replace the grid and hide the card, like the grid layout.
+        let list = layout(6, 6, Content::List(3), Music::Card, &TOKYO_NIGHT);
+        assert_eq!(list.music, Music::Hidden);
+        assert_eq!(list.result_rows[0].y, l.cells[0].y);
+        let card = layout(6, 6, Content::Grid, Music::CardWithSources, &TOKYO_NIGHT);
+        assert!(card.card.x >= RAIL && card.card.bottom() < card.size.Y);
+        inside(&card);
     }
 }

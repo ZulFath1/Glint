@@ -15,7 +15,7 @@ use windows::core::{Interface, Result};
 use windows_numerics::{Vector2, Vector3};
 
 use super::gfx::{self, Canvas, Gfx, text_primary};
-use super::layout::{CELL, Rect};
+use super::layout::{CELL, Rect, STRIP_CELL, STRIP_ICON};
 use crate::apps::App;
 use crate::icons::IconCache;
 use crate::theme::IconTile;
@@ -50,6 +50,8 @@ pub struct Grid {
     show_names: StdCell<bool>,
     /// Icons in one color (`icon_tint` in config.toml).
     icon_tint: StdCell<bool>,
+    /// Small icon-only cells (the list layout's pinned strip).
+    small: StdCell<bool>,
 }
 
 impl Grid {
@@ -71,6 +73,7 @@ impl Grid {
             label_format: gfx.text_format(LABEL_SIZE, DWRITE_FONT_WEIGHT_NORMAL)?,
             show_names: StdCell::new(show_names),
             icon_tint: StdCell::new(false),
+            small: StdCell::new(false),
         };
         let cells = apps
             .into_iter()
@@ -198,6 +201,21 @@ impl Grid {
         Ok(())
     }
 
+    /// Small icon-only cells (the list layout) or the normal ones. Repaint
+    /// afterwards (`redraw`).
+    pub fn set_small(&self, on: bool) -> bool {
+        self.small.replace(on) != on
+    }
+
+    /// The cell size, the icon size and whether there is room for a name.
+    fn metrics(&self) -> (f32, f32, bool) {
+        if self.small.get() {
+            (STRIP_CELL, STRIP_ICON, false)
+        } else {
+            (CELL, ICON, self.show_names.get())
+        }
+    }
+
     /// One-color icons on or off. Repaint afterwards (`redraw`).
     pub fn set_icon_tint(&self, on: bool) -> bool {
         self.icon_tint.replace(on) != on
@@ -216,16 +234,30 @@ impl Grid {
 
     /// Paints the cells `which` at the current DPI scale.
     pub fn redraw_cells(&self, gfx: &Gfx, icons: &IconCache, which: &[usize]) -> Result<()> {
-        let size = Vector2 { X: CELL, Y: CELL };
-        let icon_px = gfx.px(ICON);
-        let names = self.show_names.get();
+        let (cell_size, icon_size, names) = self.metrics();
+        let size = Vector2 {
+            X: cell_size,
+            Y: cell_size,
+        };
+        let icon_px = gfx.px(icon_size);
         // Without a name, the icon sits in the middle of the cell.
-        let icon_top = if names { ICON_TOP } else { (CELL - ICON) / 2.0 };
+        let icon_top = if names {
+            ICON_TOP
+        } else {
+            (cell_size - icon_size) / 2.0
+        };
         let theme = gfx::theme();
         let tint = self.icon_tint.get().then(text_primary);
         let cells = self.cells.borrow();
         for (i, cell) in which.iter().filter_map(|&i| cells.get(i).map(|c| (i, c))) {
+            cell.outer.SetSize(size)?;
             cell.canvas.resize(gfx, size)?;
+            // Grow from the cell's center.
+            cell.canvas.visual.SetCenterPoint(Vector3 {
+                X: size.X / 2.0,
+                Y: size.Y / 2.0,
+                Z: 0.0,
+            })?;
             let icon = icons
                 .get(gfx, &cell.app.aumid, &cell.app.item, icon_px)
                 .inspect_err(|e| log_warn!("no icon for {}: {e}", cell.app.aumid))
@@ -239,14 +271,14 @@ impl Grid {
                 &name,
                 &self.label_format,
                 Vector2 {
-                    X: CELL - 2.0 * LABEL_SIDE,
+                    X: cell_size - 2.0 * LABEL_SIDE,
                     Y: LABEL_HEIGHT,
                 },
                 DWRITE_TEXT_ALIGNMENT_CENTER,
                 true,
             )?;
-            let left = (CELL - ICON) / 2.0;
-            let dest = Rect::new(left, icon_top, ICON, ICON);
+            let left = (cell_size - icon_size) / 2.0;
+            let dest = Rect::new(left, icon_top, icon_size, icon_size);
             cell.canvas.draw(gfx, |ctx| {
                 paint_tile(ctx, dest, i)?;
                 let brush = gfx::brush(ctx, text_primary(), 1.0)?;

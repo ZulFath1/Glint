@@ -38,7 +38,7 @@ use windows_numerics::{Vector2, Vector3};
 
 use super::anim::{Kind, ms};
 use super::gfx::{self, Canvas, Gfx, text_primary, text_secondary};
-use super::layout::{self, COVER, CardParts, Layout, Music, Rect, THUMB, TRACK_HEIGHT};
+use super::layout::{self, CardParts, Layout, Music, Rect, THUMB, TRACK_HEIGHT};
 use super::shape::RoundRect;
 use crate::config::Rgb;
 use crate::media::{Info, MediaCommand, MusicView, format_time};
@@ -111,6 +111,10 @@ fn draw_text(
     align: DWRITE_TEXT_ALIGNMENT,
     (color, alpha): (Rgb, f32),
 ) -> Result<()> {
+    // Parts the music row doesn't have are empty: nothing to draw.
+    if r.w <= 0.0 || r.h <= 0.0 || text.is_empty() {
+        return Ok(());
+    }
     let layout = gfx.text_layout(text, format, r.size(), align, true)?;
     let brush = gfx::brush(ctx, color, alpha)?;
     // SAFETY: draws a live text layout with a live brush.
@@ -141,6 +145,12 @@ pub struct MusicCard {
     elapsed: Canvas,
     total: Canvas,
     seek: ScalarKeyFrameAnimation,
+    /// Cuts the card off at the footer's top (not for the music row,
+    /// which lives inside the footer).
+    clip: windows::UI::Composition::InsetClip,
+    cut: windows::UI::Composition::ExpressionAnimation,
+    /// The one-line music row of the list layout.
+    compact: Cell<bool>,
     /// Where the card is (menu coordinates) and how wide its parts are.
     rect: Cell<Rect>,
     view: RefCell<Option<MusicView>>,
@@ -183,6 +193,7 @@ impl MusicCard {
         cut.SetReferenceParameter(h!("footer"), footer)?;
         clip.StartAnimation(h!("BottomInset"), &cut)?;
         outer.SetClip(&clip)?;
+        let (clip_keep, cut_keep) = (clip.clone(), cut.clone());
         parent.Children()?.InsertAtTop(&outer)?;
 
         let inner = c.CreateContainerVisual()?;
@@ -192,7 +203,10 @@ impl MusicCard {
         let hover = RoundRect::new(c, 10.0, 0.0)?;
         hover.show(false)?;
 
-        let cover_size = Vector2 { X: COVER, Y: COVER };
+        let cover_size = Vector2 {
+            X: layout::COVER,
+            Y: layout::COVER,
+        };
         let cover = Canvas::new(c, gfx, cover_size)?;
         let rounded = c.CreateRoundedRectangleGeometry()?;
         rounded.SetSize(cover_size)?;
@@ -281,6 +295,9 @@ impl MusicCard {
             elapsed,
             total,
             seek,
+            clip: clip_keep,
+            cut: cut_keep,
+            compact: Cell::new(false),
             rect: Cell::new(l.card),
             view: RefCell::new(None),
             source_name: RefCell::new(String::new()),
@@ -340,7 +357,16 @@ impl MusicCard {
     /// The parts, relative to the card (the source row is always laid out;
     /// it only shows with 2+ sources).
     fn parts(&self) -> CardParts {
-        layout::card_parts(self.rect.get().w, true)
+        if self.compact.get() {
+            layout::row_parts(self.rect.get().w)
+        } else {
+            layout::card_parts(self.rect.get().w, true)
+        }
+    }
+
+    /// Does the card show a seek bar (and the times)? Not the music row.
+    pub fn has_seek_bar(&self) -> bool {
+        !self.compact.get()
     }
 
     /// The container that fades in and out (the card shows or hides).
@@ -362,12 +388,19 @@ impl MusicCard {
 
     /// New DPI scale (or first use): resize and repaint everything.
     pub fn refresh(&self, gfx: &Gfx, l: &Layout) -> Result<()> {
-        let p = l.card_parts;
-        self.cover.resize(gfx, Vector2 { X: COVER, Y: COVER })?;
+        self.set_compact(l.card_compact)?;
+        // The full card's parts, also for the music row (whose time
+        // labels are hidden), so no canvas is ever 0 × 0.
+        let p = layout::card_parts(l.card.w.max(1.0), true);
+        let cover = self.cover_size();
+        self.cover.resize(gfx, cover)?;
+        self.cover_shape.SetSize(cover)?;
         self.content.resize(gfx, Self::content_size(l))?;
         self.elapsed.resize(gfx, p.elapsed.size())?;
         self.total.resize(gfx, p.total.size())?;
-        self.move_to(gfx, l)?;
+        // Placed even while hidden: its parts must match this layout's
+        // width when it next shows.
+        self.place(gfx, l.card)?;
         self.painted.borrow_mut().take();
         self.painted_cover.borrow_mut().take();
         *self.times.borrow_mut() = Default::default();
@@ -380,7 +413,42 @@ impl MusicCard {
         if l.music == Music::Hidden {
             return Ok(());
         }
+        // A different width (or the music row <-> card): resize and repaint.
+        let r = self.rect.get();
+        if (l.card.w - r.w).abs() > 0.5 || l.card_compact != self.compact.get() {
+            return self.refresh(gfx, l);
+        }
         self.place(gfx, l.card)
+    }
+
+    fn cover_size(&self) -> Vector2 {
+        let c = if self.compact.get() {
+            layout::row_parts(100.0).cover
+        } else {
+            layout::card_parts(100.0, false).cover
+        };
+        c.size()
+    }
+
+    /// The full card, or the one-line music row (list layout): the row has
+    /// no seek bar or times, and is not cut off at the footer (it lives in
+    /// it).
+    fn set_compact(&self, on: bool) -> Result<()> {
+        self.compact.set(on);
+        if on {
+            self.clip.StopAnimation(h!("BottomInset"))?;
+            self.clip.SetBottomInset(0.0)?;
+        } else {
+            self.clip.StartAnimation(h!("BottomInset"), &self.cut)?;
+        }
+        for v in [
+            self.bar.cast::<Visual>()?,
+            self.elapsed.visual.cast()?,
+            self.total.visual.cast()?,
+        ] {
+            v.SetIsVisible(!on)?;
+        }
+        Ok(())
     }
 
     fn place(&self, gfx: &Gfx, card: Rect) -> Result<()> {
@@ -509,7 +577,7 @@ impl MusicCard {
             artist: view.info.artist.clone(),
             playing: view.playing,
             enabled: [view.can_previous, view.can_play_pause, view.can_next],
-            sources: view.sources >= 2,
+            sources: view.sources >= 2 && !self.compact.get(),
             source_name,
             has_icon: self.source_icon.borrow().is_some(),
         };
@@ -566,8 +634,16 @@ impl MusicCard {
             gfx::with_glow(ctx, |ctx| {
                 let lead = DWRITE_TEXT_ALIGNMENT_LEADING;
                 let center = DWRITE_TEXT_ALIGNMENT_CENTER;
-                // Terminal: "Title — Artist" above "now playing".
-                let (line1, line2, color2) = if theme.terminal {
+                // Terminal: "Title — Artist" above "now playing". The music
+                // row: "Title · Artist" on one line.
+                let (line1, line2, color2) = if self.compact.get() {
+                    let both = if painted.artist.is_empty() {
+                        painted.title.clone()
+                    } else {
+                        format!("{} \u{00B7} {}", painted.title, painted.artist)
+                    };
+                    (both, String::new(), text_secondary())
+                } else if theme.terminal {
                     let both = if painted.artist.is_empty() {
                         painted.title.clone()
                     } else {
@@ -694,7 +770,8 @@ impl MusicCard {
                 .ok(),
             None => None,
         };
-        let full = Rect::new(0.0, 0.0, COVER, COVER);
+        let size = self.cover.size();
+        let full = Rect::new(0.0, 0.0, size.X, size.Y);
         self.cover.draw(gfx, |ctx| {
             if let Some(bitmap) = &bitmap {
                 // SAFETY: draws a live bitmap into a local rect.
@@ -910,7 +987,7 @@ impl MusicCard {
         CardPart::BUTTONS
             .into_iter()
             .chain([CardPart::Source])
-            .filter(|&p| self.is_enabled(p))
+            .filter(|&p| self.is_enabled(p) && self.part_rect(p).w > 0.0)
             .collect()
     }
 

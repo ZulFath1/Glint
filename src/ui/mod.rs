@@ -58,6 +58,7 @@ use crate::icons::IconCache;
 use crate::media::{self, MediaCommand, MusicView};
 use crate::power::PowerAction;
 use crate::search::{self, Query};
+use crate::theme::LayoutKind;
 use crate::window::{Edge, Placement};
 use anim::{Animator, Kind, LayoutMotion};
 use background::{Applied, SystemEffects};
@@ -118,6 +119,8 @@ pub enum Focus {
     Profile,
     /// The footer gear (Settings).
     Settings,
+    /// The sidebar rail's Apps button.
+    Apps,
     Power,
     /// A separate footer button: Lock, Restart, Shut down (some themes).
     Quick(usize),
@@ -137,6 +140,7 @@ enum Target {
     Media(CardPart),
     Profile,
     Settings,
+    Apps,
     Power,
     Quick(usize),
     Strip(usize),
@@ -301,6 +305,8 @@ pub struct Ui {
     icon_tint: Cell<bool>,
     /// The accent color in use (for the music bar after a theme switch).
     accent: Cell<Rgb>,
+    /// (grid, rows) as last shown: what `sync_shown` fades in or out.
+    shown: Cell<(bool, bool)>,
 }
 
 /// True if a key press or mouse click is waiting in our message queue.
@@ -367,7 +373,7 @@ impl Ui {
         let search = SearchBox::new(&compositor, &gfx, &front, layout.search, accent)?;
         let grid = Grid::new(&compositor, &gfx, &front, apps, config.show_names)?;
         grid.set_icon_tint(config.icon_tint);
-        let chrome = Chrome::new(&compositor, &gfx, &front)?;
+        let chrome = Chrome::new(&compositor, &gfx, &front, footer.user_name())?;
         let results = Results::new(&compositor, &gfx, &front, &layout, &footer.fill_visual()?)?;
         results.set_theme(config.icon_tint)?;
         let music = MusicCard::new(
@@ -395,6 +401,7 @@ impl Ui {
             motion.add(object, kind);
         }
         motion.add(strip.motion_object()?, Kind::Visual);
+        motion.add(chrome.section_visual()?.cast()?, Kind::Visual);
         // The grid's cells glide when pins are added or removed.
         motion.set_group(grid.motion_objects()?)?;
 
@@ -452,8 +459,12 @@ impl Ui {
             chrome,
             icon_tint: Cell::new(config.icon_tint),
             accent: Cell::new(accent),
+            shown: Cell::new((true, false)),
         };
         ui.refresh()?;
+        // The list layout starts with its most-used apps.
+        ui.update_search(true)?;
+        ui.sync_shown(false)?;
         Ok(ui)
     }
 
@@ -479,6 +490,7 @@ impl Ui {
         let l = self.layout.borrow().clone();
         self.motion.instant(|| {
             self.search.set_rect(&self.gfx, l.search)?;
+            self.grid.set_small(l.kind == LayoutKind::List);
             self.grid.set_rects(&self.gfx, &l.cells)?;
             self.grid.redraw(&self.gfx, &self.icons)?;
             self.footer.refresh(&self.gfx, &l)?;
@@ -506,6 +518,12 @@ impl Ui {
         // Going back to the grid, the rows stay as they are while they fade.
         if let Content::List(n) = l.content {
             self.results.set_rows(&self.gfx, &l, n == 0)?;
+        }
+        // The list layout's "PINNED" label and icon strip sit under the
+        // rows, so they move when the number of rows changes.
+        if l.kind == LayoutKind::List {
+            self.grid.set_rects(&self.gfx, &l.cells)?;
+            self.chrome.move_section(&self.gfx, &l)?;
         }
         self.place_menu()
     }
@@ -665,6 +683,8 @@ impl Ui {
         // Repaint everything in the new colors and font.
         self.refresh()?;
         self.update_search(true)?;
+        // A different layout shows different parts: at once.
+        self.sync_shown(false)?;
         self.sync_clock();
 
         if self.is_open.get() && !self.reduced_motion.get() {
@@ -714,6 +734,7 @@ impl Ui {
     /// New accent color: caret, focused search border, seek bar, focus ring.
     pub fn set_accent(&self, accent: Rgb) -> Result<()> {
         self.accent.set(accent);
+        self.results.set_accent(accent)?;
         self.search.set_accent(&self.gfx, accent)?;
         self.music.set_accent(accent)?;
         self.ring.set_stroke(gfx::color(accent, 1.0))
@@ -983,8 +1004,51 @@ impl Ui {
         self.catalog.borrow_mut().record_launch(id);
     }
 
+    /// Are rows (search results, or the list layout's most-used apps)
+    /// showing?
     fn is_list(&self) -> bool {
         matches!(self.layout.borrow().content, Content::List(_))
+    }
+
+    fn kind(&self) -> LayoutKind {
+        self.layout.borrow().kind
+    }
+
+    /// Is the pinned grid showing? (Always in the list layout: there it is
+    /// the icon strip under the rows.)
+    fn grid_shown(&self) -> bool {
+        self.kind() == LayoutKind::List || !self.is_list()
+    }
+
+    /// The list layout with nothing typed: the most-launched apps, then
+    /// the pinned ones, as indexes into `catalog.apps`.
+    fn most_used(&self) -> Vec<usize> {
+        let catalog = self.catalog.borrow();
+        let mut used: Vec<(usize, u32)> = catalog
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.launches > 0)
+            .map(|(i, item)| (i, item.launches))
+            .collect();
+        // Most launches first; ties alphabetically (stable).
+        used.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| catalog.apps[a.0].name.cmp(&catalog.apps[b.0].name))
+        });
+        let mut list: Vec<usize> = used.into_iter().map(|(i, _)| i).collect();
+        for pin in &catalog.pinned {
+            if let Some(i) = catalog
+                .apps
+                .iter()
+                .position(|a| a.id.eq_ignore_ascii_case(pin))
+                && !list.contains(&i)
+            {
+                list.push(i);
+            }
+        }
+        list.truncate(layout::MOST_USED);
+        list
     }
 
     /// Runs the search for the text in the box, unless it is the same as
@@ -997,9 +1061,22 @@ impl Ui {
         let q = Query::new(&text);
         *self.query.borrow_mut() = text;
         if q.is_empty() {
+            self.search.set_count(&self.gfx, None)?;
+            if self.kind() == LayoutKind::List {
+                // Nothing typed: the list shows the most-used apps.
+                let hits = self.most_used();
+                let n = hits.len();
+                *self.hits.borrow_mut() = hits;
+                self.selected.set(0);
+                self.results
+                    .set_message(&self.gfx, results::TYPE_TO_SEARCH)?;
+                self.set_content(Content::List(n))?;
+                return self.paint_results();
+            }
             self.hits.borrow_mut().clear();
             return self.set_content(Content::Grid);
         }
+        self.results.set_message(&self.gfx, results::NO_RESULTS)?;
         let started = Instant::now();
         let hits = search::rank(&self.catalog.borrow().items, &q, MAX_RESULTS);
         let took = started.elapsed();
@@ -1011,8 +1088,29 @@ impl Ui {
         let n = hits.len();
         *self.hits.borrow_mut() = hits;
         self.selected.set(0);
+        self.search.set_count(&self.gfx, Some(n))?;
         self.set_content(Content::List(n))?;
         self.paint_results()
+    }
+
+    /// Fades the grid, the rows and the section label in or out to match
+    /// the layout (the rows replace the grid, except in the list layout,
+    /// where both show). `animate` = fade, else at once.
+    fn sync_shown(&self, animate: bool) -> Result<()> {
+        let (grid, rows) = (self.grid_shown(), self.is_list());
+        let (old_grid, old_rows) = self.shown.replace((grid, rows));
+        if old_grid != grid {
+            self.motion.fade(&self.grid.visual()?, grid, animate)?;
+            self.motion
+                .fade(&self.chrome.section_visual()?, grid, animate)?;
+            if !grid && matches!(self.focus.get(), Focus::Cell(_)) {
+                self.focus.set(Focus::Search);
+            }
+        }
+        if old_rows != rows {
+            self.motion.fade(&self.results.visual()?, rows, animate)?;
+        }
+        Ok(())
     }
 
     /// Switches the middle of the menu to `content`. While open, the menu
@@ -1047,16 +1145,7 @@ impl Ui {
         } else {
             self.motion.instant(|| self.place_content())?;
         }
-        let list = matches!(content, Content::List(_));
-        if matches!(old_content, Content::List(_)) != list {
-            self.motion.fade(&self.grid.visual()?, !list, animate)?;
-            self.motion
-                .fade(&self.chrome.section_visual()?, !list, animate)?;
-            self.motion.fade(&self.results.visual()?, list, animate)?;
-            if list && matches!(self.focus.get(), Focus::Cell(_)) {
-                self.focus.set(Focus::Search);
-            }
-        }
+        self.sync_shown(animate)?;
         if (old_music != Music::Hidden) != card_visible {
             self.motion
                 .fade(&self.music.visual()?, card_visible, animate)?;
@@ -1075,8 +1164,11 @@ impl Ui {
     /// missing ones are loaded a moment later (`load_icons`).
     fn paint_results(&self) -> Result<()> {
         let hits = self.hits.borrow();
-        let px = self.gfx.px(results::ICON);
+        let px = self.gfx.px(results::icon_size());
         let mut missing = false;
+        // First: the list layout paints the selected row differently.
+        let selected = (!hits.is_empty()).then(|| self.selected.get());
+        self.results.set_selected(selected)?;
         {
             let catalog = self.catalog.borrow();
             let failed = self.failed_icons.borrow();
@@ -1094,8 +1186,6 @@ impl Ui {
                 }
             }
         }
-        let selected = (!hits.is_empty()).then(|| self.selected.get());
-        self.results.set_selected(selected)?;
         if missing {
             // SAFETY: a timer on our own window. WM_TIMER only comes when no
             // other messages (typing!) are waiting.
@@ -1123,7 +1213,7 @@ impl Ui {
             return Ok(false);
         }
         let deadline = Instant::now() + ICON_BUDGET;
-        let px = self.gfx.px(results::ICON);
+        let px = self.gfx.px(results::icon_size());
         loop {
             if input_waiting() {
                 return Ok(true);
@@ -1184,7 +1274,9 @@ impl Ui {
         }
         self.selected
             .set(search::step(self.selected.get(), n, delta));
-        self.results.set_selected(Some(self.selected.get()))
+        // Repaints the rows that change look (list layout); else only the
+        // highlight moves.
+        self.paint_results()
     }
 
     // -----------------------------------------------------------------------
@@ -1228,7 +1320,8 @@ impl Ui {
     /// The seek bar moves (and the elapsed time ticks) only while the menu
     /// is open and the card shows; otherwise both stop.
     fn sync_seek(&self) -> Result<()> {
-        let moving = self.is_open.get() && self.music_shown();
+        // The list layout's music row has no seek bar: nothing to move.
+        let moving = self.is_open.get() && self.music_shown() && self.music.has_seek_bar();
         self.music.sync_seek(moving)?;
         // SAFETY: a timer on our own window, or stopping it.
         unsafe {
@@ -1295,9 +1388,17 @@ impl Ui {
     /// the profile.
     fn below_grid(&self) -> Focus {
         match self.music.focus_order().first() {
-            Some(&part) if self.music_shown() => Focus::Media(part),
-            _ => Focus::Profile,
+            Some(&part) if self.music_shown() && self.music.has_seek_bar() => Focus::Media(part),
+            _ => self.footer_first(),
         }
+    }
+
+    /// The first footer stop after the music card (or its row).
+    fn after_music(&self) -> Focus {
+        self.footer_order()
+            .into_iter()
+            .find(|f| !matches!(f, Focus::Media(_)))
+            .unwrap_or(Focus::Settings)
     }
 
     fn media_key(&self, part: CardPart, vk: VIRTUAL_KEY, shift: bool) -> Result<Action> {
@@ -1309,11 +1410,12 @@ impl Ui {
             .map(|&p| Focus::Media(p));
         let after = i.and_then(|i| order.get(i + 1)).map(|&p| Focus::Media(p));
         let n = self.grid.len();
-        let above = if n > 0 {
+        let above = if n > 0 && self.grid_shown() {
             Focus::Cell(n - 1)
         } else {
             Focus::Search
         };
+        let below = self.after_music();
         let next = match vk {
             VK_RETURN => return Ok(self.press_card(part)),
             VK_SPACE => {
@@ -1321,11 +1423,15 @@ impl Ui {
                 return Ok(self.press_card(part));
             }
             VK_LEFT => before.unwrap_or(Focus::Media(part)),
-            VK_RIGHT => after.unwrap_or(Focus::Media(part)),
+            VK_RIGHT => after.unwrap_or(if self.music.has_seek_bar() {
+                Focus::Media(part)
+            } else {
+                below
+            }),
             VK_UP => above,
-            VK_DOWN => Focus::Profile,
+            VK_DOWN => below,
             VK_TAB if shift => before.unwrap_or(above),
-            VK_TAB => after.unwrap_or(Focus::Profile),
+            VK_TAB => after.unwrap_or(below),
             _ => return Ok(Action::None),
         };
         self.set_focus(next)?;
@@ -1348,6 +1454,7 @@ impl Ui {
             Focus::Media(part) => Some((self.music.part_rect(part), self.music.part_radius(part))),
             Focus::Profile => Some((self.footer.profile_rect(), button_radius())),
             Focus::Settings => Some((self.footer.settings_rect(), button_radius())),
+            Focus::Apps => Some((self.footer.apps_rect(), button_radius())),
             Focus::Power => Some((self.footer.power_rect(), button_radius())),
             Focus::Quick(i) => self
                 .footer
@@ -1398,6 +1505,7 @@ impl Ui {
             Target::Row(i) => self.results.rect(i).map(|r| (r, results::row_radius())),
             Target::Profile => Some((self.footer.profile_rect(), button_radius())),
             Target::Settings => Some((self.footer.settings_rect(), button_radius())),
+            Target::Apps => Some((self.footer.apps_rect(), button_radius())),
             Target::Power => Some((self.footer.power_rect(), button_radius())),
             Target::Quick(i) => self
                 .footer
@@ -1437,17 +1545,21 @@ impl Ui {
             Target::Search
         } else if let Some(i) = self.results.hit(p).filter(|_| self.is_list()) {
             Target::Row(i)
-        } else if let Some(i) = self.grid.hit(p).filter(|_| !self.is_list()) {
+        } else if let Some(i) = self.grid.hit(p).filter(|_| self.grid_shown()) {
             Target::Cell(i)
         } else if let Some(part) = self.music.hit(p).filter(|_| self.music_shown()) {
             Target::Media(part)
+        } else if self.footer.apps_rect().contains(p) {
+            Target::Apps
         } else if self.footer.profile_rect().contains(p) {
             Target::Profile
         } else if self.footer.settings_rect().contains(p) {
             Target::Settings
         } else if let Some(i) = self.footer.quick_rects().iter().position(|r| r.contains(p)) {
             Target::Quick(i)
-        } else if self.footer.quick_rects().is_empty() && self.footer.power_rect().contains(p) {
+        } else if !self.layout.borrow().separate_power_buttons()
+            && self.footer.power_rect().contains(p)
+        {
             Target::Power
         } else {
             Target::Nothing
@@ -1600,7 +1712,7 @@ impl Ui {
                 }
                 // Cancel with separate footer buttons: close the strip,
                 // back to the button that opened it.
-                if !self.footer.quick_rects().is_empty() {
+                if self.layout.borrow().separate_power_buttons() {
                     let home = self.strip_home();
                     self.close_strip(home)?;
                     return Ok(Action::None);
@@ -1673,7 +1785,7 @@ impl Ui {
             Focus::Search => self.search_key(vk, ctrl, shift),
             Focus::Cell(i) => self.grid_key(i, vk, shift),
             Focus::Media(part) => self.media_key(part, vk, shift),
-            Focus::Profile | Focus::Settings | Focus::Power | Focus::Quick(_) => {
+            Focus::Profile | Focus::Settings | Focus::Apps | Focus::Power | Focus::Quick(_) => {
                 self.footer_key(focus, vk, shift)
             }
             Focus::Strip(i) => self.strip_key(i, vk, shift),
@@ -1711,10 +1823,13 @@ impl Ui {
                 VK_RETURN => return Ok(self.launch_result(self.selected.get())),
                 VK_TAB => {
                     self.keyboard_nav.set(true);
+                    // The list layout's pinned strip comes next.
                     let next = if shift {
                         self.footer_last()
+                    } else if self.grid_shown() && self.grid.len() > 0 {
+                        Focus::Cell(0)
                     } else {
-                        Focus::Profile
+                        self.footer_first()
                     };
                     return self.set_focus(next).map(|()| Action::None);
                 }
@@ -1825,15 +1940,16 @@ impl Ui {
         let n = self.grid.len();
         // Above the footer: the music card's last button, the last pin, or
         // the search box (no pins, or search results showing).
+        // (The list layout's music row is part of the footer itself.)
         let card_last = self
             .music
             .focus_order()
             .last()
             .copied()
-            .filter(|_| self.music_shown());
+            .filter(|_| self.music_shown() && self.music.has_seek_bar());
         let above = if let Some(part) = card_last {
             Focus::Media(part)
-        } else if n > 0 && !self.is_list() {
+        } else if n > 0 && self.grid_shown() {
             Focus::Cell(n - 1)
         } else {
             Focus::Search
@@ -1841,6 +1957,7 @@ impl Ui {
         let next = match (focus, vk) {
             (Focus::Profile, VK_RETURN) => return Ok(Action::OpenAccountSettings),
             (Focus::Settings, VK_RETURN) => return Ok(Action::OpenSettings),
+            (Focus::Apps, VK_RETURN) => return self.go_to_apps(),
             (Focus::Power, VK_RETURN) => {
                 self.keyboard_nav.set(true);
                 self.open_strip()?;
@@ -1850,15 +1967,21 @@ impl Ui {
                 self.keyboard_nav.set(true);
                 return self.press_quick(i);
             }
-            (_, VK_UP) => above,
+            // The sidebar's rail runs top to bottom: Up/Down move along
+            // it, Right goes to the search box.
+            (_, VK_RIGHT) if self.kind() == LayoutKind::Sidebar => Focus::Search,
+            (_, VK_UP) if self.kind() != LayoutKind::Sidebar => above,
             // Left to right: profile, gear, then power (or the separate
             // buttons); Tab past the last one wraps to the search box.
             _ => {
                 let order = self.footer_order();
                 let i = order.iter().position(|&f| f == focus).unwrap_or(0);
+                let rail = self.kind() == LayoutKind::Sidebar;
                 match vk {
-                    VK_LEFT => order[i.saturating_sub(1)],
+                    VK_LEFT if !rail => order[i.saturating_sub(1)],
                     VK_RIGHT => order[(i + 1).min(order.len() - 1)],
+                    VK_UP => order[i.saturating_sub(1)],
+                    VK_DOWN if rail => order[(i + 1).min(order.len() - 1)],
                     VK_TAB if shift => i.checked_sub(1).map_or(above, |j| order[j]),
                     VK_TAB => order.get(i + 1).copied().unwrap_or(Focus::Search),
                     _ => return Ok(Action::None),
@@ -1869,14 +1992,47 @@ impl Ui {
         Ok(Action::None)
     }
 
-    /// The footer's focus stops, left to right.
+    /// The footer's focus stops, left to right (the sidebar's rail: top
+    /// to bottom). Parts the layout doesn't show are left out.
     fn footer_order(&self) -> Vec<Focus> {
-        let mut order = vec![Focus::Profile, Focus::Settings];
-        match self.footer.quick_rects().len() {
-            0 => order.push(Focus::Power),
-            n => order.extend((0..n).map(Focus::Quick)),
+        let mut order = Vec::new();
+        if self.music_shown() && !self.music.has_seek_bar() {
+            // The list layout's music row, in the bottom bar.
+            order.extend(self.music.focus_order().into_iter().map(Focus::Media));
+        }
+        if self.footer.profile_rect().w > 0.0 {
+            order.push(Focus::Profile);
+        }
+        if self.footer.apps_rect().w > 0.0 {
+            order.push(Focus::Apps);
+        }
+        order.push(Focus::Settings);
+        let quick = self.footer.quick_rects().len();
+        order.extend((0..quick).map(Focus::Quick));
+        if !self.layout.borrow().separate_power_buttons() {
+            order.push(Focus::Power);
         }
         order
+    }
+
+    /// The footer's first focus stop (below the grid / the music card).
+    fn footer_first(&self) -> Focus {
+        self.footer_order()
+            .first()
+            .copied()
+            .unwrap_or(Focus::Settings)
+    }
+
+    /// The rail's Apps button: back to the pinned apps, keyboard in the
+    /// (emptied) search box.
+    fn go_to_apps(&self) -> Result<Action> {
+        if !self.search.editor.borrow().is_empty() {
+            self.search.editor.borrow_mut().clear();
+            self.after_edit()?;
+        }
+        self.keyboard_nav.set(false);
+        self.set_focus(Focus::Search)?;
+        Ok(Action::None)
     }
 
     /// The footer's last focus stop (Shift+Tab from the search box).
@@ -1888,7 +2044,7 @@ impl Ui {
     /// that opened it.
     fn strip_home(&self) -> Focus {
         match self.strip.state() {
-            StripState::Confirm(action) if !self.footer.quick_rects().is_empty() => {
+            StripState::Confirm(action) if self.layout.borrow().separate_power_buttons() => {
                 footer::QUICK_ACTIONS
                     .iter()
                     .position(|&a| a == action)
@@ -2134,6 +2290,7 @@ impl Ui {
             Target::Media(part) => Ok(self.press_card(part)),
             Target::Profile => Ok(Action::OpenAccountSettings),
             Target::Settings => Ok(Action::OpenSettings),
+            Target::Apps => self.go_to_apps(),
             Target::Power if self.strip.is_open() => {
                 self.close_strip(Focus::Search)?;
                 Ok(Action::None)

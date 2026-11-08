@@ -14,7 +14,7 @@ use windows::UI::Composition::{Compositor, ContainerVisual, SpriteVisual, Visual
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, POINT, RECT};
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_HIT_TEST_METRICS, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TEXT_RANGE, IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_RANGE, IDWriteTextFormat, IDWriteTextLayout,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
@@ -448,6 +448,10 @@ pub struct SearchBox {
     frame: RoundRect,
     icon: Canvas,
     text: Canvas,
+    /// "5 results" on the right (list layout only).
+    count: Canvas,
+    count_text: RefCell<String>,
+    small_format: IDWriteTextFormat,
     caret: SpriteVisual,
     format: IDWriteTextFormat,
     icon_format: IDWriteTextFormat,
@@ -473,6 +477,14 @@ impl SearchBox {
         let frame = RoundRect::new(c, 10.0, 1.0)?;
         let icon = Canvas::new(c, gfx, Vector2 { X: 20.0, Y: rect.h })?;
         let text = Canvas::new(c, gfx, text_size(rect))?;
+        let count = Canvas::new(
+            c,
+            gfx,
+            Vector2 {
+                X: COUNT_W,
+                Y: rect.h,
+            },
+        )?;
         let caret_brush = c.CreateColorBrushWithColor(gfx::color(accent, 1.0))?;
         let caret = c.CreateSpriteVisual()?;
         caret.SetBrush(&caret_brush)?;
@@ -485,6 +497,7 @@ impl SearchBox {
         children.InsertAtTop(&frame.visual)?;
         children.InsertAtTop(&icon.visual)?;
         children.InsertAtTop(&text.visual)?;
+        children.InsertAtTop(&count.visual)?;
         children.InsertAtTop(&caret)?;
 
         let s = Self {
@@ -492,6 +505,9 @@ impl SearchBox {
             frame,
             icon,
             text,
+            count,
+            count_text: RefCell::new(String::new()),
+            small_format: gfx.text_format(12.0, DWRITE_FONT_WEIGHT_NORMAL)?,
             caret,
             format: gfx.text_format(TEXT_SIZE, DWRITE_FONT_WEIGHT_NORMAL)?,
             icon_format: gfx.icon_format(ICON_SIZE)?,
@@ -569,7 +585,49 @@ impl SearchBox {
         self.icon.set_offset(gfx, rect.x + 12.0, rect.y)?;
         self.text.resize(gfx, text_size(rect))?;
         self.text.set_offset(gfx, rect.x + text_left(), rect.y)?;
+        self.count.resize(
+            gfx,
+            Vector2 {
+                X: COUNT_W,
+                Y: rect.h,
+            },
+        )?;
+        self.count
+            .set_offset(gfx, rect.right() - COUNT_W - TEXT_RIGHT_PAD, rect.y)?;
+        self.count.visual.SetIsVisible(shows_count())?;
+        self.paint_count(gfx)?;
         self.redraw(gfx)
+    }
+
+    /// The number of results to show on the right (list layout; `None`
+    /// while nothing is typed). Repaints only when the text changes.
+    pub fn set_count(&self, gfx: &Gfx, count: Option<usize>) -> Result<()> {
+        let text = match count {
+            Some(1) => "1 result".to_string(),
+            Some(n) => format!("{n} results"),
+            None => String::new(),
+        };
+        if *self.count_text.borrow() != text {
+            *self.count_text.borrow_mut() = text;
+            self.paint_count(gfx)?;
+        }
+        Ok(())
+    }
+
+    fn paint_count(&self, gfx: &Gfx) -> Result<()> {
+        let size = self.count.size();
+        let text = self.count_text.borrow().clone();
+        self.count.draw(gfx, |ctx| {
+            super::footer::draw_text(
+                ctx,
+                gfx,
+                &text,
+                &self.small_format,
+                Rect::new(0.0, 0.0, size.X, size.Y),
+                DWRITE_TEXT_ALIGNMENT_TRAILING,
+                text_secondary(),
+            )
+        })
     }
 
     pub fn redraw(&self, gfx: &Gfx) -> Result<()> {
@@ -711,9 +769,18 @@ impl SearchBox {
     }
 }
 
+/// The result count's width (list layout).
+const COUNT_W: f32 = 76.0;
+
+/// Only the list layout shows the result count.
+fn shows_count() -> bool {
+    gfx::theme().layout == crate::theme::LayoutKind::List
+}
+
 fn text_size(rect: Rect) -> Vector2 {
+    let count = if shows_count() { COUNT_W } else { 0.0 };
     Vector2 {
-        X: (rect.w - text_left() - TEXT_RIGHT_PAD).max(1.0),
+        X: (rect.w - text_left() - TEXT_RIGHT_PAD - count).max(1.0),
         Y: rect.h,
     }
 }

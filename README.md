@@ -29,6 +29,9 @@ button, and nothing else: no ads, no web results, no "Recommended".
   artist, with previous / play-pause / next buttons, a seek bar, and a
   "Switch source" button when two players are active. It hides when nothing
   is playing.
+- **5 themes, 3 layouts.** Glint, Catppuccin, Nord, Tokyo Night and Gruvbox,
+  each with its own colors, shapes, font and layout (grid, list or sidebar).
+  Switch in Settings → Theme; the menu changes live. See [Themes](#themes).
 - **4 background modes + 5 color presets.** Solid, gradient, frosted glass,
   or glass tinted with a gradient (the default). Presets: midnight, aurora,
   sunset, ocean, plain, or your own 1 to 3 colors. If your colors are too
@@ -94,6 +97,33 @@ those cycles, handles and GDI objects stay flat and private bytes grow by
 | Search | Power menu |
 |---|---|
 | ![Search results](docs/screenshots/search.png) | ![Power menu](docs/screenshots/power.png) |
+
+## Themes
+
+A theme is a color palette, shapes (corners, borders), a font and a layout.
+Pick one in **Settings → Theme**, or write `theme = "nord"` in `config.toml`.
+The background and accent settings still work on top of a theme: picking a
+theme sets them to `"theme"` (its own colors), and you can change them
+afterwards.
+
+| Theme | Layout | Look |
+|---|---|---|
+| **Glint** (default) | grid | Glass and soft gradients, the original look |
+| **Catppuccin** (Mocha) | grid | Soft and cozy: pill search bar, mauve play button, separate Lock / Restart / Shut down buttons |
+| **Nord** | list | Calm and minimal: a Rofi-style list of your most-used apps, an icon-only pinned strip, a one-line music bar |
+| **Tokyo Night** | sidebar | Neon dashboard: a rail on the left, a greeting with a big clock, icons on colored tiles |
+| **Gruvbox** (dark) | grid | Terminal style: monospace font, `user@glint: ~` title bar, `❯` prompt, `[ lock ] [ restart ] [ off ]` |
+
+**Icon tint** (Settings → Theme, or `icon_tint = true`) draws every app icon
+in one color, the theme's text color.
+
+| Glint | Catppuccin | Nord |
+|---|---|---|
+| ![Glint theme](docs/screenshots/theme-glint.png) | ![Catppuccin theme](docs/screenshots/theme-catppuccin.png) | ![Nord theme](docs/screenshots/theme-nord.png) |
+
+| Tokyo Night | Gruvbox |
+|---|---|
+| ![Tokyo Night theme](docs/screenshots/theme-tokyo-night.png) | ![Gruvbox theme](docs/screenshots/theme-gruvbox.png) |
 
 ## Install
 
@@ -165,9 +195,17 @@ pinned = [
   "Microsoft.Windows.Photos_8wekyb3d8bbwe!App",
 ]
 
+# The look: "glint", "catppuccin", "nord", "tokyo-night" or "gruvbox".
+# A theme brings its own colors, shapes and font; `accent = "theme"` and
+# `preset = "theme"` below use the theme's colors.
+theme = "glint"
+
+# Draw app icons in one color (the theme's text color).
+icon_tint = false
+
 # Color of the text caret, keyboard focus ring, search border and seek bar:
-# "#rrggbb", or "system" to follow your Windows accent color.
-accent = "#8fa8ff"
+# "theme", "#rrggbb", or "system" to follow your Windows accent color.
+accent = "theme"
 
 # An extra shortcut that opens the menu, like "Alt+Space" or "Ctrl+Shift+S"
 # (modifiers: Ctrl, Alt, Shift, Win). Empty = the Win key only.
@@ -186,9 +224,9 @@ autostart = false
 [background]
 # "solid", "gradient", "glass" (frosted glass) or "glass-gradient".
 mode = "glass-gradient"
-# Colors: "midnight", "aurora", "sunset", "ocean", "plain",
-# or "custom" to use `colors` below.
-preset = "aurora"
+# Colors: "theme" (the theme's own), "midnight", "aurora", "sunset",
+# "ocean", "plain", or "custom" to use `colors` below.
+preset = "theme"
 # Used when preset = "custom": 1 to 3 colors.
 colors = ["#2b1a4a", "#1a2347", "#0f2a3a"]
 # Gradient direction in degrees (0 = up, 90 = right).
@@ -307,6 +345,11 @@ Ideas for after 0.1.0, not promises:
 ## Credits
 
 - Inspired by [Seelen UI](https://github.com/eythaann/Seelen-UI).
+- Theme palettes from [Catppuccin](https://github.com/catppuccin/catppuccin)
+  (Mocha), [Nord](https://www.nordtheme.com/),
+  [Tokyo Night](https://github.com/folke/tokyonight.nvim) and
+  [Gruvbox](https://github.com/morhetz/gruvbox), all MIT licensed. Glint
+  uses their colors only; the themes are not affiliated with these projects.
 - Built on [windows-rs](https://github.com/microsoft/windows-rs),
   [serde](https://serde.rs/) and
   [toml_edit](https://github.com/toml-rs/toml).

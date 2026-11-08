@@ -13,20 +13,43 @@ use windows::UI::Composition::{Compositor, ContainerVisual, Visual};
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    IDWriteTextFormat,
+    DWRITE_TEXT_ALIGNMENT_TRAILING, IDWriteTextFormat,
 };
 use windows::core::{Interface, Result, h};
 use windows_numerics::Vector2;
 
 use super::gfx::{self, Canvas, Gfx, text_primary, text_secondary};
-use super::layout::{Layout, MAX_RESULTS, ROW_HEIGHT, Rect};
+use super::layout::{Layout, MAX_RESULTS, Rect};
 use super::shape::RoundRect;
+use crate::config::Rgb;
+
+/// Shown in the message row of the list layout when nothing is typed and
+/// there is nothing to suggest yet.
+pub const TYPE_TO_SEARCH: &str = "Type to search";
 
 /// Icon size and place inside a row (DIPs).
-pub const ICON: f32 = 24.0;
+const ICON: f32 = 24.0;
 const ICON_LEFT: f32 = 14.0;
-const TEXT_LEFT: f32 = ICON_LEFT + ICON + 12.0;
+const ICON_GAP: f32 = 12.0;
 const TEXT_RIGHT: f32 = 12.0;
+/// The list layout: "Enter" on the right of the selected row.
+const ENTER_HINT: &str = "Enter";
+const HINT_W: f32 = 56.0;
+
+/// The rows' icon size for the active theme (bigger in the list layout).
+pub fn icon_size() -> f32 {
+    if is_list_layout() {
+        super::layout::LIST_ICON
+    } else {
+        ICON
+    }
+}
+
+/// The list layout highlights the selected row with the accent color and
+/// shows the "Enter" hint on it.
+fn is_list_layout() -> bool {
+    gfx::theme().layout == crate::theme::LayoutKind::List
+}
 const NAME_SIZE: f32 = 14.0;
 const MESSAGE_SIZE: f32 = 13.0;
 
@@ -40,6 +63,8 @@ const CLIP_BOX: f32 = 10_000.0;
 struct Shown {
     id: String,
     with_icon: bool,
+    /// Painted as the selected row (list layout: dark text and the hint).
+    selected: bool,
 }
 
 pub struct Results {
@@ -55,6 +80,10 @@ pub struct Results {
     message_format: IDWriteTextFormat,
     /// Icons in one color (`icon_tint`).
     icon_tint: Cell<bool>,
+    /// The selected row's fill in the list layout.
+    accent: Cell<Rgb>,
+    /// What the message row says ("No apps found", "Type to search").
+    message_text: RefCell<&'static str>,
 }
 
 impl Results {
@@ -112,6 +141,8 @@ impl Results {
             name_format: gfx.text_format(NAME_SIZE, DWRITE_FONT_WEIGHT_NORMAL)?,
             message_format: gfx.text_format(MESSAGE_SIZE, DWRITE_FONT_WEIGHT_NORMAL)?,
             icon_tint: Cell::new(false),
+            accent: Cell::new(gfx::theme().palette.accent),
+            message_text: RefCell::new(NO_RESULTS),
         })
     }
 
@@ -119,11 +150,36 @@ impl Results {
     /// shape. Every row is repainted by the next search (`forget`).
     pub fn set_theme(&self, icon_tint: bool) -> Result<()> {
         self.icon_tint.set(icon_tint);
-        self.selection
-            .set_fill(gfx::paint(gfx::theme().palette.selected))?;
+        self.set_selection_fill()?;
         self.selection.set_radius(row_radius());
         self.forget();
         self.set_selected(self.selected.get())
+    }
+
+    /// A new accent color: the list layout's selected row uses it.
+    pub fn set_accent(&self, accent: Rgb) -> Result<()> {
+        if self.accent.replace(accent) != accent && is_list_layout() {
+            self.forget();
+            self.set_selection_fill()?;
+        }
+        Ok(())
+    }
+
+    fn set_selection_fill(&self) -> Result<()> {
+        let fill = if is_list_layout() {
+            gfx::color(self.accent.get(), 1.0)
+        } else {
+            gfx::paint(gfx::theme().palette.selected)
+        };
+        self.selection.set_fill(fill)
+    }
+
+    /// The message row's text. Repaints it when it changes.
+    pub fn set_message(&self, gfx: &Gfx, text: &'static str) -> Result<()> {
+        if self.message_text.replace(text) != text {
+            self.paint_message(gfx)?;
+        }
+        Ok(())
     }
 
     /// The container of everything (cross-faded with the grid).
@@ -149,10 +205,15 @@ impl Results {
         }
         self.forget();
         self.message.resize(gfx, size)?;
+        self.paint_message(gfx)
+    }
+
+    fn paint_message(&self, gfx: &Gfx) -> Result<()> {
+        let size = self.message.size();
         let format = &self.message_format;
+        let text = *self.message_text.borrow();
         self.message.draw(gfx, |ctx| {
-            let layout =
-                gfx.text_layout(NO_RESULTS, format, size, DWRITE_TEXT_ALIGNMENT_CENTER, true)?;
+            let layout = gfx.text_layout(text, format, size, DWRITE_TEXT_ALIGNMENT_CENTER, true)?;
             let brush = gfx::brush(ctx, text_secondary(), 1.0)?;
             gfx::with_glow(ctx, |ctx| {
                 // SAFETY: draws a live text layout with a live brush.
@@ -197,15 +258,24 @@ impl Results {
         }
     }
 
-    /// True if row `i` already shows app `id` (with an icon, if `with_icon`).
+    /// Is row `i` painted as the selected one? Only the list layout paints
+    /// the selected row differently (everywhere else, always false).
+    pub fn paints_selected(&self, i: usize) -> bool {
+        is_list_layout() && self.selected.get() == Some(i)
+    }
+
+    /// True if row `i` already shows app `id` (with an icon, if
+    /// `with_icon`, and selected or not as `paints_selected` says).
     pub fn shows(&self, i: usize, id: &str, with_icon: bool) -> bool {
+        let selected = self.paints_selected(i);
         self.shown.borrow().get(i).is_some_and(|s| {
             s.as_ref()
-                .is_some_and(|s| s.id == id && s.with_icon == with_icon)
+                .is_some_and(|s| s.id == id && s.with_icon == with_icon && s.selected == selected)
         })
     }
 
-    /// Paints row `i`: the icon (if there is one yet) and the name.
+    /// Paints row `i`: the icon (if there is one yet) and the name; in the
+    /// list layout the selected row gets dark text and the "Enter" hint.
     pub fn paint_row(
         &self,
         gfx: &Gfx,
@@ -218,43 +288,72 @@ impl Results {
             return Ok(());
         };
         let size = row.size();
+        let selected = self.paints_selected(i);
+        let icon_size = icon_size();
+        let text_left = ICON_LEFT + icon_size + ICON_GAP;
+        let hint = if selected { HINT_W } else { 0.0 };
         let label = gfx.text_layout(
             name,
             &self.name_format,
             Vector2 {
-                X: size.X - TEXT_LEFT - TEXT_RIGHT,
+                X: (size.X - text_left - TEXT_RIGHT - hint).max(0.0),
                 Y: size.Y,
             },
             DWRITE_TEXT_ALIGNMENT_LEADING,
             true,
         )?;
-        let tint = self.icon_tint.get().then(text_primary);
+        let text = if selected {
+            gfx::on_fill(self.accent.get())
+        } else {
+            text_primary()
+        };
+        let tint = self.icon_tint.get().then_some(text);
+        let paint = |ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext| {
+            let brush = gfx::brush(ctx, text, 1.0)?;
+            let top = (size.Y - icon_size) / 2.0;
+            if let Some(icon) = icon {
+                let dest = Rect::new(ICON_LEFT, top, icon_size, icon_size);
+                gfx::draw_icon(ctx, icon, dest, tint)?;
+            }
+            // SAFETY: draws a live text layout with a live brush.
+            unsafe {
+                ctx.DrawTextLayout(
+                    Vector2 {
+                        X: text_left,
+                        Y: 0.0,
+                    },
+                    &label,
+                    &brush,
+                    gfx::TEXT_OPTIONS,
+                );
+            }
+            if selected {
+                let r = Rect::new(size.X - TEXT_RIGHT - HINT_W, 0.0, HINT_W, size.Y);
+                super::footer::draw_text(
+                    ctx,
+                    gfx,
+                    ENTER_HINT,
+                    &self.message_format,
+                    r,
+                    DWRITE_TEXT_ALIGNMENT_TRAILING,
+                    text,
+                )?;
+            }
+            Ok(())
+        };
         row.draw(gfx, |ctx| {
-            let brush = gfx::brush(ctx, text_primary(), 1.0)?;
-            gfx::with_glow(ctx, |ctx| {
-                let top = (ROW_HEIGHT - ICON) / 2.0;
-                if let Some(icon) = icon {
-                    gfx::draw_icon(ctx, icon, Rect::new(ICON_LEFT, top, ICON, ICON), tint)?;
-                }
-                // SAFETY: draws a live text layout with a live brush.
-                unsafe {
-                    ctx.DrawTextLayout(
-                        Vector2 {
-                            X: TEXT_LEFT,
-                            Y: 0.0,
-                        },
-                        &label,
-                        &brush,
-                        gfx::TEXT_OPTIONS,
-                    );
-                }
-                Ok(())
-            })
+            // Dark text on the accent fill needs no glow.
+            if selected {
+                paint(ctx)
+            } else {
+                gfx::with_glow(ctx, paint)
+            }
         })?;
         if let Some(slot) = self.shown.borrow_mut().get_mut(i) {
             *slot = Some(Shown {
                 id: id.to_string(),
                 with_icon: icon.is_some(),
+                selected,
             });
         }
         Ok(())

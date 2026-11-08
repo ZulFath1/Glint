@@ -38,6 +38,22 @@ const NAME_SIZE: f32 = 13.0;
 const POWER_GLYPH: &str = "\u{E7E8}";
 const PERSON_GLYPH: &str = "\u{E77B}";
 const GEAR_GLYPH: &str = "\u{E713}";
+/// "All apps" (the sidebar rail's Apps button).
+const APPS_GLYPH: &str = "\u{E71D}";
+
+/// A canvas size of at least 1 × 1 (parts a layout doesn't have are 0 × 0).
+fn nonzero(v: Vector2) -> Vector2 {
+    Vector2 {
+        X: v.X.max(1.0),
+        Y: v.Y.max(1.0),
+    }
+}
+
+/// The sidebar rail's color: the theme's darkest background color.
+fn rail_color() -> Rgb {
+    let bg = gfx::theme().palette.background;
+    bg.last().copied().unwrap_or(Rgb::new(0, 0, 0))
+}
 /// The separate footer buttons (Buttons / Text styles), in order.
 pub const QUICK_ACTIONS: [PowerAction; 3] = [
     PowerAction::Lock,
@@ -157,6 +173,11 @@ pub(super) fn draw_text(
 pub struct Footer {
     fill: SpriteVisual,
     divider: SpriteVisual,
+    /// The sidebar layout's rail (a darker band on the left) and its edge.
+    rail: SpriteVisual,
+    rail_edge: SpriteVisual,
+    /// The rail's "Apps" button (sidebar layout only).
+    apps: Canvas,
     /// Lock / Restart / Shut down (only shown with those footer styles).
     quick: Vec<Canvas>,
     quick_text: IDWriteTextFormat,
@@ -189,8 +210,13 @@ impl Footer {
         fill.SetBrush(&c.CreateColorBrushWithColor(gfx::paint(p.footer))?)?;
         let divider = c.CreateSpriteVisual()?;
         divider.SetBrush(&c.CreateColorBrushWithColor(gfx::paint(p.divider))?)?;
-        back.Children()?.InsertAtTop(&fill)?;
-        back.Children()?.InsertAtTop(&divider)?;
+        let rail = c.CreateSpriteVisual()?;
+        rail.SetBrush(&c.CreateColorBrushWithColor(gfx::color(rail_color(), 1.0))?)?;
+        let rail_edge = c.CreateSpriteVisual()?;
+        rail_edge.SetBrush(&c.CreateColorBrushWithColor(gfx::paint(p.divider))?)?;
+        for v in [&rail, &rail_edge, &fill, &divider] {
+            back.Children()?.InsertAtTop(v)?;
+        }
 
         let avatar = Canvas::new(c, gfx, AVATAR_SIZE)?;
         // A round picture: clip the square to a circle.
@@ -206,10 +232,17 @@ impl Footer {
         avatar
             .visual
             .SetClip(&c.CreateGeometricClipWithGeometry(&circle)?)?;
-        let name = Canvas::new(c, gfx, layout.name.size())?;
-        let power = Canvas::new(c, gfx, layout.power.size())?;
-        let gear = Canvas::new(c, gfx, layout.settings.size())?;
-        for v in [&avatar.visual, &name.visual, &power.visual, &gear.visual] {
+        let name = Canvas::new(c, gfx, nonzero(layout.name.size()))?;
+        let power = Canvas::new(c, gfx, nonzero(layout.power.size()))?;
+        let gear = Canvas::new(c, gfx, nonzero(layout.settings.size()))?;
+        let apps = Canvas::new(c, gfx, nonzero(layout.apps.size()))?;
+        for v in [
+            &avatar.visual,
+            &name.visual,
+            &power.visual,
+            &gear.visual,
+            &apps.visual,
+        ] {
             front.Children()?.InsertAtTop(v)?;
         }
         let mut quick = Vec::with_capacity(QUICK_ACTIONS.len());
@@ -225,6 +258,9 @@ impl Footer {
         Ok(Self {
             fill,
             divider,
+            rail,
+            rail_edge,
+            apps,
             quick,
             quick_text: gfx.text_format(QUICK_TEXT_SIZE, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
             avatar,
@@ -244,7 +280,10 @@ impl Footer {
     pub fn profile_rect(&self) -> Rect {
         let l = self.layout.borrow();
         let mut r = l.profile;
-        r.w = (l.name.x - r.x + self.name_width.get() + 10.0).min(l.profile.w);
+        // No name (the sidebar's rail): just the avatar's area.
+        if l.name.w > 0.0 {
+            r.w = (l.name.x - r.x + self.name_width.get() + 10.0).min(l.profile.w);
+        }
         r
     }
 
@@ -256,6 +295,16 @@ impl Footer {
         self.layout.borrow().settings
     }
 
+    /// The rail's Apps button (sidebar layout; empty otherwise).
+    pub fn apps_rect(&self) -> Rect {
+        self.layout.borrow().apps
+    }
+
+    /// The display name ("First Last"), for the sidebar's greeting.
+    pub fn user_name(&self) -> &str {
+        &self.user_name
+    }
+
     /// The separate footer buttons (empty with the power-button style).
     pub fn quick_rects(&self) -> Vec<Rect> {
         self.layout.borrow().quick.clone()
@@ -265,10 +314,16 @@ impl Footer {
     /// `refresh` afterwards (it repaints and places everything).
     pub fn set_theme(&self) -> Result<()> {
         let p = gfx::theme().palette;
-        for (v, paint) in [(&self.fill, p.footer), (&self.divider, p.divider)] {
+        let rail = gfx::color(rail_color(), 1.0);
+        for (v, color) in [
+            (&self.fill, gfx::paint(p.footer)),
+            (&self.divider, gfx::paint(p.divider)),
+            (&self.rail, rail),
+            (&self.rail_edge, gfx::paint(p.divider)),
+        ] {
             v.Brush()?
                 .cast::<windows::UI::Composition::CompositionColorBrush>()?
-                .SetColor(gfx::paint(paint))?;
+                .SetColor(color)?;
         }
         Ok(())
     }
@@ -276,9 +331,10 @@ impl Footer {
     /// Positions and paints everything (layout or DPI change).
     pub fn refresh(&self, gfx: &Gfx, layout: &Layout) -> Result<()> {
         self.avatar.resize(gfx, AVATAR_SIZE)?;
-        self.name.resize(gfx, layout.name.size())?;
-        self.power.resize(gfx, layout.power.size())?;
-        self.gear.resize(gfx, layout.settings.size())?;
+        self.name.resize(gfx, nonzero(layout.name.size()))?;
+        self.power.resize(gfx, nonzero(layout.power.size()))?;
+        self.gear.resize(gfx, nonzero(layout.settings.size()))?;
+        self.apps.resize(gfx, nonzero(layout.apps.size()))?;
         for (i, q) in self.quick.iter().enumerate() {
             match layout.quick.get(i) {
                 Some(r) => {
@@ -288,7 +344,9 @@ impl Footer {
                 None => q.visual.SetIsVisible(false)?,
             }
         }
-        self.power.visual.SetIsVisible(layout.quick.is_empty())?;
+        self.power
+            .visual
+            .SetIsVisible(!layout.separate_power_buttons())?;
         self.move_to(gfx, layout)?;
         self.redraw(gfx)
     }
@@ -297,6 +355,26 @@ impl Footer {
     pub fn move_to(&self, gfx: &Gfx, layout: &Layout) -> Result<()> {
         *self.layout.borrow_mut() = layout.clone();
         let f = layout.footer;
+        // Parts a layout doesn't have are hidden (the sidebar has no footer
+        // bar or name; the list layout's music row replaces the profile).
+        let bar = f.h > 0.0;
+        self.fill.SetIsVisible(bar)?;
+        self.divider.SetIsVisible(bar)?;
+        self.avatar.visual.SetIsVisible(layout.avatar.w > 0.0)?;
+        self.name.visual.SetIsVisible(layout.name.w > 0.0)?;
+        self.apps.visual.SetIsVisible(layout.apps.w > 0.0)?;
+        let rail = layout.rail;
+        self.rail.SetIsVisible(rail.w > 0.0)?;
+        self.rail_edge.SetIsVisible(rail.w > 0.0)?;
+        self.rail.SetSize(rail.size())?;
+        let edge = gfx::theme().shape.divider;
+        self.rail_edge.SetOffset(Vector3 {
+            X: rail.right() - edge,
+            Y: 0.0,
+            Z: 0.0,
+        })?;
+        self.rail_edge.SetSize(Vector2 { X: edge, Y: rail.h })?;
+        self.apps.set_offset(gfx, layout.apps.x, layout.apps.y)?;
         let s = gfx.scale();
         self.fill.SetOffset(Vector3 {
             X: 0.0,
@@ -333,10 +411,16 @@ impl Footer {
     /// What moves when the menu's height changes (layout animation).
     pub fn motion_objects(&self) -> Result<Vec<(CompositionObject, Kind)>> {
         let mut list = Vec::new();
-        for v in [&self.fill, &self.divider] {
+        for v in [&self.fill, &self.divider, &self.rail, &self.rail_edge] {
             list.push((v.cast()?, Kind::Visual));
         }
-        for c in [&self.avatar, &self.name, &self.power, &self.gear] {
+        for c in [
+            &self.avatar,
+            &self.name,
+            &self.power,
+            &self.gear,
+            &self.apps,
+        ] {
             list.push((c.visual.cast()?, Kind::Visual));
         }
         for c in &self.quick {
@@ -412,7 +496,11 @@ impl Footer {
             })
         })?;
 
-        for (canvas, glyph) in [(&self.power, POWER_GLYPH), (&self.gear, GEAR_GLYPH)] {
+        for (canvas, glyph) in [
+            (&self.power, POWER_GLYPH),
+            (&self.gear, GEAR_GLYPH),
+            (&self.apps, APPS_GLYPH),
+        ] {
             canvas.draw(gfx, |ctx| {
                 gfx::with_glow(ctx, |ctx| {
                     draw_text(
