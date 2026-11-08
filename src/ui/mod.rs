@@ -89,6 +89,8 @@ pub enum Action {
     None,
     Close,
     OpenAccountSettings,
+    /// The footer gear: open the Settings window.
+    OpenSettings,
     Power(PowerAction),
     /// Launch the app with this AppsFolder ID (AUMID).
     Launch(String),
@@ -109,6 +111,8 @@ pub enum Focus {
     /// A button of the music card.
     Media(CardPart),
     Profile,
+    /// The footer gear (Settings).
+    Settings,
     Power,
     /// A button of the power strip.
     Strip(usize),
@@ -125,6 +129,7 @@ enum Target {
     /// A button or the seek bar of the music card.
     Media(CardPart),
     Profile,
+    Settings,
     Power,
     Strip(usize),
     /// The power strip, but not on a button.
@@ -334,7 +339,7 @@ impl Ui {
         hover.show(false)?;
         hover_layer.Children()?.InsertAtTop(&hover.visual)?;
         let search = SearchBox::new(&compositor, &gfx, &front, layout.search, accent)?;
-        let grid = Grid::new(&compositor, &gfx, &front, apps)?;
+        let grid = Grid::new(&compositor, &gfx, &front, apps, config.show_names)?;
         let results = Results::new(&compositor, &gfx, &front, &layout, &footer.fill_visual()?)?;
         let music = MusicCard::new(
             &compositor,
@@ -578,6 +583,34 @@ impl Ui {
         let animator = Animator::new(&self.compositor, cfg)?;
         *self.animator.borrow_mut() = animator;
         Ok(())
+    }
+
+    /// App names under the pinned icons on or off.
+    pub fn set_show_names(&self, on: bool) -> Result<()> {
+        if self.grid.set_show_names(on) {
+            self.grid.redraw(&self.gfx, &self.icons)?;
+        }
+        Ok(())
+    }
+
+    /// Plays the open animation again from the start (Settings: "Replay
+    /// animation", or after an animation value changed). Only while open.
+    pub fn replay_open(&self, reduced_motion: bool) -> Result<()> {
+        if !self.is_open.get() {
+            return Ok(());
+        }
+        Animator::reset_closed(&self.menu)?;
+        self.animate_open(true, reduced_motion)
+    }
+
+    /// The compositor and painting devices, shared with the Settings
+    /// window (one GPU device for the whole app).
+    pub fn compositor(&self) -> &Compositor {
+        &self.compositor
+    }
+
+    pub fn gfx(&self) -> &Gfx {
+        &self.gfx
     }
 
     /// Album tint on or off. Call `set_music` afterwards to apply it.
@@ -1160,6 +1193,7 @@ impl Ui {
             Focus::Cell(i) => self.grid.rect(i).map(|r| (r, CELL_RADIUS)),
             Focus::Media(part) => Some((self.music.part_rect(part), self.music.part_radius(part))),
             Focus::Profile => Some((self.footer.profile_rect(), BUTTON_RADIUS)),
+            Focus::Settings => Some((self.footer.settings_rect(), BUTTON_RADIUS)),
             Focus::Power => Some((self.footer.power_rect(), BUTTON_RADIUS)),
             Focus::Strip(i) => self.strip.buttons().get(i).map(|&r| (r, BUTTON_RADIUS)),
         }
@@ -1204,6 +1238,7 @@ impl Ui {
             Target::Cell(i) => self.grid.rect(i).map(|r| (r, CELL_RADIUS)),
             Target::Row(i) => self.results.rect(i).map(|r| (r, results::ROW_RADIUS)),
             Target::Profile => Some((self.footer.profile_rect(), BUTTON_RADIUS)),
+            Target::Settings => Some((self.footer.settings_rect(), BUTTON_RADIUS)),
             Target::Power => Some((self.footer.power_rect(), BUTTON_RADIUS)),
             _ => None,
         };
@@ -1244,6 +1279,8 @@ impl Ui {
             Target::Media(part)
         } else if self.footer.profile_rect().contains(p) {
             Target::Profile
+        } else if self.footer.settings_rect().contains(p) {
+            Target::Settings
         } else if self.footer.power_rect().contains(p) {
             Target::Power
         } else {
@@ -1463,7 +1500,7 @@ impl Ui {
             Focus::Search => self.search_key(vk, ctrl, shift),
             Focus::Cell(i) => self.grid_key(i, vk, shift),
             Focus::Media(part) => self.media_key(part, vk, shift),
-            Focus::Profile | Focus::Power => self.footer_key(focus, vk, shift),
+            Focus::Profile | Focus::Settings | Focus::Power => self.footer_key(focus, vk, shift),
             Focus::Strip(i) => self.strip_key(i, vk, shift),
         }
     }
@@ -1624,16 +1661,21 @@ impl Ui {
         };
         let next = match (focus, vk) {
             (Focus::Profile, VK_RETURN) => return Ok(Action::OpenAccountSettings),
+            (Focus::Settings, VK_RETURN) => return Ok(Action::OpenSettings),
             (Focus::Power, VK_RETURN) => {
                 self.keyboard_nav.set(true);
                 self.open_strip()?;
                 return Ok(Action::None);
             }
             (_, VK_UP) => above,
+            // Left to right: profile, gear, power.
             (Focus::Profile, VK_TAB) if shift => above,
-            (Focus::Profile, VK_RIGHT | VK_TAB) => Focus::Power,
-            (Focus::Power, VK_LEFT) => Focus::Profile,
-            (Focus::Power, VK_TAB) if shift => Focus::Profile,
+            (Focus::Profile, VK_RIGHT | VK_TAB) => Focus::Settings,
+            (Focus::Settings, VK_LEFT) => Focus::Profile,
+            (Focus::Settings, VK_TAB) if shift => Focus::Profile,
+            (Focus::Settings, VK_RIGHT | VK_TAB) => Focus::Power,
+            (Focus::Power, VK_LEFT) => Focus::Settings,
+            (Focus::Power, VK_TAB) if shift => Focus::Settings,
             (Focus::Power, VK_TAB) => Focus::Search,
             _ => return Ok(Action::None),
         };
@@ -1855,6 +1897,7 @@ impl Ui {
             Target::Row(i) => Ok(self.launch_result(i)),
             Target::Media(part) => Ok(self.press_card(part)),
             Target::Profile => Ok(Action::OpenAccountSettings),
+            Target::Settings => Ok(Action::OpenSettings),
             Target::Power if self.strip.is_open() => {
                 self.close_strip(Focus::Search)?;
                 Ok(Action::None)

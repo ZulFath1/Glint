@@ -135,7 +135,52 @@ fn allow_host_backdrop(hwnd: HWND) {
 /// Works out where the menu goes: on the cursor's monitor, centered on the
 /// taskbar's edge, `TASKBAR_GAP` away from it.
 pub fn placement(menu_width: f32, menu_height: f32) -> Placement {
+    let (monitor, work, scale) = cursor_monitor();
+    compute_placement(monitor, work, work, scale, menu_width, menu_height)
+}
+
+/// Like `placement`, but on the side of `avoid` (the Settings window, in
+/// screen pixels) with the most room, so the live preview sits next to
+/// Settings instead of under it. The menu still keeps to the taskbar's edge.
+pub fn placement_beside(menu_width: f32, menu_height: f32, avoid: RECT) -> Placement {
+    let center = POINT {
+        x: avoid.left + (avoid.right - avoid.left) / 2,
+        y: avoid.top + (avoid.bottom - avoid.top) / 2,
+    };
+    let (monitor, work, scale) = monitor_at(center);
+    let area = beside(work, avoid, (TASKBAR_GAP * scale).round() as i32);
+    compute_placement(monitor, work, area, scale, menu_width, menu_height)
+}
+
+/// The part of `work` left or right of `avoid` (whichever is wider), minus
+/// a gap. `work` itself if `avoid` doesn't overlap it sideways.
+fn beside(work: RECT, avoid: RECT, gap: i32) -> RECT {
+    let left = avoid.left - gap - work.left;
+    let right = work.right - (avoid.right + gap);
+    if avoid.right <= work.left || avoid.left >= work.right {
+        return work;
+    }
+    let mut area = work;
+    if right >= left {
+        area.left = (avoid.right + gap).min(work.right);
+    } else {
+        area.right = (avoid.left - gap).max(work.left);
+    }
+    area
+}
+
+/// The monitor under the cursor: its full rect, its work area (taskbar
+/// space taken out, also for an auto-hide or `--taskbar-edge` taskbar) and
+/// its DPI scale.
+pub fn cursor_monitor() -> (RECT, RECT, f32) {
     let mut cursor = POINT::default();
+    // SAFETY: valid out-pointer to a local.
+    let _ = unsafe { GetCursorPos(&mut cursor) };
+    monitor_at(cursor)
+}
+
+/// Like `cursor_monitor`, for the monitor nearest to `point`.
+fn monitor_at(point: POINT) -> (RECT, RECT, f32) {
     let mut info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
@@ -143,8 +188,7 @@ pub fn placement(menu_width: f32, menu_height: f32) -> Placement {
     let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
     // SAFETY: all calls get valid out-pointers to locals.
     unsafe {
-        let _ = GetCursorPos(&mut cursor);
-        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
         let _ = GetMonitorInfoW(monitor, &mut info);
         let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
     }
@@ -159,13 +203,7 @@ pub fn placement(menu_width: f32, menu_height: f32) -> Placement {
     {
         work = reserve_taskbar(work, edge, thickness);
     }
-    compute_placement(
-        info.rcMonitor,
-        work,
-        dpi_x as f32 / 96.0,
-        menu_width,
-        menu_height,
-    )
+    (info.rcMonitor, work, dpi_x as f32 / 96.0)
 }
 
 /// Debug flag `--taskbar-edge top|left|right|bottom`: 0 = off, else the
@@ -250,7 +288,16 @@ fn reserve_taskbar(work: RECT, edge: Edge, thickness: i32) -> RECT {
     r
 }
 
-fn compute_placement(monitor: RECT, work: RECT, scale: f32, menu_w: f32, menu_h: f32) -> Placement {
+/// `work` finds the taskbar's edge; the menu is placed inside `area` (the
+/// same as `work`, or the part of it beside the Settings window).
+fn compute_placement(
+    monitor: RECT,
+    work: RECT,
+    area: RECT,
+    scale: f32,
+    menu_w: f32,
+    menu_h: f32,
+) -> Placement {
     let px = |dip: f32| (dip * scale).round() as i32;
     let (mw, mh, margin, gap) = (px(menu_w), px(menu_h), px(MARGIN), px(TASKBAR_GAP));
 
@@ -265,6 +312,8 @@ fn compute_placement(monitor: RECT, work: RECT, scale: f32, menu_w: f32, menu_h:
     } else {
         Edge::Bottom // auto-hide taskbar: assume the default position
     };
+    // From here on, only the space we may use (it is inside `work`).
+    let work = area;
 
     let center_x = work.left + (work.right - work.left - mw) / 2;
     let (menu_x, menu_y) = match edge {
@@ -311,6 +360,27 @@ pub fn show(hwnd: HWND, p: &Placement) {
     };
     if let Err(e) = result {
         log_error!("SetWindowPos failed: {e}");
+    }
+}
+
+/// Like `show`, but not topmost: just below `above` (the Settings window),
+/// so the live preview never covers Settings. (Placing a topmost window
+/// after a normal one takes its topmost status away.)
+pub fn show_below(hwnd: HWND, p: &Placement, above: HWND) {
+    // SAFETY: moves/shows our own window below another of our windows.
+    let result = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(above),
+            p.x,
+            p.y,
+            p.width,
+            p.height,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE,
+        )
+    };
+    if let Err(e) = result {
+        log_error!("SetWindowPos (preview) failed: {e}");
     }
 }
 
@@ -432,6 +502,7 @@ mod tests {
         let p = compute_placement(
             rect(0, 0, 1920, 1080),
             rect(0, 0, 1920, 1032),
+            rect(0, 0, 1920, 1032),
             1.0,
             360.0,
             320.0,
@@ -455,6 +526,7 @@ mod tests {
         let p = compute_placement(
             rect(0, 0, 1920, 1080),
             rect(0, 48, 1920, 1080),
+            rect(0, 48, 1920, 1080),
             1.0,
             360.0,
             320.0,
@@ -467,6 +539,7 @@ mod tests {
     fn bottom_taskbar_at_150_percent() {
         let p = compute_placement(
             rect(0, 0, 2880, 1620),
+            rect(0, 0, 2880, 1548),
             rect(0, 0, 2880, 1548),
             1.5,
             360.0,
@@ -482,7 +555,7 @@ mod tests {
         // Auto-hide: Windows says the work area is the whole 1920x1200 screen.
         let m = rect(0, 0, 1920, 1200);
         let work = reserve_taskbar(m, Edge::Bottom, 48);
-        let p = compute_placement(m, work, 1.0, 360.0, 320.0);
+        let p = compute_placement(m, work, work, 1.0, 360.0, 320.0);
         assert_eq!(p.edge, Edge::Bottom);
         assert_eq!(p.y + p.menu_y + p.menu_height, 1200 - 48 - 12);
         assert_eq!(reserve_taskbar(m, Edge::Left, 60).left, 60);
@@ -492,16 +565,39 @@ mod tests {
     fn top_and_side_taskbars() {
         let m = rect(0, 0, 1920, 1080);
         assert_eq!(
-            compute_placement(m, rect(0, 48, 1920, 1080), 1.0, 360.0, 320.0).edge,
+            compute_placement(
+                m,
+                rect(0, 48, 1920, 1080),
+                rect(0, 48, 1920, 1080),
+                1.0,
+                360.0,
+                320.0
+            )
+            .edge,
             Edge::Top
         );
-        let left = compute_placement(m, rect(60, 0, 1920, 1080), 1.0, 360.0, 320.0);
+        let left = compute_placement(
+            m,
+            rect(60, 0, 1920, 1080),
+            rect(60, 0, 1920, 1080),
+            1.0,
+            360.0,
+            320.0,
+        );
         assert_eq!(left.edge, Edge::Left);
         // The window never reaches into the taskbar on the left.
         assert_eq!(left.x, 60);
         assert_eq!(left.x + left.menu_x, 60 + 12);
         assert_eq!(
-            compute_placement(m, rect(0, 0, 1860, 1080), 1.0, 360.0, 320.0).edge,
+            compute_placement(
+                m,
+                rect(0, 0, 1860, 1080),
+                rect(0, 0, 1860, 1080),
+                1.0,
+                360.0,
+                320.0
+            )
+            .edge,
             Edge::Right
         );
     }
@@ -517,7 +613,7 @@ mod tests {
             let bar = px(48.0);
             for edge in [Edge::Bottom, Edge::Top, Edge::Left, Edge::Right] {
                 let work = reserve_taskbar(m, edge, bar);
-                let p = compute_placement(m, work, scale, 360.0, 420.0);
+                let p = compute_placement(m, work, work, scale, 360.0, 420.0);
                 assert_eq!(p.edge, edge, "{edge:?} at {scale}");
                 assert!(p.x >= work.left && p.y >= work.top, "{edge:?} at {scale}");
                 assert!(p.x + p.width <= work.right, "{edge:?} at {scale}");
@@ -541,11 +637,31 @@ mod tests {
         // A 125% monitor placed left of the main screen has negative x.
         let m = rect(-2400, 0, 0, 1350);
         let work = rect(-2400, 0, 0, 1290);
-        let p = compute_placement(m, work, 1.25, 360.0, 320.0);
+        let p = compute_placement(m, work, work, 1.25, 360.0, 320.0);
         assert_eq!(p.edge, Edge::Bottom);
         assert_eq!(p.x + p.width / 2, -1200);
         assert!(p.x >= -2400 && p.x + p.width <= 0);
         assert_eq!(p.y + p.menu_y + p.menu_height, 1290 - 15);
+    }
+
+    #[test]
+    fn the_preview_menu_goes_beside_settings() {
+        let m = rect(0, 0, 1920, 1080);
+        let work = rect(0, 0, 1920, 1032);
+        // Settings on the left: the menu centers in the space to its right.
+        let settings = rect(100, 400, 820, 1000);
+        let area = beside(work, settings, 12);
+        assert_eq!(area, rect(832, 0, 1920, 1032));
+        let p = compute_placement(m, work, area, 1.0, 528.0, 400.0);
+        assert_eq!(p.edge, Edge::Bottom);
+        let menu_left = p.x + p.menu_x;
+        assert!(menu_left >= 832, "{menu_left}");
+        assert_eq!(menu_left + 528 / 2, (832 + 1920) / 2);
+        // Settings on the right: the menu goes left of it.
+        let area = beside(work, rect(1100, 400, 1820, 1000), 12);
+        assert_eq!((area.left, area.right), (0, 1088));
+        // Settings on another monitor: nothing changes.
+        assert_eq!(beside(work, rect(-900, 0, -100, 600), 12), work);
     }
 
     #[test]

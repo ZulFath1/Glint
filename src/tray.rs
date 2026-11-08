@@ -10,7 +10,8 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, IDI_APPLICATION, LoadIconW,
     MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW, SetForegroundWindow,
-    TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_NULL,
+    SetMenuDefaultItem, TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, WM_APP, WM_NULL,
 };
 use windows::core::{Result, w};
 
@@ -23,8 +24,11 @@ const CMD_OPEN_CONFIG: usize = 2;
 const CMD_RELOAD_CONFIG: usize = 3;
 const CMD_AUTOSTART: usize = 4;
 const CMD_GPU_RESET: usize = 5;
+const CMD_SETTINGS: usize = 6;
 
 pub enum TrayCommand {
+    /// Open the Settings window.
+    Settings,
     Quit,
     OpenConfig,
     ReloadConfig,
@@ -107,6 +111,9 @@ impl Tray {
         // clicks elsewhere.
         unsafe {
             let menu = CreatePopupMenu().ok()?;
+            let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS, w!("Settings…"));
+            let _ = SetMenuDefaultItem(menu, CMD_SETTINGS as u32, 0);
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_CONFIG, w!("Open config file"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_RELOAD_CONFIG, w!("Reload config"));
             let check = if autostart { MF_CHECKED } else { MF_UNCHECKED };
@@ -143,6 +150,7 @@ impl Tray {
             let _ = PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
             let _ = DestroyMenu(menu);
             match chosen.0 as usize {
+                CMD_SETTINGS => Some(TrayCommand::Settings),
                 CMD_QUIT => Some(TrayCommand::Quit),
                 CMD_OPEN_CONFIG => Some(TrayCommand::OpenConfig),
                 CMD_RELOAD_CONFIG => Some(TrayCommand::ReloadConfig),

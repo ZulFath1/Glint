@@ -3,7 +3,8 @@
 //! `glint.exe --stress N` opens and closes the menu N times. Each cycle also
 //! types in search, shows or hides a (fake) music card, and switches the
 //! background mode; every 25 cycles it changes the pins, every 50 it
-//! re-reads config.toml. It compares memory at the end with memory after
+//! re-reads config.toml, and every 10 it opens and closes the Settings
+//! window (milestone 8). It compares memory at the end with memory after
 //! cycle 10 (the rule in CLAUDE.md) and after cycle 100 ("warm", see
 //! `WARM_CYCLE`): the private working set (Task Manager's number) must not
 //! grow by 1 MB or more. Then Glint quits.
@@ -98,6 +99,8 @@ pub struct Plan {
     pub pin: Option<bool>,
     pub reload_config: bool,
     pub device_loss: bool,
+    /// Open the Settings window before the menu, close it after.
+    pub settings: bool,
 }
 
 /// What happens in cycle `n` (1-based); `gpu` = `--stress-gpu`. Pure, so it
@@ -116,6 +119,8 @@ pub fn plan(n: u32, gpu: bool) -> Plan {
         // and the menu agree on the pins when it is re-read.
         reload_config: n % 50 == 40,
         device_loss: gpu,
+        // 100 times in 1,000 cycles (IMPROVE.md 8.5).
+        settings: n % 10 == 5,
     }
 }
 
@@ -275,29 +280,37 @@ impl Stress {
         }
     }
 
-    /// Counts our working-set pages that no other process shares.
     fn private_working_set(&self) -> usize {
-        let mut buf = self.buffer.borrow_mut();
-        for _ in 0..4 {
-            let bytes = (buf.len() * std::mem::size_of::<usize>()) as u32;
-            // SAFETY: `buf` is a live, writable buffer of `bytes` bytes. The
-            // first entry receives the page count, the rest one entry each.
-            let ok =
-                unsafe { QueryWorkingSet(GetCurrentProcess(), buf.as_mut_ptr().cast(), bytes) };
-            let count = buf[0];
-            if ok.is_ok() && count < buf.len() {
-                return buf[1..=count]
-                    .iter()
-                    .filter(|&&entry| entry & SHARED_BIT == 0)
-                    .count()
-                    * PAGE;
-            }
-            // Too small: `count` says how many pages there are now.
-            let want = count + count / 4 + 1024;
-            buf.resize(want, 0);
-        }
-        0
+        count_private(&mut self.buffer.borrow_mut())
     }
+}
+
+/// Task Manager's "Memory" number for Glint right now (Settings → About).
+pub fn private_working_set() -> usize {
+    count_private(&mut vec![0; 32 * 1024])
+}
+
+/// Counts our working-set pages that no other process shares. `buf` is
+/// grown when there are more pages than it holds.
+fn count_private(buf: &mut Vec<usize>) -> usize {
+    for _ in 0..4 {
+        let bytes = (buf.len() * std::mem::size_of::<usize>()) as u32;
+        // SAFETY: `buf` is a live, writable buffer of `bytes` bytes. The
+        // first entry receives the page count, the rest one entry each.
+        let ok = unsafe { QueryWorkingSet(GetCurrentProcess(), buf.as_mut_ptr().cast(), bytes) };
+        let count = buf[0];
+        if ok.is_ok() && count < buf.len() {
+            return buf[1..=count]
+                .iter()
+                .filter(|&&entry| entry & SHARED_BIT == 0)
+                .count()
+                * PAGE;
+        }
+        // Too small: `count` says how many pages there are now.
+        let want = count + count / 4 + 1024;
+        buf.resize(want, 0);
+    }
+    0
 }
 
 /// A made-up song for the music card, different each cycle (so the cover
@@ -348,6 +361,7 @@ mod tests {
         assert!(plans.iter().all(|p| !p.device_loss));
         assert!((1..=1000).all(|n| plan(n, true).device_loss));
         assert_eq!(plans.iter().filter(|p| p.reload_config).count(), 20);
+        assert_eq!(plans.iter().filter(|p| p.settings).count(), 100);
         // Every pin taken away is put back before the end.
         assert_eq!(plan(975, false).pin, Some(true));
     }

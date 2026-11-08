@@ -36,6 +36,7 @@ use crate::power::PowerAction;
 const NAME_SIZE: f32 = 13.0;
 const POWER_GLYPH: &str = "\u{E7E8}";
 const PERSON_GLYPH: &str = "\u{E77B}";
+const GEAR_GLYPH: &str = "\u{E713}";
 const FOOTER_FILL: f32 = 0.22;
 const DIVIDER_ALPHA: f32 = 0.08;
 
@@ -153,6 +154,8 @@ pub struct Footer {
     avatar: Canvas,
     name: Canvas,
     power: Canvas,
+    /// The gear that opens Settings.
+    gear: Canvas,
     user_name: String,
     /// Width of the painted name, so the profile hover hugs it.
     name_width: Cell<f32>,
@@ -197,7 +200,8 @@ impl Footer {
             .SetClip(&c.CreateGeometricClipWithGeometry(&circle)?)?;
         let name = Canvas::new(c, gfx, layout.name.size())?;
         let power = Canvas::new(c, gfx, layout.power.size())?;
-        for v in [&avatar.visual, &name.visual, &power.visual] {
+        let gear = Canvas::new(c, gfx, layout.settings.size())?;
+        for v in [&avatar.visual, &name.visual, &power.visual, &gear.visual] {
             front.Children()?.InsertAtTop(v)?;
         }
 
@@ -209,6 +213,7 @@ impl Footer {
             avatar,
             name,
             power,
+            gear,
             user_name,
             name_width: Cell::new(0.0),
             layout: RefCell::new(layout.clone()),
@@ -230,11 +235,16 @@ impl Footer {
         self.layout.borrow().power
     }
 
+    pub fn settings_rect(&self) -> Rect {
+        self.layout.borrow().settings
+    }
+
     /// Positions and paints everything (layout or DPI change).
     pub fn refresh(&self, gfx: &Gfx, layout: &Layout) -> Result<()> {
         self.avatar.resize(gfx, AVATAR_SIZE)?;
         self.name.resize(gfx, layout.name.size())?;
         self.power.resize(gfx, layout.power.size())?;
+        self.gear.resize(gfx, layout.settings.size())?;
         self.move_to(gfx, layout)?;
         self.redraw(gfx)
     }
@@ -259,7 +269,9 @@ impl Footer {
         self.avatar
             .set_offset(gfx, layout.avatar.x, layout.avatar.y)?;
         self.name.set_offset(gfx, layout.name.x, layout.name.y)?;
-        self.power.set_offset(gfx, layout.power.x, layout.power.y)
+        self.power.set_offset(gfx, layout.power.x, layout.power.y)?;
+        self.gear
+            .set_offset(gfx, layout.settings.x, layout.settings.y)
     }
 
     /// The footer's background: its top edge is where the footer starts,
@@ -274,7 +286,7 @@ impl Footer {
         for v in [&self.fill, &self.divider] {
             list.push((v.cast()?, Kind::Visual));
         }
-        for c in [&self.avatar, &self.name, &self.power] {
+        for c in [&self.avatar, &self.name, &self.power, &self.gear] {
             list.push((c.visual.cast()?, Kind::Visual));
         }
         Ok(list)
@@ -346,19 +358,22 @@ impl Footer {
             })
         })?;
 
-        self.power.draw(gfx, |ctx| {
-            gfx::with_glow(ctx, |ctx| {
-                draw_text(
-                    ctx,
-                    gfx,
-                    POWER_GLYPH,
-                    &self.glyph_format,
-                    Rect::new(0.0, 0.0, POWER_BUTTON, POWER_BUTTON),
-                    DWRITE_TEXT_ALIGNMENT_CENTER,
-                    text_primary(),
-                )
-            })
-        })
+        for (canvas, glyph) in [(&self.power, POWER_GLYPH), (&self.gear, GEAR_GLYPH)] {
+            canvas.draw(gfx, |ctx| {
+                gfx::with_glow(ctx, |ctx| {
+                    draw_text(
+                        ctx,
+                        gfx,
+                        glyph,
+                        &self.glyph_format,
+                        Rect::new(0.0, 0.0, POWER_BUTTON, POWER_BUTTON),
+                        DWRITE_TEXT_ALIGNMENT_CENTER,
+                        text_primary(),
+                    )
+                })
+            })?;
+        }
+        Ok(())
     }
 }
 

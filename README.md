@@ -15,8 +15,8 @@ button, and nothing else: no ads, no web results, no "Recommended".
   one after another. Every animation is played by the Windows compositor at
   your monitor's refresh rate (60, 120, 144 Hz...). Closing halfway and
   reopening continues smoothly instead of jumping.
-- **Only as big as it needs to be.** The grid has up to 4 columns, and the
-  menu shrinks or grows with the number of pins.
+- **Only as big as it needs to be.** The grid has 6 columns by default (3 to
+  8, your choice), and the menu shrinks or grows with the number of pins.
 - **Instant app search.** Start typing to search all installed apps, both
   classic programs and Store apps. Exact prefixes rank first, then word
   starts ("ps" finds Photoshop), then looser matches. Apps you launch often
@@ -37,6 +37,11 @@ button, and nothing else: no ads, no web results, no "Recommended".
 - **Power button.** Lock, Sleep, Restart and Shut down, with an "Are you
   sure?" step for Restart and Shut down.
 - **Profile.** Your account picture and name; click to open account settings.
+- **Settings window.** Change the background, colors, columns, animation,
+  music player, hotkey and more, and watch the menu change next to it as you
+  go. Open it from the tray icon or the gear button in the menu. It is built
+  with the same native stack as the menu, and closing it gives its memory
+  back.
 - **Config file with hot reload.** Edit `config.toml`, save, and the menu
   changes right away. A typo doesn't break anything: Glint keeps the last
   good settings and tells you the line number.
@@ -119,6 +124,7 @@ menu. If you want, you can hide that button, for example with a
 | Space (search empty) | Play / pause music |
 | Ctrl+← / Ctrl+→ (search empty) | Previous / next track |
 | Click outside the menu | Close it |
+| Gear button (or tray icon > Settings…) | Open Settings |
 
 ### Uninstall
 
@@ -134,12 +140,19 @@ undone.
 
 ## Configuration
 
-The settings live in `%APPDATA%\Glint\config.toml`. Glint creates it on
-first run (keeping only the default pins that exist on your PC). Open it
-from the tray icon with **Open config file**. Save the file and the menu
-updates right away.
+The easy way to change settings is the **Settings** window (tray icon >
+**Settings…**, or the gear in the menu). Everything it changes is saved to
+`%APPDATA%\Glint\config.toml`, which you can also edit by hand. Glint
+creates it on first run (keeping only the default pins that exist on your
+PC). Open it from the tray icon with **Open config file**. Save the file and
+the menu (and an open Settings window) updates right away. Your comments in
+the file are kept when Glint saves.
 
 ```toml
+# The easy way to change these: right-click the Glint tray icon, then
+# "Settings…". Or edit this file: Glint watches it, so when you save, the
+# menu changes right away.
+
 # Pinned apps, in grid order, as app IDs (AppUserModelIDs).
 # The easy way to change them: right-click an app in the menu, then
 # "Pin to Glint" or "Unpin from Glint". Apps that aren't installed are skipped.
@@ -160,8 +173,11 @@ accent = "#8fa8ff"
 # (modifiers: Ctrl, Alt, Shift, Win). Empty = the Win key only.
 hotkey = ""
 
-# The pinned grid is never wider than this many icons (1 to 8).
-max_columns = 4
+# The pinned grid is never wider than this many icons (3 to 8).
+max_columns = 6
+
+# Show app names under the pinned icons.
+show_names = true
 
 # Start Glint when you sign in to Windows. You can also switch this with
 # "Start with Windows" in the tray icon's menu.
@@ -265,7 +281,8 @@ To run the leak test: `target\release\glint.exe --stress 1000`. It takes about
 
 - Clicking the real Start button opens the Windows Start menu, not Glint.
 - Search finds apps only (no files, settings or web results).
-- There is no settings window yet; settings are in `config.toml`.
+- Settings can't record hotkeys that use the Win key (Windows handles
+  those first); write them in `config.toml` instead.
 - Pins can't be reordered by dragging; edit their order in `config.toml`.
 - Glint has been tested on one PC so far. Multiple monitors, display scales
   other than the author's, a taskbar on the top or side, and real
@@ -278,7 +295,6 @@ To run the leak test: `target\release\glint.exe --stress 1000`. It takes about
 
 Ideas for after 0.1.0, not promises:
 
-- A small settings window
 - Drag to reorder pins
 - Opening Glint from the taskbar's Start button
 - Getting the leak test fully under 1 MB

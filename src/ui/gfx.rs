@@ -268,15 +268,17 @@ impl Gfx {
         ((dip * self.scale.get()).ceil() as i32).max(1)
     }
 
-    fn surface_size(&self, size: Vector2) -> SizeInt32 {
+    fn surface_size(size: Vector2, scale: f32) -> SizeInt32 {
+        let px = |dip: f32| ((dip * scale).ceil() as i32).max(1);
         SizeInt32 {
-            Width: self.px(size.X),
-            Height: self.px(size.Y),
+            Width: px(size.X),
+            Height: px(size.Y),
         }
     }
 
-    pub fn create_surface(&self, size: Vector2) -> Result<CompositionDrawingSurface> {
-        let px = self.surface_size(size);
+    /// A surface for `size` DIPs at DPI `scale`.
+    pub fn create_surface(&self, size: Vector2, scale: f32) -> Result<CompositionDrawingSurface> {
+        let px = Self::surface_size(size, scale);
         self.graphics.CreateDrawingSurface(
             Size {
                 Width: px.Width as f32,
@@ -292,6 +294,7 @@ impl Gfx {
     pub fn draw(
         &self,
         surface: &CompositionDrawingSurface,
+        scale: f32,
         paint: impl FnOnce(&ID2D1DeviceContext) -> Result<()>,
     ) -> Result<()> {
         let interop: ICompositionDrawingSurfaceInterop = surface.cast()?;
@@ -305,7 +308,6 @@ impl Gfx {
                 return Err(e);
             }
         };
-        let scale = self.scale.get();
         // SAFETY: plain state changes on the device context we were given.
         unsafe {
             // Surfaces live in a shared atlas; `offset` is where ours starts
@@ -610,11 +612,25 @@ pub struct Canvas {
     pub visual: SpriteVisual,
     surface: CompositionDrawingSurface,
     size: Cell<Vector2>,
+    /// `Some` = painted at this DPI scale (the Settings window, which can be
+    /// on another monitor); `None` = at the menu's scale (`Gfx::scale`).
+    own_scale: Cell<Option<f32>>,
 }
 
 impl Canvas {
     pub fn new(compositor: &Compositor, gfx: &Gfx, size: Vector2) -> Result<Self> {
-        let surface = gfx.create_surface(size)?;
+        Self::with_scale(compositor, gfx, size, None)
+    }
+
+    /// A canvas painted at its own DPI scale (`Some`), not the menu's.
+    pub fn with_scale(
+        compositor: &Compositor,
+        gfx: &Gfx,
+        size: Vector2,
+        own_scale: Option<f32>,
+    ) -> Result<Self> {
+        let scale = own_scale.unwrap_or_else(|| gfx.scale());
+        let surface = gfx.create_surface(size, scale)?;
         let brush = compositor.CreateSurfaceBrushWithSurface(&surface)?;
         brush.SetStretch(CompositionStretch::Fill)?;
         let visual = compositor.CreateSpriteVisual()?;
@@ -624,7 +640,18 @@ impl Canvas {
             visual,
             surface,
             size: Cell::new(size),
+            own_scale: Cell::new(own_scale),
         })
+    }
+
+    fn scale(&self, gfx: &Gfx) -> f32 {
+        self.own_scale.get().unwrap_or_else(|| gfx.scale())
+    }
+
+    /// For a canvas with its own scale: the new one. Repaint afterwards.
+    pub fn set_own_scale(&self, gfx: &Gfx, scale: f32) -> Result<()> {
+        self.own_scale.set(Some(scale));
+        self.resize(gfx, self.size.get())
     }
 
     pub fn size(&self) -> Vector2 {
@@ -635,12 +662,13 @@ impl Canvas {
     pub fn resize(&self, gfx: &Gfx, size: Vector2) -> Result<()> {
         self.size.set(size);
         self.visual.SetSize(size)?;
-        self.surface.Resize(gfx.surface_size(size))
+        self.surface
+            .Resize(Gfx::surface_size(size, self.scale(gfx)))
     }
 
     /// Places the canvas at (x, y) DIPs, snapped to whole pixels.
     pub fn set_offset(&self, gfx: &Gfx, x: f32, y: f32) -> Result<()> {
-        let s = gfx.scale();
+        let s = self.scale(gfx);
         self.visual.SetOffset(windows_numerics::Vector3 {
             X: snap(x, s),
             Y: snap(y, s),
@@ -653,6 +681,6 @@ impl Canvas {
         gfx: &Gfx,
         paint: impl FnOnce(&ID2D1DeviceContext) -> Result<()>,
     ) -> Result<()> {
-        gfx.draw(&self.surface, paint)
+        gfx.draw(&self.surface, self.scale(gfx), paint)
     }
 }

@@ -32,6 +32,11 @@ impl Rgb {
         Self { r, g, b }
     }
 
+    /// "#rrggbb", as written in config.toml.
+    pub fn hex(self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+    }
+
     /// Parses "#rrggbb" (the leading # is optional).
     pub fn parse(s: &str) -> Option<Self> {
         let hex = s.trim().trim_start_matches('#');
@@ -257,16 +262,63 @@ impl Hotkey {
         }
         Ok(key)
     }
+
+    /// A hotkey from keys pressed in Settings' recorder, if it is one that
+    /// `parse` accepts (so the file never gets a value it would reject).
+    pub fn from_keys(ctrl: bool, alt: bool, shift: bool, win: bool, vk: u16) -> Option<Self> {
+        let name = key_name(vk)?;
+        let mut text = String::new();
+        for (on, m) in [(ctrl, "Ctrl"), (alt, "Alt"), (shift, "Shift"), (win, "Win")] {
+            if on {
+                text.push_str(m);
+                text.push('+');
+            }
+        }
+        text.push_str(&name);
+        Self::parse(&text).ok()
+    }
+}
+
+/// The name config.toml uses for a virtual-key code (the reverse of
+/// `vk_for`). `None` for keys a hotkey can't use (modifiers alone...).
+pub fn key_name(vk: u16) -> Option<String> {
+    let c = u8::try_from(vk).ok()?;
+    if c.is_ascii_uppercase() || c.is_ascii_digit() {
+        return Some(char::from(c).to_string());
+    }
+    if (0x70..=0x87).contains(&vk) {
+        return Some(format!("F{}", vk - 0x70 + 1));
+    }
+    let name = match vk {
+        0x20 => "Space",
+        0x0D => "Enter",
+        0x09 => "Tab",
+        0x08 => "Backspace",
+        0x2D => "Insert",
+        0x2E => "Delete",
+        0x24 => "Home",
+        0x23 => "End",
+        0x21 => "PageUp",
+        0x22 => "PageDown",
+        0x25 => "Left",
+        0x26 => "Up",
+        0x27 => "Right",
+        0x28 => "Down",
+        0xC0 => "`",
+        _ => return None,
+    };
+    Some(name.to_string())
 }
 
 /// The virtual-key code for a key name: A–Z, 0–9, F1–F24 and a few named
 /// keys.
 fn vk_for(name: &str) -> Option<u16> {
     let upper = name.to_ascii_uppercase();
-    if upper.len() == 1 {
-        let c = upper.as_bytes()[0];
+    if let [c] = upper.as_bytes()
+        && c.is_ascii_alphanumeric()
+    {
         // Letters and digits have the same code as their ASCII uppercase.
-        return c.is_ascii_alphanumeric().then_some(u16::from(c));
+        return Some(u16::from(*c));
     }
     if let Some(n) = upper.strip_prefix('F').and_then(|n| n.parse::<u16>().ok()) {
         return (1..=24).contains(&n).then_some(0x70 + n - 1);
@@ -327,8 +379,20 @@ fn unit<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
 fn angle<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
     in_range(d, -360.0, 360.0)
 }
+/// The fewest and most grid columns.
+pub const MIN_COLUMNS: usize = 3;
+pub const MAX_COLUMNS: usize = 8;
+/// The default number of columns (milestone 8: was 4).
+pub const DEFAULT_COLUMNS: usize = 6;
+
+/// 3 to 8 columns. Files from before milestone 8 could say 1 or 2: those
+/// still load, raised to 3 (and logged), instead of being an error.
 fn columns<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
-    in_range(d, 1, 8)
+    let n = in_range(d, 1, MAX_COLUMNS)?;
+    if n < MIN_COLUMNS {
+        log_info!("config.toml: max_columns = {n} is below {MIN_COLUMNS}; using {MIN_COLUMNS}");
+    }
+    Ok(n.max(MIN_COLUMNS))
 }
 fn duration<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     in_range(d, 0, 3000)
@@ -492,9 +556,11 @@ pub struct Config {
     /// Extra shortcut that toggles the menu (`None` = Win key only).
     #[serde(deserialize_with = "hotkey")]
     pub hotkey: Option<Hotkey>,
-    /// The grid never gets wider than this many columns.
+    /// The grid never gets wider than this many columns (3–8).
     #[serde(deserialize_with = "columns")]
     pub max_columns: usize,
+    /// App names under the pinned icons.
+    pub show_names: bool,
     /// Start Glint when you sign in to Windows (the HKCU `Run` key).
     pub autostart: bool,
     pub background: Background,
@@ -509,12 +575,36 @@ impl Default for Config {
             pinned: DEFAULT_PINS.map(String::from).to_vec(),
             accent: Accent::Color(DEFAULT_ACCENT),
             hotkey: None,
-            max_columns: 4,
+            max_columns: DEFAULT_COLUMNS,
+            show_names: true,
             autostart: false,
             background: Background::default(),
             music: Music::default(),
             animation: Animation::default(),
             stats: Stats::default(),
+        }
+    }
+}
+
+impl Config {
+    /// Settings' "Reset to defaults": every setting back to its default,
+    /// except the pinned apps, the launch counts and "Start with Windows".
+    pub fn reset_keeping(&self) -> Self {
+        Self {
+            pinned: self.pinned.clone(),
+            autostart: self.autostart,
+            stats: self.stats.clone(),
+            ..Self::default()
+        }
+    }
+}
+
+impl Accent {
+    /// As written in config.toml: "system" or "#rrggbb".
+    pub fn text(self) -> String {
+        match self {
+            Self::System => "system".to_string(),
+            Self::Color(c) => c.hex(),
         }
     }
 }
@@ -621,7 +711,9 @@ pub fn load(path: &Path) -> Result<Option<Config>, ConfigError> {
 /// replaced by the default pins that exist on this PC.
 const TEMPLATE: &str = r##"# Glint settings.
 #
-# Glint watches this file: save it and the menu changes right away.
+# The easy way to change these: right-click the Glint tray icon, then
+# "Settings…". Or edit this file: Glint watches it, so when you save, the
+# menu changes right away.
 # If something here is wrong, Glint keeps the last good settings and tells
 # you the line number (a tray notification, and the log in
 # %LOCALAPPDATA%\Glint\log.txt). Delete this file to get the defaults back.
@@ -639,8 +731,11 @@ accent = "#8fa8ff"
 # (modifiers: Ctrl, Alt, Shift, Win). Empty = the Win key only.
 hotkey = ""
 
-# The pinned grid is never wider than this many icons (1 to 8).
-max_columns = 4
+# The pinned grid is never wider than this many icons (3 to 8).
+max_columns = 6
+
+# Show app names under the pinned icons.
+show_names = true
 
 # Start Glint when you sign in to Windows. You can also switch this with
 # "Start with Windows" in the tray icon's menu.
@@ -856,13 +951,147 @@ fn remove_keeping_comment(array: &mut Array, i: usize) {
 /// Sets `autostart = on`, keeping the line's comments. Added (after the
 /// other top-level settings) if the file doesn't have it yet.
 pub fn set_autostart(doc: &mut DocumentMut, on: bool) {
-    if let Some(value) = doc.get_mut("autostart").and_then(Item::as_value_mut) {
-        let decor = value.decor().clone();
-        *value = Value::from(on);
-        *value.decor_mut() = decor;
+    set_key(doc, None, "autostart", Value::from(on));
+}
+
+/// Sets `key` (in `[table]`, or at the top for `None`) to `value`. An
+/// existing line keeps its spacing and comment; a missing one is added
+/// (and a missing table too).
+fn set_key(doc: &mut DocumentMut, table: Option<&str>, key: &str, value: Value) {
+    let target: &mut dyn toml_edit::TableLike = match table {
+        None => doc.as_table_mut(),
+        Some(name) => {
+            let item = doc.entry(name).or_insert_with(|| Item::Table(Table::new()));
+            match item.as_table_like_mut() {
+                Some(t) => t,
+                None => return,
+            }
+        }
+    };
+    if let Some(old) = target.get_mut(key).and_then(Item::as_value_mut) {
+        let decor = old.decor().clone();
+        *old = value;
+        *old.decor_mut() = decor;
     } else {
-        doc.insert("autostart", toml_edit::value(on));
+        target.insert(key, Item::Value(value));
     }
+}
+
+/// A number with at most `places` decimals, so the file says `0.25` and
+/// not `0.25000000372529`. Whole numbers are written without a dot.
+fn number(x: f32, places: i32) -> Value {
+    let f = 10f64.powi(places);
+    let r = (f64::from(x) * f).round() / f;
+    if r.fract() == 0.0 {
+        Value::from(r as i64)
+    } else {
+        Value::from(r)
+    }
+}
+
+/// Writes every setting that differs between `old` (what the file holds)
+/// and `new` (what Settings shows). Unchanged lines stay exactly as they
+/// are. Pins and launch counts have their own functions above.
+pub fn save_changes(doc: &mut DocumentMut, old: &Config, new: &Config) {
+    let mut put = |changed: bool, table: Option<&str>, key: &str, value: Value| {
+        if changed {
+            set_key(doc, table, key, value);
+        }
+    };
+    put(
+        old.accent != new.accent,
+        None,
+        "accent",
+        Value::from(new.accent.text()),
+    );
+    let hotkey = new
+        .hotkey
+        .as_ref()
+        .map_or(String::new(), |k| k.text.clone());
+    put(
+        old.hotkey != new.hotkey,
+        None,
+        "hotkey",
+        Value::from(hotkey),
+    );
+    put(
+        old.max_columns != new.max_columns,
+        None,
+        "max_columns",
+        Value::from(new.max_columns as i64),
+    );
+    put(
+        old.show_names != new.show_names,
+        None,
+        "show_names",
+        Value::from(new.show_names),
+    );
+    put(
+        old.autostart != new.autostart,
+        None,
+        "autostart",
+        Value::from(new.autostart),
+    );
+
+    let (ob, nb) = (&old.background, &new.background);
+    let bg = Some("background");
+    put(ob.mode != nb.mode, bg, "mode", Value::from(nb.mode.name()));
+    put(
+        ob.preset != nb.preset,
+        bg,
+        "preset",
+        Value::from(nb.preset.name()),
+    );
+    let colors: Array = nb.colors.iter().map(|c| c.hex()).collect();
+    put(ob.colors != nb.colors, bg, "colors", Value::Array(colors));
+    put(ob.angle != nb.angle, bg, "angle", number(nb.angle, 0));
+    put(
+        ob.overlay != nb.overlay,
+        bg,
+        "overlay",
+        number(nb.overlay, 2),
+    );
+    put(ob.tint != nb.tint, bg, "tint", number(nb.tint, 2));
+    put(
+        ob.tint_from_album != nb.tint_from_album,
+        bg,
+        "tint_from_album",
+        Value::from(nb.tint_from_album),
+    );
+
+    put(
+        old.music.enabled != new.music.enabled,
+        Some("music"),
+        "enabled",
+        Value::from(new.music.enabled),
+    );
+
+    let (oa, na) = (&old.animation, &new.animation);
+    let anim = Some("animation");
+    put(
+        oa.open_ms != na.open_ms,
+        anim,
+        "open_ms",
+        Value::from(i64::from(na.open_ms)),
+    );
+    put(
+        oa.close_ms != na.close_ms,
+        anim,
+        "close_ms",
+        Value::from(i64::from(na.close_ms)),
+    );
+    put(
+        oa.stagger_ms != na.stagger_ms,
+        anim,
+        "stagger_ms",
+        Value::from(i64::from(na.stagger_ms)),
+    );
+    put(
+        oa.overshoot != na.overshoot,
+        anim,
+        "overshoot",
+        number(na.overshoot, 2),
+    );
 }
 
 /// Writes the launch counts into `[stats.launch_counts]`, one line per app.
@@ -1004,6 +1233,99 @@ mod tests {
         assert!(Hotkey::parse("Hyper+S").is_err());
         assert!(Hotkey::parse("Alt+").is_err());
         assert!(Hotkey::parse("Alt+F25").is_err());
+    }
+
+    #[test]
+    fn columns_default_to_6_and_old_small_values_become_3() {
+        assert_eq!(Config::default().max_columns, 6);
+        assert_eq!(parse("max_columns = 1").unwrap().max_columns, 3);
+        assert_eq!(parse("max_columns = 2").unwrap().max_columns, 3);
+        assert_eq!(parse("max_columns = 4").unwrap().max_columns, 4);
+        assert_eq!(parse("max_columns = 8").unwrap().max_columns, 8);
+        assert_eq!(parse("max_columns = 9").unwrap_err().line, Some(1));
+        assert!(Config::default().show_names);
+        assert!(!parse("show_names = false").unwrap().show_names);
+    }
+
+    #[test]
+    fn hotkeys_from_recorded_keys() {
+        let k = Hotkey::from_keys(false, true, false, false, 0x20).unwrap();
+        assert_eq!(k.text, "Alt+Space");
+        assert_eq!(Hotkey::parse(&k.text).unwrap(), k);
+        let k = Hotkey::from_keys(true, false, true, false, u16::from(b'K')).unwrap();
+        assert_eq!(k.text, "Ctrl+Shift+K");
+        assert_eq!(
+            Hotkey::from_keys(false, false, false, false, 0x70)
+                .unwrap()
+                .text,
+            "F1"
+        );
+        // Not allowed: a plain letter, Shift+letter, a modifier key alone.
+        assert!(Hotkey::from_keys(false, false, false, false, u16::from(b'K')).is_none());
+        assert!(Hotkey::from_keys(false, false, true, false, u16::from(b'K')).is_none());
+        assert!(Hotkey::from_keys(true, false, false, false, 0x11).is_none());
+        // Every key name reads back as the same key.
+        for vk in 0u16..=0xFF {
+            if let Some(name) = key_name(vk) {
+                assert_eq!(vk_for(&name), Some(vk), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn reset_keeps_pins_counts_and_autostart() {
+        let mut c = parse(
+            "pinned = [\"a\"]\nautostart = true\nmax_columns = 3\n[stats.launch_counts]\na = 2\n",
+        )
+        .unwrap();
+        c.background.overlay = 0.5;
+        let r = c.reset_keeping();
+        assert_eq!(r.pinned, ["a"]);
+        assert!(r.autostart);
+        assert_eq!(r.stats.launch_counts["a"], 2);
+        assert_eq!(r.max_columns, 6);
+        assert_eq!(r.background, Background::default());
+    }
+
+    #[test]
+    fn saving_changes_touches_only_changed_lines() {
+        let text = default_text(&pins(&["a"]));
+        let old = parse(&text).unwrap();
+        let mut new = old.clone();
+        new.max_columns = 8;
+        new.show_names = false;
+        new.accent = Accent::System;
+        new.hotkey = Hotkey::parse("Alt+Space").ok();
+        new.background.mode = BackgroundMode::Solid;
+        new.background.preset = Preset::Custom;
+        new.background.colors = vec![Rgb::new(1, 2, 3), Rgb::new(0xff, 0, 0x10)];
+        new.background.angle = 90.0;
+        new.background.overlay = 0.25;
+        new.background.tint = 0.4;
+        new.music.enabled = false;
+        new.animation.open_ms = 500;
+        new.animation.overshoot = 1.4;
+        let mut doc: DocumentMut = text.parse().unwrap();
+        save_changes(&mut doc, &old, &new);
+        let out = doc.to_string();
+        assert_eq!(parse(&out).unwrap(), new, "{out}");
+        assert!(out.contains("overlay = 0.25\n"), "{out}");
+        assert!(out.contains("overshoot = 1.4\n"), "{out}");
+        assert!(out.contains("angle = 90\n"), "{out}");
+        assert!(out.contains("colors = [\"#010203\", \"#ff0010\"]"), "{out}");
+        // Comments stay; untouched lines are byte for byte the same.
+        assert!(out.contains("# How much to darken the background"), "{out}");
+        assert!(out.contains("close_ms = 170\n"), "{out}");
+        // Nothing changed: nothing written.
+        let mut doc: DocumentMut = text.parse().unwrap();
+        save_changes(&mut doc, &old, &old);
+        assert_eq!(doc.to_string(), text);
+        // A file missing the lines and tables still gets them.
+        let mut doc: DocumentMut = "pinned = []\n".parse().unwrap();
+        save_changes(&mut doc, &Config::default(), &new);
+        let mut want = new.clone();
+        want.pinned.clear();
+        assert_eq!(parse(&doc.to_string()).unwrap(), want, "{doc}");
     }
 
     #[test]

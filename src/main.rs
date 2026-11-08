@@ -19,6 +19,7 @@ mod icons;
 mod media;
 mod power;
 mod search;
+mod settings;
 mod settings_watch;
 mod stress;
 mod tray;
@@ -53,18 +54,19 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::Ime::ISC_SHOWUICOMPOSITIONWINDOW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, TME_LEAVE,
-    TRACKMOUSEEVENT, TrackMouseEvent, UnregisterHotKey, VK_CONTROL, VK_ESCAPE, VK_SHIFT,
+    TRACKMOUSEEVENT, TrackMouseEvent, UnregisterHotKey, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW, HTCLIENT,
     IDC_IBEAM, KillTimer, LoadCursorW, MSG, PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE,
-    PostMessageW, PostQuitMessage, RegisterWindowMessageW, SC_KEYMENU, SW_SHOWNORMAL, SetCursor,
-    SetTimer, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE,
-    WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_HOTKEY, WM_IME_COMPOSITION,
-    WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_POWERBROADCAST, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WM_WTSSESSION_CHANGE,
+    PostMessageW, PostQuitMessage, RegisterWindowMessageW, SC_KEYMENU, SW_SHOWNORMAL,
+    SWP_NOACTIVATE, SWP_NOZORDER, SetCursor, SetTimer, TranslateMessage, WA_INACTIVE, WM_ACTIVATE,
+    WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION,
+    WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_HOTKEY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_POWERBROADCAST, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WM_WTSSESSION_CHANGE,
     WTS_SESSION_UNLOCK,
 };
 use windows::core::{Result, w};
@@ -140,8 +142,20 @@ struct App {
     accent: Cell<Rgb>,
     /// `--stress N` is running (the leak test).
     stress: Option<stress::Stress>,
-    /// Trim memory once the menu is hidden again (after a GPU reset).
+    /// Trim memory once the menu is hidden again (after a GPU reset, or
+    /// after Settings closed).
     trim_after_close: Cell<bool>,
+    /// The Settings window, while it is open (milestone 8). While it is,
+    /// the menu is its live preview: placed beside it, not topmost, and
+    /// it doesn't close when it loses the focus.
+    settings_window: RefCell<Option<settings::SettingsWindow>>,
+    /// What config.toml holds (as last loaded or saved), so a save from
+    /// Settings writes only the lines that changed.
+    file_config: RefCell<Config>,
+    /// Settings changed something that isn't saved yet.
+    settings_dirty: Cell<bool>,
+    /// The hotkey is switched off while Settings records a new one.
+    hotkey_paused: Cell<bool>,
 }
 
 /// WM_TIMER id: an app was installed or removed; wait until things settle.
@@ -159,6 +173,13 @@ const TIMER_SAVE_STATS: usize = 5;
 const SAVE_STATS_MS: u32 = 5000;
 /// RegisterHotKey id for the `hotkey` setting.
 const HOTKEY_ID: i32 = 1;
+/// WM_TIMER id: save what Settings changed (300 ms after the last change,
+/// so dragging a slider writes the file once). Id 6 is the stress test's.
+const TIMER_SETTINGS_SAVE: usize = 7;
+const SETTINGS_SAVE_MS: u32 = 300;
+/// WM_TIMER id: an animation value changed in Settings; replay the open
+/// animation once it stops changing.
+const TIMER_REPLAY: usize = 8;
 
 /// The accent color to draw with.
 fn resolve_accent(config: &Config, settings: &SettingsWatch) -> Rgb {
@@ -259,11 +280,45 @@ impl App {
     /// The window fits the tallest the menu can get (8 search results or
     /// the grid), so it never moves while the menu grows or shrinks.
     fn placement(&self) -> Placement {
-        let size = self.ui.max_size();
-        window::placement(size.X, size.Y)
+        self.placement_for(self.ui.max_size())
+    }
+
+    /// Where a window for a `size` DIPs menu goes: above the taskbar, or,
+    /// while Settings is open, beside the Settings window.
+    fn placement_for(&self, size: windows_numerics::Vector2) -> Placement {
+        match self.preview_anchor() {
+            Some((rect, _)) => window::placement_beside(size.X, size.Y, rect),
+            None => window::placement(size.X, size.Y),
+        }
+    }
+
+    /// Settings is open: its screen rect and window handle.
+    fn preview_anchor(&self) -> Option<(windows::Win32::Foundation::RECT, HWND)> {
+        self.settings_window
+            .borrow()
+            .as_ref()
+            .map(|s| (s.screen_rect(), s.hwnd()))
+    }
+
+    fn in_preview(&self) -> bool {
+        self.settings_window.borrow().is_some()
+    }
+
+    /// Shows the menu window at `p`: topmost, or just below Settings.
+    fn show_window(&self, p: &Placement) {
+        match self.preview_anchor() {
+            Some((_, settings)) => window::show_below(self.hwnd, p, settings),
+            None => window::show(self.hwnd, p),
+        }
     }
 
     fn open(&self) {
+        self.open_with(true);
+    }
+
+    /// Opens the menu. `focus` = give it the keyboard (not for the
+    /// Settings preview, which leaves the keyboard with Settings).
+    fn open_with(&self, focus: bool) {
         self.generation.set(self.generation.get() + 1);
         let fresh = !self.is_visible.get();
         if fresh {
@@ -277,7 +332,7 @@ impl App {
             log_err("layout", self.ui.set_layout(&p));
             // Covers are decoded for this monitor's DPI.
             self.media.set_cover_px(self.ui.cover_px());
-            window::show(self.hwnd, &p);
+            self.show_window(&p);
             self.placement.set(Some(p));
             self.is_visible.set(true);
         }
@@ -293,7 +348,7 @@ impl App {
         );
         // The stress test types through the UI directly and never takes the
         // keyboard away from whatever you are doing meanwhile.
-        if self.stress.is_none() && !window::take_focus(self.hwnd) {
+        if focus && self.stress.is_none() && !window::take_focus(self.hwnd) {
             // SAFETY: posts a plain message (no pointers) to our window.
             let _ =
                 unsafe { PostMessageW(Some(self.hwnd), WM_APP_FOCUS_RETRY, WPARAM(0), LPARAM(0)) };
@@ -322,6 +377,7 @@ impl App {
         match action {
             Action::None => {}
             Action::Close => self.close(),
+            Action::OpenSettings => self.open_settings(true),
             Action::OpenAccountSettings => {
                 self.close();
                 // SAFETY: opens a static URI; no pointers are kept.
@@ -399,9 +455,13 @@ impl App {
         let Some(path) = self.config_path.clone() else {
             return;
         };
+        // Something Settings changed and hasn't saved yet goes into the
+        // file first; otherwise this reload would undo it.
+        self.save_settings();
         match config::load(&path) {
             Ok(Some(new)) => {
-                self.apply_config(new);
+                *self.file_config.borrow_mut() = new.clone();
+                self.apply_config(new, "config.toml reloaded");
                 if manual {
                     self.tray.notify("Glint", "config.toml reloaded.", false);
                 }
@@ -410,7 +470,8 @@ impl App {
                 // Deleted: back to the defaults (that's what deleting means).
                 log_info!("config.toml was deleted; writing the defaults again");
                 let fresh = write_default_config(&path);
-                self.apply_config(fresh);
+                *self.file_config.borrow_mut() = fresh.clone();
+                self.apply_config(fresh, "config.toml reloaded");
             }
             Err(e) => self.config_error(&e, false),
         }
@@ -437,8 +498,9 @@ impl App {
     }
 
     /// Switches to `new`, changing only what is different. Reloading the
-    /// file Glint itself just saved therefore does nothing.
-    fn apply_config(&self, new: Config) {
+    /// file Glint itself just saved therefore does nothing. `why` is for
+    /// the log.
+    fn apply_config(&self, new: Config, why: &str) {
         let old = self.config.replace(new.clone());
         let mut changed = Vec::new();
         if old.background != new.background {
@@ -456,6 +518,10 @@ impl App {
         if old.pinned != new.pinned || old.max_columns != new.max_columns {
             changed.push("pins");
             self.apply_pins();
+        }
+        if old.show_names != new.show_names {
+            changed.push("app names");
+            log_err("app names", self.ui.set_show_names(new.show_names));
         }
         if old.autostart != new.autostart {
             changed.push("autostart");
@@ -481,7 +547,12 @@ impl App {
             }
         }
         if !changed.is_empty() {
-            log_info!("config.toml reloaded: {}", changed.join(", "));
+            log_info!("{why}: {}", changed.join(", "));
+            // An open Settings window shows the new values (a no-op when
+            // the change came from Settings itself).
+            if let Some(s) = self.settings_window.borrow().as_ref() {
+                s.sync(self.ui.gfx(), &self.config.borrow());
+            }
         }
     }
 
@@ -491,6 +562,9 @@ impl App {
         let accent = resolve_accent(&self.config.borrow(), &self.settings);
         if self.accent.replace(accent) != accent {
             log_err("accent color", self.ui.set_accent(accent));
+            if let Some(s) = self.settings_window.borrow().as_ref() {
+                s.set_accent(self.ui.gfx(), accent);
+            }
         }
     }
 
@@ -506,11 +580,11 @@ impl App {
             if !shown {
                 return None;
             }
-            let p = window::placement(size.X, size.Y);
+            let p = self.placement_for(size);
             if self.placement.get() == Some(p) {
                 return None;
             }
-            window::show(self.hwnd, &p);
+            self.show_window(&p);
             self.placement.set(Some(p));
             Some(p)
         });
@@ -544,6 +618,7 @@ impl App {
             return;
         }
         log_info!("{} {id}", if pin { "pinned" } else { "unpinned" });
+        self.file_config.borrow_mut().pinned = pins.clone();
         self.config.borrow_mut().pinned = pins;
         self.apply_pins();
     }
@@ -565,8 +640,311 @@ Fix the file, then try again."
             );
             return;
         }
+        self.file_config.borrow_mut().autostart = on;
         self.config.borrow_mut().autostart = on;
         autostart::sync(on);
+        if let Some(s) = self.settings_window.borrow().as_ref() {
+            s.sync(self.ui.gfx(), &self.config.borrow());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The Settings window (milestone 8)
+    // -----------------------------------------------------------------------
+
+    /// Opens Settings (or brings it to the front), with the menu open
+    /// beside it as a live preview. `activate` = give Settings the
+    /// keyboard and open the preview (false only in the stress test, which
+    /// opens the menu itself).
+    fn open_settings(&self, activate: bool) {
+        if let Some((_, hwnd)) = self.preview_anchor() {
+            settings::show(hwnd, true);
+            return;
+        }
+        let at = settings::initial_rect(self.ui.max_size().X);
+        let opened = settings::SettingsWindow::open(
+            Some(settings_wndproc),
+            at,
+            self.ui.compositor(),
+            self.ui.gfx(),
+            &self.config.borrow(),
+            self.accent.get(),
+            self.settings.effects(),
+        );
+        let hwnd = match opened {
+            Ok(w) => {
+                let hwnd = w.hwnd();
+                *self.settings_window.borrow_mut() = Some(w);
+                hwnd
+            }
+            Err(e) => {
+                log_error!("opening Settings failed: {e}");
+                return;
+            }
+        };
+        if self.stress.is_none() {
+            log_info!("settings opened");
+        }
+        // The preview: a closed menu opens beside Settings; an open one (or
+        // one still closing) moves there and stops being topmost.
+        if activate && !self.is_open.get() {
+            self.open_with(false);
+        }
+        self.reposition(true);
+        settings::show(hwnd, activate);
+    }
+
+    /// Closes Settings: saves what isn't saved, drops the window and all
+    /// it made, and closes the preview. Memory is handed back afterwards.
+    fn close_settings(&self) {
+        self.save_settings();
+        // Taken out first, so nothing is borrowed while it is destroyed
+        // (destroying sends it messages).
+        let window = self.settings_window.borrow_mut().take();
+        let Some(window) = window else {
+            return;
+        };
+        drop(window);
+        if self.stress.is_none() {
+            log_info!("settings closed");
+        }
+        // SAFETY: stops our own one-shot timer (if it is running).
+        let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_REPLAY) };
+        if self.hotkey_paused.replace(false) {
+            self.register_hotkey();
+        }
+        // Settings' fonts, surfaces and scratch memory are free now: hand
+        // them back (once the preview's close animation is over).
+        if self.is_visible.get() {
+            self.trim_after_close.set(true);
+            self.close();
+        } else {
+            self.ui.release_caches();
+            trim_memory();
+        }
+    }
+
+    /// Carries out what Settings asked for (with nothing borrowed: the
+    /// color picker runs its own message loop).
+    fn run_settings(&self, action: settings::Action) {
+        use settings::Action as A;
+        match action {
+            A::None => {}
+            A::Apply(new) => self.apply_from_settings(*new),
+            A::PickColor(target) => {
+                let Some((hwnd, start)) = self
+                    .settings_window
+                    .borrow()
+                    .as_ref()
+                    .map(|s| (s.hwnd(), s.current_color(target)))
+                else {
+                    return;
+                };
+                let Some(color) = settings::choose_color(hwnd, start) else {
+                    return;
+                };
+                let next = self
+                    .settings_window
+                    .borrow()
+                    .as_ref()
+                    .map(|s| s.color_picked(self.ui.gfx(), target, color));
+                if let Some(next) = next {
+                    self.run_settings(next);
+                }
+            }
+            A::Replay => {
+                // SAFETY: stops our own one-shot timer (if it is running).
+                let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_REPLAY) };
+                self.replay();
+            }
+            A::Recording(true) => {
+                if self.hotkey_on.replace(false) {
+                    // SAFETY: removes the hotkey we registered on our window.
+                    let _ = unsafe { UnregisterHotKey(Some(self.hwnd), HOTKEY_ID) };
+                }
+                self.hotkey_paused.set(true);
+            }
+            A::Recording(false) => {
+                if self.hotkey_paused.replace(false) {
+                    self.register_hotkey();
+                }
+            }
+            A::OpenConfigFile => match &self.config_path {
+                Some(path) => apps::open_document(path.clone()),
+                None => log_warn!("no config file (APPDATA is not set)"),
+            },
+            A::OpenUrl(url) => {
+                let url = windows::core::HSTRING::from(url);
+                // SAFETY: opens a URL; `url` outlives the call.
+                let result =
+                    unsafe { ShellExecuteW(None, w!("open"), &url, None, None, SW_SHOWNORMAL) };
+                if result.0 as isize <= 32 {
+                    log_error!("opening {url} failed ({})", result.0 as isize);
+                }
+            }
+            A::Close => self.close_settings(),
+        }
+    }
+
+    /// A change from Settings: the menu shows it now, the file gets it
+    /// 300 ms after the last change.
+    fn apply_from_settings(&self, new: Config) {
+        let (animation_changed, same_hotkey) = {
+            let c = self.config.borrow();
+            (c.animation != new.animation, c.hotkey == new.hotkey)
+        };
+        self.apply_config(new, "settings");
+        // A recording that ended without a new hotkey: switch it back on.
+        // (A new one was registered by `apply_config`.)
+        if self.hotkey_paused.replace(false) && same_hotkey {
+            self.register_hotkey();
+        }
+        self.settings_dirty.set(true);
+        // SAFETY: one-shot timers on our own window; setting one again
+        // restarts its wait.
+        unsafe {
+            SetTimer(Some(self.hwnd), TIMER_SETTINGS_SAVE, SETTINGS_SAVE_MS, None);
+            if animation_changed {
+                SetTimer(Some(self.hwnd), TIMER_REPLAY, SETTINGS_SAVE_MS, None);
+            }
+        }
+    }
+
+    /// Plays the open animation again (the preview opens if it was closed).
+    fn replay(&self) {
+        if self.is_open.get() {
+            log_err("replay", self.ui.replay_open(self.reduced_motion()));
+        } else if self.in_preview() {
+            self.open_with(false);
+        }
+    }
+
+    /// Writes what Settings changed to config.toml, keeping everything
+    /// else in the file (comments too) as it is.
+    fn save_settings(&self) {
+        // SAFETY: stops our own one-shot timer (if it is running).
+        let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SETTINGS_SAVE) };
+        if !self.settings_dirty.replace(false) {
+            return;
+        }
+        let Some(path) = &self.config_path else {
+            return;
+        };
+        let old = self.file_config.borrow().clone();
+        let new = self.config.borrow().clone();
+        match config::edit(path, |doc| config::save_changes(doc, &old, &new)) {
+            Ok(()) => *self.file_config.borrow_mut() = new,
+            Err(e) => {
+                log_error!("saving settings failed: config.toml {e}");
+                self.tray.notify(
+                    "Settings not saved",
+                    &format!("config.toml {e}\nFix the file, then change the setting again."),
+                    true,
+                );
+            }
+        }
+    }
+
+    /// A message for the Settings window. `None` = let Windows handle it.
+    fn on_settings_message(&self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+        let gfx = self.ui.gfx();
+        // Runs `f` on the window (if it is open) and returns what it asked
+        // for. Only borrowed (never taken) here, so nested messages are fine.
+        let with = |f: &dyn Fn(&settings::SettingsWindow) -> settings::Action| {
+            self.settings_window
+                .borrow()
+                .as_ref()
+                .map_or(settings::Action::None, f)
+        };
+        let action = match msg {
+            WM_CLOSE => {
+                self.close_settings();
+                return Some(LRESULT(0));
+            }
+            WM_SIZE => with(&|s| {
+                s.resized(gfx);
+                settings::Action::None
+            }),
+            WM_DPICHANGED => {
+                let dpi = (wparam.0 & 0xFFFF) as u32;
+                with(&|s| {
+                    s.set_dpi(gfx, dpi);
+                    settings::Action::None
+                });
+                // SAFETY: for WM_DPICHANGED, lParam points to the suggested
+                // window rect, valid during the message.
+                if let (Some(r), Some((_, hwnd))) = (
+                    unsafe { (lparam.0 as *const windows::Win32::Foundation::RECT).as_ref() },
+                    self.preview_anchor(),
+                ) {
+                    // SAFETY: moves our own window to the suggested rect.
+                    let _ = unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                            hwnd,
+                            None,
+                            r.left,
+                            r.top,
+                            r.right - r.left,
+                            r.bottom - r.top,
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        )
+                    };
+                }
+                return Some(LRESULT(0));
+            }
+            // Settings was moved: the preview follows it.
+            WM_EXITSIZEMOVE => {
+                self.reposition(true);
+                return None;
+            }
+            WM_MOUSEMOVE => {
+                let (x, y) = mouse_xy(lparam);
+                with(&|s| s.mouse_move(gfx, x, y))
+            }
+            WM_MOUSELEAVE => with(&|s| {
+                s.mouse_leave();
+                settings::Action::None
+            }),
+            WM_LBUTTONDOWN => {
+                let (x, y) = mouse_xy(lparam);
+                with(&|s| s.mouse_down(gfx, x, y))
+            }
+            WM_LBUTTONUP => {
+                let (x, y) = mouse_xy(lparam);
+                with(&|s| s.mouse_up(gfx, x, y))
+            }
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                let recording = self
+                    .settings_window
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|s| s.is_recording());
+                // Alt+F4 and the other system keys work as usual, except
+                // while a hotkey is being recorded.
+                if msg == WM_SYSKEYDOWN && !recording {
+                    return None;
+                }
+                let (ctrl, alt, shift) =
+                    (key_held(VK_CONTROL), key_held(VK_MENU), key_held(VK_SHIFT));
+                let vk = wparam.0 as u16;
+                with(&|s| s.key_down(gfx, vk, ctrl, alt, shift))
+            }
+            // Recording Alt+key must not open the window menu.
+            WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_KEYMENU => {
+                let recording = self
+                    .settings_window
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|s| s.is_recording());
+                if recording {
+                    return Some(LRESULT(0));
+                }
+                return None;
+            }
+            _ => return None,
+        };
+        self.run_settings(action);
+        Some(LRESULT(0))
     }
 
     /// Writes the launch counts to `[stats]` in config.toml, if any are new.
@@ -620,6 +998,11 @@ Fix the file, then try again."
             }
             Err(e) => {
                 log_warn!("hotkey {} not available: {e}", key.text);
+                if let Some(s) = self.settings_window.borrow().as_ref() {
+                    let note = format!("{} is already used by Windows or another app.", key.text);
+                    s.set_hotkey_note(self.ui.gfx(), Some(note));
+                    return;
+                }
                 self.tray.notify(
                     "Glint hotkey not available",
                     &format!("{} is already used by Windows or another app.", key.text),
@@ -693,6 +1076,12 @@ Fix the file, then try again."
                 self.reload_config(false);
             }
             TIMER_SAVE_STATS => self.save_stats(),
+            TIMER_SETTINGS_SAVE => self.save_settings(),
+            TIMER_REPLAY => {
+                // SAFETY: stops our own timer; it is one-shot.
+                let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_REPLAY) };
+                self.replay();
+            }
             stress::TIMER_STRESS => self.stress_close(),
             ui::TIMER_ICONS => self.ui.load_icons(),
             ui::TIMER_SEEK => log_err("music time", self.ui.music_tick()),
@@ -784,8 +1173,10 @@ Fix the file, then try again."
         }
     }
 
-    /// Re-place the open menu, e.g. after a DPI change.
-    fn reposition(&self) {
+    /// Re-place the open menu, e.g. after a DPI change, or beside Settings.
+    /// `always` = show the window again even if it stays put (to change
+    /// whether it is topmost).
+    fn reposition(&self, always: bool) {
         if !self.is_open.get() {
             return;
         }
@@ -793,14 +1184,19 @@ Fix the file, then try again."
         if self.placement.get() != Some(p) {
             log_err("layout", self.ui.set_layout(&p));
             self.media.set_cover_px(self.ui.cover_px());
-            window::show(self.hwnd, &p);
+            self.show_window(&p);
             self.placement.set(Some(p));
+        } else if always {
+            self.show_window(&p);
         }
     }
 
     fn apply_background(&self) {
         let effects = self.settings.effects();
         let config = self.config.borrow();
+        if let Some(s) = self.settings_window.borrow().as_ref() {
+            s.apply_background(&config, effects);
+        }
         match self.ui.apply_background(&config, effects) {
             Ok(applied) => {
                 let bg = &config.background;
@@ -872,6 +1268,10 @@ Fix the file, then try again."
         }
         let song = plan.music.then(|| stress::fake_song(n, plan.two_sources));
         log_err("stress: music card", self.ui.set_music(song));
+        if plan.settings {
+            // Opened without the keyboard; the menu opens beside it.
+            self.open_settings(false);
+        }
 
         self.open();
         // Let the open animation play fully, like a real open.
@@ -888,6 +1288,8 @@ Fix the file, then try again."
             log_err("stress: typing", self.ui.char_typed(unit));
         }
         self.run(self.ui.key_down(VK_ESCAPE.0, false, false));
+        // Closing Settings closes the preview too.
+        self.close_settings();
         self.close();
     }
 
@@ -904,6 +1306,7 @@ Fix the file, then try again."
                 let debug = key_held(VK_SHIFT);
                 let autostart = self.config.borrow().autostart;
                 match self.tray.show_menu(autostart, debug) {
+                    Some(TrayCommand::Settings) => self.open_settings(true),
                     Some(TrayCommand::Quit) => {
                         self.save_stats();
                         // SAFETY: posts WM_QUIT to this (the UI) thread.
@@ -933,7 +1336,10 @@ Fix the file, then try again."
         let (x, y) = mouse_xy(lparam);
         let on_menu = self.ui.menu_contains(x, y);
         if !on_menu {
-            self.close();
+            // The preview stays while Settings is open.
+            if !self.in_preview() {
+                self.close();
+            }
         } else if msg == WM_LBUTTONDOWN {
             self.run(self.ui.mouse_down(x, y, key_held(VK_SHIFT)));
         }
@@ -942,8 +1348,10 @@ Fix the file, then try again."
     /// Another window was activated: close. If that happens right after we
     /// opened, the user didn't do it, so log who took the focus.
     fn on_deactivate(&self, lparam: LPARAM) {
-        if self.stress.is_some() {
-            return; // the stress test closes the menu itself
+        // The stress test closes the menu itself; the preview stays open
+        // while you use Settings.
+        if self.stress.is_some() || self.in_preview() {
+            return;
         }
         let open_for = now_ms().saturating_sub(self.opened_at.get());
         if self.is_open.get() && open_for < 1500 {
@@ -970,6 +1378,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_APP_TOGGLE => {
                 app.toggle();
+                return LRESULT(0);
+            }
+            settings::WM_APP_OPEN_SETTINGS => {
+                app.open_settings(true);
                 return LRESULT(0);
             }
             WM_APP_TRAY => {
@@ -1107,6 +1519,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_APP_REDRAW => {
                 log_warn!("graphics device replaced; repainting");
                 log_err("repaint", app.ui.device_replaced());
+                if let Some(s) = app.settings_window.borrow().as_ref() {
+                    s.device_replaced(app.ui.gfx());
+                }
                 // The new device's driver memory is all in RAM (measured in
                 // milestone 7: +10 MB working set after the first reset, and
                 // nothing more on later ones). Hand it back, like at startup;
@@ -1125,7 +1540,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             // We size the window ourselves, so ignore the suggested rect.
             WM_DPICHANGED => {
-                app.reposition();
+                app.reposition(false);
                 return LRESULT(0);
             }
             // A monitor was plugged in or out, or a resolution changed: the
@@ -1161,6 +1576,28 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     // A tapped Alt (our focus workaround) must not open a window menu.
     if msg == WM_SYSCOMMAND && (wparam.0 & 0xFFF0) as u32 == SC_KEYMENU {
         return LRESULT(0);
+    }
+    // SAFETY: default handling with the unchanged arguments.
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// The Settings window's procedure. Its messages go to `App` like the
+/// menu's; before the window is stored (while it is being created), Windows
+/// handles them.
+extern "system" fn settings_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_GETMINMAXINFO {
+        settings::min_max_info(hwnd, lparam);
+        return LRESULT(0);
+    }
+    if let Some(app) = app()
+        && let Some(result) = app.on_settings_message(msg, wparam, lparam)
+    {
+        return result;
     }
     // SAFETY: default handling with the unchanged arguments.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -1287,6 +1724,7 @@ fn run() -> Result<()> {
         tray,
         hook,
         settings,
+        file_config: RefCell::new(config.clone()),
         config: RefCell::new(config),
         is_open: Cell::new(false),
         is_visible: Cell::new(false),
@@ -1312,6 +1750,9 @@ fn run() -> Result<()> {
         accent: Cell::new(accent),
         stress: args.stress.map(|(n, gpu)| stress::Stress::new(n, gpu)),
         trim_after_close: Cell::new(false),
+        settings_window: RefCell::new(None),
+        settings_dirty: Cell::new(false),
+        hotkey_paused: Cell::new(false),
     });
     app.apply_background();
     app.register_hotkey();
@@ -1346,6 +1787,9 @@ fn run() -> Result<()> {
     // Launches not saved yet (however we were asked to quit).
     if let Some(app) = &app {
         app.save_stats();
+        // Unsaved Settings changes, and its window goes before ours.
+        app.save_settings();
+        drop(app.settings_window.borrow_mut().take());
     }
     // SAFETY: unregisters and destroys our own window.
     unsafe {

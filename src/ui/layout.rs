@@ -36,6 +36,8 @@ pub const AVATAR: f32 = 30.0;
 pub const POWER_BUTTON: f32 = 44.0;
 /// Inset of the footer's hover areas from the menu edge.
 const FOOTER_INSET: f32 = 8.0;
+/// Between the Settings gear and the power button.
+const BUTTON_GAP: f32 = 4.0;
 
 /// The power strip: a row of 4 buttons above the footer
 /// (Lock, Sleep, Restart, Shut down; the owner never signs out, so that one
@@ -236,6 +238,8 @@ pub struct Layout {
     pub name: Rect,
     /// The largest hover area of the profile (shrunk to the name's width).
     pub profile: Rect,
+    /// The gear that opens the Settings window.
+    pub settings: Rect,
     pub power: Rect,
     pub strip: Rect,
 }
@@ -342,13 +346,20 @@ pub fn layout(pins: usize, max_columns: usize, content: Content, music: Music) -
         POWER_BUTTON,
         POWER_BUTTON,
     );
+    // The Settings gear, just left of the power button, same size.
+    let settings = Rect::new(
+        power.x - BUTTON_GAP - POWER_BUTTON,
+        power.y,
+        POWER_BUTTON,
+        POWER_BUTTON,
+    );
     let avatar = Rect::new(16.0, mid - AVATAR / 2.0, AVATAR, AVATAR);
     let name_x = avatar.right() + 10.0;
-    let name = Rect::new(name_x, mid - 10.0, power.x - 12.0 - name_x, 20.0);
+    let name = Rect::new(name_x, mid - 10.0, settings.x - 12.0 - name_x, 20.0);
     let profile = Rect::new(
         FOOTER_INSET,
         footer_top + FOOTER_INSET,
-        power.x - 8.0 - FOOTER_INSET,
+        settings.x - 8.0 - FOOTER_INSET,
         FOOTER_HEIGHT - 2.0 * FOOTER_INSET,
     );
     let strip = Rect::new(
@@ -377,6 +388,7 @@ pub fn layout(pins: usize, max_columns: usize, content: Content, music: Music) -
         avatar,
         name,
         profile,
+        settings,
         power,
         strip,
     }
@@ -417,6 +429,31 @@ mod tests {
         assert_eq!(l.size.Y, 64.0 + 164.0 + 12.0 + 60.0);
         assert_eq!(l.cells[0], Rect::new(14.0, 64.0, 80.0, 80.0));
         assert_eq!(l.cells[5], Rect::new(14.0 + 84.0, 64.0 + 84.0, 80.0, 80.0));
+    }
+
+    #[test]
+    fn six_and_eight_columns() {
+        // The new default: 6 pins in one row of 6, 6 × 84 + 24 = 528 wide.
+        let l = layout(6, 6, Content::Grid, Music::Hidden);
+        assert_eq!((l.columns, l.rows), (6, 1));
+        assert_eq!(l.size.X, 528.0);
+        let l = layout(16, 8, Content::Grid, Music::Hidden);
+        assert_eq!((l.columns, l.rows), (8, 2));
+        assert_eq!(l.size.X, 696.0);
+        assert_eq!(l.cells[15].right(), 696.0 - 14.0);
+    }
+
+    #[test]
+    fn the_gear_sits_left_of_the_power_button() {
+        for pins in [0, 3, 6, 16] {
+            let l = layout(pins, 6, Content::Grid, Music::Hidden);
+            assert_eq!(l.settings.size(), l.power.size());
+            assert_eq!(l.settings.y, l.power.y);
+            assert_eq!(l.settings.right() + 4.0, l.power.x);
+            assert!(l.name.right() < l.settings.x);
+            assert!(l.profile.right() < l.settings.x);
+            assert!(l.name.w > 100.0, "{pins} pins");
+        }
     }
 
     #[test]
