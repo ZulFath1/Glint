@@ -565,7 +565,10 @@ pub struct Config {
     /// Pinned apps, as AppUserModelIDs, in grid order.
     #[serde(deserialize_with = "pins")]
     pub pinned: Vec<String>,
-    /// Colors, shapes, font and layout (milestone 9).
+    /// Colors, shapes, font and layout (milestone 9). New files say
+    /// tokyo-night (`Config::default`); a file without this line is from
+    /// before themes, so it keeps the look it always had: glint.
+    #[serde(default)]
     pub theme: ThemeId,
     /// Draw app icons in one color (the theme's text color).
     pub icon_tint: bool,
@@ -590,7 +593,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             pinned: DEFAULT_PINS.map(String::from).to_vec(),
-            theme: ThemeId::Glint,
+            theme: ThemeId::TokyoNight,
             icon_tint: false,
             accent: Accent::Theme,
             hotkey: None,
@@ -746,7 +749,7 @@ pinned = [{PINS}]
 # The look: "glint", "catppuccin", "nord", "tokyo-night" or "gruvbox".
 # A theme brings its own colors, shapes and font; `accent = "theme"` and
 # `preset = "theme"` below use the theme's colors.
-theme = "glint"
+theme = "tokyo-night"
 
 # Draw app icons in one color (the theme's text color).
 icon_tint = false
@@ -1239,7 +1242,16 @@ mod tests {
 
     #[test]
     fn missing_fields_use_defaults() {
-        assert_eq!(parse("").unwrap(), Config::default());
+        // (An empty file is an old one: glint. New files say tokyo-night.)
+        let empty = parse("").unwrap();
+        assert_eq!(empty.theme, ThemeId::Glint);
+        assert_eq!(
+            empty,
+            Config {
+                theme: ThemeId::Glint,
+                ..Config::default()
+            }
+        );
         let c = parse("[background]\nmode = \"solid\"\n").unwrap();
         assert_eq!(c.background.mode, BackgroundMode::Solid);
         assert_eq!(c.background.overlay, 0.2);
@@ -1401,8 +1413,9 @@ mod tests {
         save_changes(&mut doc, &old, &old);
         assert_eq!(doc.to_string(), text);
         // A file missing the lines and tables still gets them.
+        // (`old` is what that file holds, as in the app.)
         let mut doc: DocumentMut = "pinned = []\n".parse().unwrap();
-        save_changes(&mut doc, &Config::default(), &new);
+        save_changes(&mut doc, &parse("pinned = []").unwrap(), &new);
         let mut want = new.clone();
         want.pinned.clear();
         assert_eq!(parse(&doc.to_string()).unwrap(), want, "{doc}");

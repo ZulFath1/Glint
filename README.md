@@ -108,10 +108,10 @@ afterwards.
 
 | Theme | Layout | Look |
 |---|---|---|
-| **Glint** (default) | grid | Glass and soft gradients, the original look |
+| **Glint** | grid | Glass and soft gradients, the original look (what configs from 0.1 keep) |
 | **Catppuccin** (Mocha) | grid | Soft and cozy: pill search bar, mauve play button, separate Lock / Restart / Shut down buttons |
 | **Nord** | list | Calm and minimal: a Rofi-style list of your most-used apps, an icon-only pinned strip, a one-line music bar |
-| **Tokyo Night** | sidebar | Neon dashboard: a rail on the left, a greeting with a big clock, icons on colored tiles |
+| **Tokyo Night** (default) | sidebar | Neon dashboard: a rail on the left, a greeting with a big clock, icons on colored tiles |
 | **Gruvbox** (dark) | grid | Terminal style: monospace font, `user@glint: ~` title bar, `❯` prompt, `[ lock ] [ restart ] [ off ]` |
 
 **Icon tint** (Settings → Theme, or `icon_tint = true`) draws every app icon
@@ -198,7 +198,7 @@ pinned = [
 # The look: "glint", "catppuccin", "nord", "tokyo-night" or "gruvbox".
 # A theme brings its own colors, shapes and font; `accent = "theme"` and
 # `preset = "theme"` below use the theme's colors.
-theme = "glint"
+theme = "tokyo-night"
 
 # Draw app icons in one color (the theme's text color).
 icon_tint = false

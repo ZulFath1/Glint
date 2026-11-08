@@ -41,6 +41,9 @@ const GREETING_H: f32 = 20.0;
 const CLOCK_H: f32 = 44.0;
 /// Room the clock and date take on the right of the header.
 const CLOCK_AREA_W: f32 = 150.0;
+/// The greeting's line starts this far below the clock's box, so the
+/// text lines up with the top of the big digits.
+const GREETING_TOP: f32 = 4.0;
 
 fn now() -> SYSTEMTIME {
     // SAFETY: GetLocalTime only fills in a SYSTEMTIME it returns by value.
@@ -283,7 +286,7 @@ impl Chrome {
         self.header.draw(gfx, |ctx| {
             gfx::with_glow(ctx, |ctx| {
                 // The clock and the date on the right (right-aligned); the
-                // greeting on the left, centered next to them.
+                // greeting at the top left.
                 let (lead, right) = (
                     DWRITE_TEXT_ALIGNMENT_LEADING,
                     DWRITE_TEXT_ALIGNMENT_TRAILING,
@@ -307,8 +310,7 @@ impl Chrome {
                     right,
                     accent,
                 )?;
-                // Left of the clock (about 120 DIPs wide at 36 px).
-                let block = CLOCK_H + GREETING_H;
+                // Top left, level with the top of the clock's digits.
                 super::footer::draw_text(
                     ctx,
                     gfx,
@@ -316,7 +318,7 @@ impl Chrome {
                     &self.greeting_format,
                     Rect::new(
                         0.0,
-                        top + (block - GREETING_H) / 2.0,
+                        top + GREETING_TOP,
                         (size.X - CLOCK_AREA_W).max(0.0),
                         GREETING_H,
                     ),
