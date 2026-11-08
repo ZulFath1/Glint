@@ -23,6 +23,7 @@
 
 pub mod anim;
 pub mod background;
+pub mod chrome;
 pub mod context_menu;
 pub mod footer;
 pub mod gfx;
@@ -52,7 +53,7 @@ use windows::core::{Interface, Result};
 use windows_numerics::{Vector2, Vector3};
 
 use crate::apps::AppInfo;
-use crate::config::{Config, Rgb};
+use crate::config::{Config, Rgb, ThemeId};
 use crate::icons::IconCache;
 use crate::media::{self, MediaCommand, MusicView};
 use crate::power::PowerAction;
@@ -60,6 +61,7 @@ use crate::search::{self, Query};
 use crate::window::{Edge, Placement};
 use anim::{Animator, Kind, LayoutMotion};
 use background::{Applied, SystemEffects};
+use chrome::Chrome;
 use context_menu::{ContextMenu, MenuTarget};
 use footer::{Footer, PowerStrip, StripState};
 use gfx::Gfx;
@@ -78,6 +80,9 @@ const ICON_BUDGET: Duration = Duration::from_millis(8);
 /// The timer that refreshes the music card's elapsed time (WM_TIMER id).
 /// It only runs while the menu is open and music plays.
 pub const TIMER_SEEK: usize = 3;
+/// The timer that repaints the terminal title strip's clock, once a
+/// minute, only while the menu is open (WM_TIMER id).
+pub const TIMER_CLOCK: usize = 9;
 /// At most 4 updates a second (the text changes once a second).
 const SEEK_TICK_MS: u32 = 250;
 /// The app icon next to "Playing from …".
@@ -114,6 +119,8 @@ pub enum Focus {
     /// The footer gear (Settings).
     Settings,
     Power,
+    /// A separate footer button: Lock, Restart, Shut down (some themes).
+    Quick(usize),
     /// A button of the power strip.
     Strip(usize),
 }
@@ -131,6 +138,7 @@ enum Target {
     Profile,
     Settings,
     Power,
+    Quick(usize),
     Strip(usize),
     /// The power strip, but not on a button.
     StripPanel,
@@ -140,10 +148,17 @@ enum Target {
     ContextPanel,
 }
 
-const HOVER_ALPHA: f32 = 0.08;
-const CELL_RADIUS: f32 = 12.0;
-const BUTTON_RADIUS: f32 = 10.0;
 const RING_WIDTH: f32 = 2.0;
+
+/// Corner radius of the hover / focus ring around a grid cell (theme).
+fn cell_radius() -> f32 {
+    gfx::theme().shape.cell_radius
+}
+
+/// Corner radius of the hover / focus ring around a button (theme).
+fn button_radius() -> f32 {
+    gfx::theme().shape.button_radius
+}
 
 /// Every installed app, prepared for searching, plus how often each was
 /// launched (saved to `[stats]` in config.toml by main.rs).
@@ -280,10 +295,12 @@ pub struct Ui {
     source_cache: RefCell<Option<(String, String, Option<ID2D1Bitmap1>)>>,
     /// The high contrast text color in use (None = high contrast is off).
     high_contrast: Cell<Option<Rgb>>,
-}
-
-fn white(alpha: f32) -> windows::UI::Color {
-    gfx::color(Rgb::new(255, 255, 255), alpha)
+    /// Terminal themes' title strip and section label.
+    chrome: Chrome,
+    /// Icons in one color (`icon_tint`).
+    icon_tint: Cell<bool>,
+    /// The accent color in use (for the music bar after a theme switch).
+    accent: Cell<Rgb>,
 }
 
 /// True if a key press or mouse click is waiting in our message queue.
@@ -297,6 +314,8 @@ impl Ui {
     /// `accent` is the config's accent color, already resolved (a fixed
     /// color, or the Windows one for `accent = "system"`).
     pub fn new(hwnd: HWND, config: &Config, accent: Rgb, scale: f32) -> Result<Self> {
+        // Everything is painted with the configured theme from the start.
+        gfx::set_theme(config.theme.theme());
         let compositor = Compositor::new()?;
         let interop: ICompositorDesktopInterop = compositor.cast()?;
         // SAFETY: `hwnd` is our live top-level window, created on this thread.
@@ -312,9 +331,16 @@ impl Ui {
             .iter()
             .filter_map(|aumid| crate::apps::find(aumid))
             .collect();
-        let layout = layout::layout(apps.len(), config.max_columns, Content::Grid, Music::Hidden);
+        let layout = layout::layout(
+            apps.len(),
+            config.max_columns,
+            Content::Grid,
+            Music::Hidden,
+            gfx::theme(),
+        );
 
         let shell = shell::Shell::new(&compositor, layout.size)?;
+        shell.set_theme(gfx::theme(), layout.size)?;
         root.Children()?.InsertAtTop(shell.host())?;
         let menu = shell.host_visual()?;
         Animator::reset_closed(&menu)?;
@@ -334,13 +360,16 @@ impl Ui {
         let top = new_layer()?;
 
         let footer = Footer::new(&compositor, &gfx, &back, &front, &layout)?;
-        let hover = RoundRect::new(&compositor, CELL_RADIUS, 0.0)?;
-        hover.set_fill(white(HOVER_ALPHA))?;
+        let hover = RoundRect::new(&compositor, cell_radius(), 0.0)?;
+        hover.set_fill(gfx::paint(gfx::theme().palette.hover))?;
         hover.show(false)?;
         hover_layer.Children()?.InsertAtTop(&hover.visual)?;
         let search = SearchBox::new(&compositor, &gfx, &front, layout.search, accent)?;
         let grid = Grid::new(&compositor, &gfx, &front, apps, config.show_names)?;
+        grid.set_icon_tint(config.icon_tint);
+        let chrome = Chrome::new(&compositor, &gfx, &front)?;
         let results = Results::new(&compositor, &gfx, &front, &layout, &footer.fill_visual()?)?;
+        results.set_theme(config.icon_tint)?;
         let music = MusicCard::new(
             &compositor,
             &gfx,
@@ -351,7 +380,7 @@ impl Ui {
         )?;
         let strip = PowerStrip::new(&compositor, &gfx, &popup, layout.strip)?;
         let context = ContextMenu::new(&compositor, &gfx, &popup)?;
-        let ring = RoundRect::new(&compositor, CELL_RADIUS, RING_WIDTH)?;
+        let ring = RoundRect::new(&compositor, cell_radius(), RING_WIDTH)?;
         ring.set_stroke(gfx::color(accent, 1.0))?;
         ring.show(false)?;
         top.Children()?.InsertAtTop(&ring.visual)?;
@@ -420,6 +449,9 @@ impl Ui {
             seek_drag: Cell::new(false),
             source_cache: RefCell::new(None),
             high_contrast: Cell::new(None),
+            chrome,
+            icon_tint: Cell::new(config.icon_tint),
+            accent: Cell::new(accent),
         };
         ui.refresh()?;
         Ok(ui)
@@ -428,14 +460,16 @@ impl Ui {
     /// The largest the menu gets, in DIPs (the window is made this big, so
     /// it never has to move while the menu grows or shrinks).
     pub fn max_size(&self) -> Vector2 {
-        layout::max_size(self.grid.len(), self.max_columns.get())
+        layout::max_size(self.grid.len(), self.max_columns.get(), gfx::theme())
     }
 
-    /// The point the power strip grows out of (the power button's top).
+    /// The point the power strip grows out of (the power button's top, or
+    /// the middle separate footer button's).
     fn strip_origin(l: &Layout) -> Vector2 {
+        let b = l.quick.get(1).copied().unwrap_or(l.power);
         Vector2 {
-            X: l.power.x + l.power.w / 2.0,
-            Y: l.power.y,
+            X: b.x + b.w / 2.0,
+            Y: b.y,
         }
     }
 
@@ -453,6 +487,7 @@ impl Ui {
             self.results.resize(&self.gfx, &l)?;
             self.music.refresh(&self.gfx, &l)?;
             self.context.refresh(&self.gfx)?;
+            self.chrome.refresh(&self.gfx, &l)?;
             self.place_content()
         })?;
         self.paint_results()?;
@@ -563,7 +598,113 @@ impl Ui {
             gfx::set_high_contrast_text(text);
             self.refresh()?;
         }
-        self.shell.background.apply(&config.background, effects)
+        // A theme switch while open cross-fades the colors.
+        let animate = self.is_open.get() && !self.reduced_motion.get();
+        self.shell
+            .background
+            .apply(&config.background, config.theme, effects, animate)
+    }
+
+    /// A new theme and/or one-color icons (IMPROVE.md milestone 9).
+    /// Everything is recolored and repainted; while open, the content fades
+    /// in again over 250 ms (the background cross-fades in
+    /// `apply_background`, which main.rs calls right after this).
+    ///
+    /// The window may have to grow first (a terminal theme is taller):
+    /// `fit_window` works like in `set_pins`.
+    pub fn set_theme(
+        &self,
+        id: ThemeId,
+        icon_tint: bool,
+        fit_window: impl FnOnce(Vector2) -> Option<Placement>,
+    ) -> Result<()> {
+        if gfx::theme().id == id && self.icon_tint.get() == icon_tint {
+            return Ok(());
+        }
+        let theme = id.theme();
+        gfx::set_theme(theme);
+        self.icon_tint.set(icon_tint);
+        self.grid.set_icon_tint(icon_tint);
+
+        // Things are about to change shape: no popup or highlight left behind.
+        self.context.reset()?;
+        self.strip.reset()?;
+        self.hovered.set(Target::Nothing);
+        self.hover.show(false)?;
+        if matches!(
+            self.focus.get(),
+            Focus::Strip(_) | Focus::Power | Focus::Quick(_)
+        ) {
+            self.focus.set(Focus::Search);
+        }
+
+        // Composition colors and shapes (no painting yet).
+        self.hover.set_fill(gfx::paint(theme.palette.hover))?;
+        self.search.set_theme()?;
+        self.footer.set_theme()?;
+        self.strip.set_theme()?;
+        self.context.set_theme()?;
+        self.music.set_theme(self.accent.get())?;
+        self.results.set_theme(icon_tint)?;
+
+        if let Some(p) = fit_window(self.max_size()) {
+            self.set_layout(&p)?;
+        }
+        let new = {
+            let l = self.layout.borrow();
+            layout::layout(
+                self.grid.len(),
+                self.max_columns.get(),
+                l.content,
+                l.music,
+                theme,
+            )
+        };
+        self.shell.set_theme(theme, new.size)?;
+        *self.layout.borrow_mut() = new;
+        // Repaint everything in the new colors and font.
+        self.refresh()?;
+        self.update_search(true)?;
+        self.sync_clock();
+
+        if self.is_open.get() && !self.reduced_motion.get() {
+            let a = self.compositor.CreateScalarKeyFrameAnimation()?;
+            a.InsertKeyFrame(0.0, 0.0)?;
+            a.InsertKeyFrame(1.0, 1.0)?;
+            a.SetDuration(anim::ms(background::THEME_FADE_MS))?;
+            self.shell
+                .body()
+                .StartAnimation(windows::core::h!("Opacity"), &a)?;
+        }
+        log_info!("theme: {} (icon tint {icon_tint})", id.name());
+        Ok(())
+    }
+
+    /// The terminal title strip's clock runs only while the menu is open
+    /// (one repaint a minute, aligned to the minute); otherwise its timer
+    /// is stopped.
+    fn sync_clock(&self) {
+        let ticking = self.is_open.get() && Chrome::has_clock(&self.layout.borrow());
+        // SAFETY: a timer on our own window, or stopping it.
+        unsafe {
+            if ticking {
+                SetTimer(
+                    Some(self.hwnd),
+                    TIMER_CLOCK,
+                    chrome::ms_to_next_minute(),
+                    None,
+                );
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_CLOCK);
+            }
+        }
+    }
+
+    /// WM_TIMER for [`TIMER_CLOCK`]: a new minute.
+    pub fn clock_tick(&self) -> Result<()> {
+        self.chrome.tick(&self.gfx)?;
+        self.sync_clock();
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -572,6 +713,7 @@ impl Ui {
 
     /// New accent color: caret, focused search border, seek bar, focus ring.
     pub fn set_accent(&self, accent: Rgb) -> Result<()> {
+        self.accent.set(accent);
         self.search.set_accent(&self.gfx, accent)?;
         self.music.set_accent(accent)?;
         self.ring.set_stroke(gfx::color(accent, 1.0))
@@ -674,7 +816,7 @@ impl Ui {
         }
 
         // The window first (instant, the menu stays where it is on screen).
-        if let Some(p) = fit_window(layout::max_size(count, max_columns)) {
+        if let Some(p) = fit_window(layout::max_size(count, max_columns, gfx::theme())) {
             self.set_layout(&p)?;
         }
 
@@ -682,7 +824,7 @@ impl Ui {
             let l = self.layout.borrow();
             (l.content, l.music, l.size.X)
         };
-        let new = layout::layout(count, max_columns, content, music);
+        let new = layout::layout(count, max_columns, content, music, gfx::theme());
         let added = self.grid.set_apps(&self.gfx, apps)?;
         // New cells start in their place (painted), then join the gliders.
         self.grid.place(&self.gfx, &new.cells, &added)?;
@@ -784,6 +926,9 @@ impl Ui {
         }
         self.update_focus_visuals()?;
         self.sync_seek()?;
+        // The clock may be minutes old: repaint it, then tick each minute.
+        self.chrome.tick(&self.gfx)?;
+        self.sync_clock();
         self.animator.borrow().open(&self.menu, reduced_motion)
     }
 
@@ -794,8 +939,9 @@ impl Ui {
             let _ = unsafe { ReleaseCapture() };
             self.music.cancel_drag();
         }
-        // The seek bar stops and its timer ends: nothing runs while hidden.
+        // The seek bar and the clock stop: nothing runs while hidden.
         self.sync_seek()?;
+        self.sync_clock();
         // No blinking caret while hidden: zero work for DWM.
         Animator::stop_blink(&self.search.caret_visual()?, true)?;
         search_box::ime_cancel(self.hwnd);
@@ -879,7 +1025,13 @@ impl Ui {
     /// everything glides to its new place (220 ms) and what appears or
     /// disappears fades.
     fn relayout(&self, content: Content, music: Music) -> Result<()> {
-        let new = layout::layout(self.grid.len(), self.max_columns.get(), content, music);
+        let new = layout::layout(
+            self.grid.len(),
+            self.max_columns.get(),
+            content,
+            music,
+            gfx::theme(),
+        );
         let (old_content, old_music) = {
             let l = self.layout.borrow();
             (l.content, l.music)
@@ -898,6 +1050,8 @@ impl Ui {
         let list = matches!(content, Content::List(_));
         if matches!(old_content, Content::List(_)) != list {
             self.motion.fade(&self.grid.visual()?, !list, animate)?;
+            self.motion
+                .fade(&self.chrome.section_visual()?, !list, animate)?;
             self.motion.fade(&self.results.visual()?, list, animate)?;
             if list && matches!(self.focus.get(), Focus::Cell(_)) {
                 self.focus.set(Focus::Search);
@@ -1190,12 +1344,17 @@ impl Ui {
     fn focus_rect(&self, focus: Focus) -> Option<(Rect, f32)> {
         match focus {
             Focus::Search => None, // the search box shows focus with its border
-            Focus::Cell(i) => self.grid.rect(i).map(|r| (r, CELL_RADIUS)),
+            Focus::Cell(i) => self.grid.rect(i).map(|r| (r, cell_radius())),
             Focus::Media(part) => Some((self.music.part_rect(part), self.music.part_radius(part))),
-            Focus::Profile => Some((self.footer.profile_rect(), BUTTON_RADIUS)),
-            Focus::Settings => Some((self.footer.settings_rect(), BUTTON_RADIUS)),
-            Focus::Power => Some((self.footer.power_rect(), BUTTON_RADIUS)),
-            Focus::Strip(i) => self.strip.buttons().get(i).map(|&r| (r, BUTTON_RADIUS)),
+            Focus::Profile => Some((self.footer.profile_rect(), button_radius())),
+            Focus::Settings => Some((self.footer.settings_rect(), button_radius())),
+            Focus::Power => Some((self.footer.power_rect(), button_radius())),
+            Focus::Quick(i) => self
+                .footer
+                .quick_rects()
+                .get(i)
+                .map(|&r| (r, button_radius())),
+            Focus::Strip(i) => self.strip.buttons().get(i).map(|&r| (r, button_radius())),
         }
     }
 
@@ -1235,11 +1394,16 @@ impl Ui {
             _ => None,
         })?;
         let highlight = match target {
-            Target::Cell(i) => self.grid.rect(i).map(|r| (r, CELL_RADIUS)),
-            Target::Row(i) => self.results.rect(i).map(|r| (r, results::ROW_RADIUS)),
-            Target::Profile => Some((self.footer.profile_rect(), BUTTON_RADIUS)),
-            Target::Settings => Some((self.footer.settings_rect(), BUTTON_RADIUS)),
-            Target::Power => Some((self.footer.power_rect(), BUTTON_RADIUS)),
+            Target::Cell(i) => self.grid.rect(i).map(|r| (r, cell_radius())),
+            Target::Row(i) => self.results.rect(i).map(|r| (r, results::row_radius())),
+            Target::Profile => Some((self.footer.profile_rect(), button_radius())),
+            Target::Settings => Some((self.footer.settings_rect(), button_radius())),
+            Target::Power => Some((self.footer.power_rect(), button_radius())),
+            Target::Quick(i) => self
+                .footer
+                .quick_rects()
+                .get(i)
+                .map(|&r| (r, button_radius())),
             _ => None,
         };
         match highlight {
@@ -1281,7 +1445,9 @@ impl Ui {
             Target::Profile
         } else if self.footer.settings_rect().contains(p) {
             Target::Settings
-        } else if self.footer.power_rect().contains(p) {
+        } else if let Some(i) = self.footer.quick_rects().iter().position(|r| r.contains(p)) {
+            Target::Quick(i)
+        } else if self.footer.quick_rects().is_empty() && self.footer.power_rect().contains(p) {
             Target::Power
         } else {
             Target::Nothing
@@ -1432,6 +1598,13 @@ impl Ui {
                 if i == 1 {
                     return Ok(Action::Power(action));
                 }
+                // Cancel with separate footer buttons: close the strip,
+                // back to the button that opened it.
+                if !self.footer.quick_rects().is_empty() {
+                    let home = self.strip_home();
+                    self.close_strip(home)?;
+                    return Ok(Action::None);
+                }
                 // Cancel: back to the buttons, focus on the one we came from.
                 self.strip.set_state(&self.gfx, StripState::Buttons)?;
                 self.hovered.set(Target::Nothing);
@@ -1475,7 +1648,7 @@ impl Ui {
                 // Back to where the strip was opened from: the power button
                 // when using the keyboard, else the search box.
                 let back = if self.keyboard_nav.get() {
-                    Focus::Power
+                    self.strip_home()
                 } else {
                     Focus::Search
                 };
@@ -1500,7 +1673,9 @@ impl Ui {
             Focus::Search => self.search_key(vk, ctrl, shift),
             Focus::Cell(i) => self.grid_key(i, vk, shift),
             Focus::Media(part) => self.media_key(part, vk, shift),
-            Focus::Profile | Focus::Settings | Focus::Power => self.footer_key(focus, vk, shift),
+            Focus::Profile | Focus::Settings | Focus::Power | Focus::Quick(_) => {
+                self.footer_key(focus, vk, shift)
+            }
             Focus::Strip(i) => self.strip_key(i, vk, shift),
         }
     }
@@ -1536,7 +1711,11 @@ impl Ui {
                 VK_RETURN => return Ok(self.launch_result(self.selected.get())),
                 VK_TAB => {
                     self.keyboard_nav.set(true);
-                    let next = if shift { Focus::Power } else { Focus::Profile };
+                    let next = if shift {
+                        self.footer_last()
+                    } else {
+                        Focus::Profile
+                    };
                     return self.set_focus(next).map(|()| Action::None);
                 }
                 _ => {}
@@ -1556,7 +1735,7 @@ impl Ui {
             }
             VK_TAB => {
                 self.keyboard_nav.set(true);
-                return self.set_focus(Focus::Power).map(|()| Action::None);
+                return self.set_focus(self.footer_last()).map(|()| Action::None);
             }
             // Nothing typed, nothing to launch.
             VK_RETURN => return Ok(Action::None),
@@ -1667,19 +1846,76 @@ impl Ui {
                 self.open_strip()?;
                 return Ok(Action::None);
             }
+            (Focus::Quick(i), VK_RETURN) => {
+                self.keyboard_nav.set(true);
+                return self.press_quick(i);
+            }
             (_, VK_UP) => above,
-            // Left to right: profile, gear, power.
-            (Focus::Profile, VK_TAB) if shift => above,
-            (Focus::Profile, VK_RIGHT | VK_TAB) => Focus::Settings,
-            (Focus::Settings, VK_LEFT) => Focus::Profile,
-            (Focus::Settings, VK_TAB) if shift => Focus::Profile,
-            (Focus::Settings, VK_RIGHT | VK_TAB) => Focus::Power,
-            (Focus::Power, VK_LEFT) => Focus::Settings,
-            (Focus::Power, VK_TAB) if shift => Focus::Settings,
-            (Focus::Power, VK_TAB) => Focus::Search,
-            _ => return Ok(Action::None),
+            // Left to right: profile, gear, then power (or the separate
+            // buttons); Tab past the last one wraps to the search box.
+            _ => {
+                let order = self.footer_order();
+                let i = order.iter().position(|&f| f == focus).unwrap_or(0);
+                match vk {
+                    VK_LEFT => order[i.saturating_sub(1)],
+                    VK_RIGHT => order[(i + 1).min(order.len() - 1)],
+                    VK_TAB if shift => i.checked_sub(1).map_or(above, |j| order[j]),
+                    VK_TAB => order.get(i + 1).copied().unwrap_or(Focus::Search),
+                    _ => return Ok(Action::None),
+                }
+            }
         };
         self.set_focus(next)?;
+        Ok(Action::None)
+    }
+
+    /// The footer's focus stops, left to right.
+    fn footer_order(&self) -> Vec<Focus> {
+        let mut order = vec![Focus::Profile, Focus::Settings];
+        match self.footer.quick_rects().len() {
+            0 => order.push(Focus::Power),
+            n => order.extend((0..n).map(Focus::Quick)),
+        }
+        order
+    }
+
+    /// The footer's last focus stop (Shift+Tab from the search box).
+    fn footer_last(&self) -> Focus {
+        self.footer_order().last().copied().unwrap_or(Focus::Power)
+    }
+
+    /// Where the keyboard goes back to when the strip closes: the button
+    /// that opened it.
+    fn strip_home(&self) -> Focus {
+        match self.strip.state() {
+            StripState::Confirm(action) if !self.footer.quick_rects().is_empty() => {
+                footer::QUICK_ACTIONS
+                    .iter()
+                    .position(|&a| a == action)
+                    .map_or(Focus::Search, Focus::Quick)
+            }
+            _ => Focus::Power,
+        }
+    }
+
+    /// A separate footer button (Lock / Restart / Shut down) was pressed.
+    /// Restart and Shut down ask first, in the strip.
+    fn press_quick(&self, i: usize) -> Result<Action> {
+        let Some(&action) = footer::QUICK_ACTIONS.get(i) else {
+            return Ok(Action::None);
+        };
+        if !action.needs_confirm() {
+            return Ok(Action::Power(action));
+        }
+        self.strip.open_confirm(
+            &self.gfx,
+            &self.animator.borrow(),
+            action,
+            self.reduced_motion.get(),
+        )?;
+        self.hovered.set(Target::Nothing);
+        // Focus starts on Cancel.
+        self.set_focus(Focus::Strip(0))?;
         Ok(Action::None)
     }
 
@@ -1906,6 +2142,7 @@ impl Ui {
                 self.open_strip()?;
                 Ok(Action::None)
             }
+            Target::Quick(i) => self.press_quick(i),
             Target::Strip(i) => self.press_strip(i),
             Target::Context => self.activate_context(),
             _ => Ok(Action::None),

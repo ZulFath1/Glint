@@ -8,7 +8,6 @@
 use std::cell::{Cell as StdCell, RefCell};
 
 use windows::UI::Composition::{CompositionObject, Compositor, ContainerVisual, Visual};
-use windows::Win32::Graphics::Direct2D::D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, IDWriteTextFormat,
 };
@@ -19,6 +18,7 @@ use super::gfx::{self, Canvas, Gfx, text_primary};
 use super::layout::{CELL, Rect};
 use crate::apps::App;
 use crate::icons::IconCache;
+use crate::theme::IconTile;
 
 /// Icon size and position inside the 80 × 80 cell (DIPs).
 const ICON: f32 = 38.0;
@@ -28,6 +28,9 @@ const LABEL_SIZE: f32 = 12.0;
 const LABEL_TOP: f32 = 54.0;
 const LABEL_HEIGHT: f32 = 18.0;
 const LABEL_SIDE: f32 = 4.0;
+/// The tile behind the icon (themes with `IconTile`): the icon plus this
+/// much on every side.
+const TILE_PAD: f32 = 5.0;
 
 struct Cell {
     outer: ContainerVisual,
@@ -45,6 +48,8 @@ pub struct Grid {
     label_format: IDWriteTextFormat,
     /// App names under the icons (`show_names` in config.toml).
     show_names: StdCell<bool>,
+    /// Icons in one color (`icon_tint` in config.toml).
+    icon_tint: StdCell<bool>,
 }
 
 impl Grid {
@@ -65,6 +70,7 @@ impl Grid {
             rects: Default::default(),
             label_format: gfx.text_format(LABEL_SIZE, DWRITE_FONT_WEIGHT_NORMAL)?,
             show_names: StdCell::new(show_names),
+            icon_tint: StdCell::new(false),
         };
         let cells = apps
             .into_iter()
@@ -192,6 +198,11 @@ impl Grid {
         Ok(())
     }
 
+    /// One-color icons on or off. Repaint afterwards (`redraw`).
+    pub fn set_icon_tint(&self, on: bool) -> bool {
+        self.icon_tint.replace(on) != on
+    }
+
     /// Names under the icons on or off. Repaint afterwards (`redraw`).
     pub fn set_show_names(&self, on: bool) -> bool {
         self.show_names.replace(on) != on
@@ -210,15 +221,22 @@ impl Grid {
         let names = self.show_names.get();
         // Without a name, the icon sits in the middle of the cell.
         let icon_top = if names { ICON_TOP } else { (CELL - ICON) / 2.0 };
+        let theme = gfx::theme();
+        let tint = self.icon_tint.get().then(text_primary);
         let cells = self.cells.borrow();
-        for cell in which.iter().filter_map(|&i| cells.get(i)) {
+        for (i, cell) in which.iter().filter_map(|&i| cells.get(i).map(|c| (i, c))) {
             cell.canvas.resize(gfx, size)?;
             let icon = icons
                 .get(gfx, &cell.app.aumid, &cell.app.item, icon_px)
                 .inspect_err(|e| log_warn!("no icon for {}: {e}", cell.app.aumid))
                 .ok();
+            let name = if theme.terminal {
+                cell.app.name.to_lowercase()
+            } else {
+                cell.app.name.clone()
+            };
             let label = gfx.text_layout(
-                &cell.app.name,
+                &name,
                 &self.label_format,
                 Vector2 {
                     X: CELL - 2.0 * LABEL_SIDE,
@@ -227,23 +245,17 @@ impl Grid {
                 DWRITE_TEXT_ALIGNMENT_CENTER,
                 true,
             )?;
+            let left = (CELL - ICON) / 2.0;
+            let dest = Rect::new(left, icon_top, ICON, ICON);
             cell.canvas.draw(gfx, |ctx| {
+                paint_tile(ctx, dest, i)?;
                 let brush = gfx::brush(ctx, text_primary(), 1.0)?;
                 gfx::with_glow(ctx, |ctx| {
-                    let left = (CELL - ICON) / 2.0;
-                    let dest = gfx::d2d_rect(Rect::new(left, icon_top, ICON, ICON));
-                    // SAFETY: drawing calls with live objects and local rects.
+                    if let Some(icon) = &icon {
+                        gfx::draw_icon(ctx, icon, dest, tint)?;
+                    }
+                    // SAFETY: draws a live text layout with a live brush.
                     unsafe {
-                        if let Some(icon) = &icon {
-                            ctx.DrawBitmap(
-                                icon,
-                                Some(&dest),
-                                1.0,
-                                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-                                None,
-                                None,
-                            );
-                        }
                         if names {
                             ctx.DrawTextLayout(
                                 Vector2 {
@@ -262,4 +274,36 @@ impl Grid {
         }
         Ok(())
     }
+}
+
+/// The tile behind icon number `i` (at `icon`), as the theme wants it.
+pub fn paint_tile(
+    ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+    icon: Rect,
+    i: usize,
+) -> Result<()> {
+    let theme = gfx::theme();
+    if theme.tile == IconTile::None {
+        return Ok(());
+    }
+    let p = theme.palette;
+    let r = Rect::new(
+        icon.x - TILE_PAD,
+        icon.y - TILE_PAD,
+        icon.w + 2.0 * TILE_PAD,
+        icon.h + 2.0 * TILE_PAD,
+    );
+    let stroke = match (theme.tile, p.tile_borders) {
+        (IconTile::Bordered, borders) if !borders.is_empty() => {
+            Some((borders[i % borders.len()], 0.9, 1.0))
+        }
+        _ => None,
+    };
+    gfx::round_rect(
+        ctx,
+        r,
+        theme.shape.tile_radius,
+        Some((p.tile.color, p.tile.alpha)),
+        stroke,
+    )
 }

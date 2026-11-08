@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! host (animated: Scale, Opacity, CenterPoint)
+//! ├── hard shadow (terminal themes only: offset 8, 8, no blur)
 //! └── content  (clipped to the rounded rect)
 //!     ├── background layers (backdrop → tint/gradient → overlay → sheen),
 //!     │   see background.rs
@@ -10,8 +11,9 @@
 //!     └── border or glass rim (always on top)
 //! ```
 //!
-//! No drop shadow: the owner found it looked odd over light backgrounds
-//! (a deliberate change from CLAUDE.md section 5).
+//! No soft drop shadow: the owner found it looked odd over light backgrounds
+//! (a deliberate change from CLAUDE.md section 5). Gruvbox has a hard,
+//! unblurred offset shadow instead, which fits inside the window margin.
 
 use windows::UI::Composition::{
     CompositionObject, CompositionRoundedRectangleGeometry, Compositor, ContainerVisual, Visual,
@@ -21,6 +23,12 @@ use windows_numerics::Vector2;
 
 use super::anim::Kind;
 use super::background::Background;
+use super::layout::Rect;
+use super::shape::RoundRect;
+use crate::theme::Theme;
+
+/// The hard shadow's offset (DIPs).
+const SHADOW_OFFSET: f32 = 8.0;
 
 /// Corner radius of the menu (DIPs).
 pub const CORNER_RADIUS: f32 = 18.0;
@@ -30,6 +38,7 @@ pub struct Shell {
     content: ContainerVisual,
     clip_shape: CompositionRoundedRectangleGeometry,
     body: ContainerVisual,
+    shadow: RoundRect,
     pub background: Background,
 }
 
@@ -37,6 +46,9 @@ impl Shell {
     pub fn new(compositor: &Compositor, size: Vector2) -> Result<Self> {
         let host = compositor.CreateContainerVisual()?;
         host.SetSize(size)?;
+        let shadow = RoundRect::new(compositor, CORNER_RADIUS, 0.0)?;
+        shadow.show(false)?;
+        host.Children()?.InsertAtTop(&shadow.visual)?;
 
         // Content, clipped to the rounded shape.
         let clip_shape = compositor.CreateRoundedRectangleGeometry()?;
@@ -65,6 +77,7 @@ impl Shell {
             content,
             clip_shape,
             body,
+            shadow,
             background,
         })
     }
@@ -92,6 +105,7 @@ impl Shell {
             (self.clip_shape.cast()?, Kind::Geometry),
         ];
         list.extend(self.background.motion_objects()?);
+        list.extend(self.shadow.motion_objects()?);
         Ok(list)
     }
 
@@ -102,6 +116,24 @@ impl Shell {
         self.content.SetSize(size)?;
         self.body.SetSize(size)?;
         self.clip_shape.SetSize(size)?;
+        self.shadow
+            .set_rect(Rect::new(SHADOW_OFFSET, SHADOW_OFFSET, size.X, size.Y))?;
         self.background.set_size(size)
+    }
+
+    /// A new theme: corner radius and the hard shadow. (The background's
+    /// colors and border come with `Background::apply`.)
+    pub fn set_theme(&self, theme: &Theme, size: Vector2) -> Result<()> {
+        let r = theme.shape.menu_radius;
+        self.clip_shape.SetCornerRadius(Vector2 { X: r, Y: r })?;
+        self.shadow.set_radius(r);
+        match theme.palette.shadow {
+            Some(c) => {
+                self.shadow.set_fill(super::gfx::color(c, 1.0))?;
+                self.shadow.show(true)?;
+            }
+            None => self.shadow.show(false)?,
+        }
+        self.set_size(size)
     }
 }

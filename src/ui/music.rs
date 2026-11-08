@@ -43,16 +43,17 @@ use super::shape::RoundRect;
 use crate::config::Rgb;
 use crate::media::{Info, MediaCommand, MusicView, format_time};
 
-const RADIUS: f32 = 14.0;
-const FILL_ALPHA: f32 = 0.28;
-const BORDER_ALPHA: f32 = 0.08;
-const COVER_RADIUS: f32 = 8.0;
-const HOVER_ALPHA: f32 = 0.08;
-const BUTTON_RADIUS: f32 = 10.0;
 /// Buttons the app doesn't support are drawn this faint.
 const DIM_ALPHA: f32 = 0.32;
-const TRACK_ALPHA: f32 = 0.20;
-const PILL_ALPHA: f32 = 0.10;
+/// Terminal themes: a thicker, square bar without a round thumb.
+const BLOCK_TRACK_HEIGHT: f32 = 6.0;
+/// The filled circle behind the play button (themes with `play`).
+const PLAY_CIRCLE: f32 = 32.0;
+/// Terminal themes draw the buttons as text.
+const TEXT_PREVIOUS: &str = "|\u{25C0}";
+const TEXT_PLAY: &str = "\u{25B6}";
+const TEXT_PAUSE: &str = "\u{25AE}\u{25AE}";
+const TEXT_NEXT: &str = "\u{25B6}|";
 const SOURCE_ICON: f32 = 16.0;
 /// The longest a single seek animation runs (Composition caps durations).
 const MAX_ANIMATION_TICKS: i64 = 24 * 3600 * 10_000_000;
@@ -101,10 +102,6 @@ struct Painted {
     has_icon: bool,
 }
 
-fn white(alpha: f32) -> windows::UI::Color {
-    gfx::color(Rgb::new(255, 255, 255), alpha)
-}
-
 fn draw_text(
     ctx: &ID2D1DeviceContext,
     gfx: &Gfx,
@@ -134,6 +131,9 @@ pub struct MusicCard {
     panel: RoundRect,
     hover: RoundRect,
     cover: Canvas,
+    cover_shape: windows::UI::Composition::CompositionRoundedRectangleGeometry,
+    thumb: windows::UI::Composition::ShapeVisual,
+    thumb_color: CompositionColorBrush,
     content: Canvas,
     bar: ContainerVisual,
     track: SpriteVisual,
@@ -188,21 +188,15 @@ impl MusicCard {
         let inner = c.CreateContainerVisual()?;
         outer.Children()?.InsertAtTop(&inner)?;
 
-        let panel = RoundRect::new(c, RADIUS, 1.0)?;
-        panel.set_fill(gfx::color(Rgb::new(0, 0, 0), FILL_ALPHA))?;
-        panel.set_stroke(white(BORDER_ALPHA))?;
-        let hover = RoundRect::new(c, BUTTON_RADIUS, 0.0)?;
-        hover.set_fill(white(HOVER_ALPHA))?;
+        let panel = RoundRect::new(c, 14.0, 1.0)?;
+        let hover = RoundRect::new(c, 10.0, 0.0)?;
         hover.show(false)?;
 
         let cover_size = Vector2 { X: COVER, Y: COVER };
         let cover = Canvas::new(c, gfx, cover_size)?;
         let rounded = c.CreateRoundedRectangleGeometry()?;
         rounded.SetSize(cover_size)?;
-        rounded.SetCornerRadius(Vector2 {
-            X: COVER_RADIUS,
-            Y: COVER_RADIUS,
-        })?;
+
         cover
             .visual
             .SetClip(&c.CreateGeometricClipWithGeometry(&rounded)?)?;
@@ -212,7 +206,7 @@ impl MusicCard {
         // x follows the fill's scale (worked out by DWM every frame).
         let bar = c.CreateContainerVisual()?;
         let track = c.CreateSpriteVisual()?;
-        track.SetBrush(&c.CreateColorBrushWithColor(white(TRACK_ALPHA))?)?;
+        track.SetBrush(&c.CreateColorBrush()?)?;
         let fill = c.CreateSpriteVisual()?;
         fill.SetBrush(&c.CreateColorBrushWithColor(gfx::color(accent, 1.0))?)?;
         fill.SetScale(Vector3 {
@@ -230,7 +224,8 @@ impl MusicCard {
             Y: THUMB / 2.0,
         })?;
         let dot_shape = c.CreateSpriteShapeWithGeometry(&dot)?;
-        dot_shape.SetFillBrush(&c.CreateColorBrushWithColor(gfx::color(text_primary(), 1.0))?)?;
+        let thumb_color = c.CreateColorBrushWithColor(gfx::color(text_primary(), 1.0))?;
+        dot_shape.SetFillBrush(&thumb_color)?;
         let thumb = c.CreateShapeVisual()?;
         thumb.SetSize(Vector2 { X: THUMB, Y: THUMB })?;
         thumb.Shapes()?.Append(&dot_shape)?;
@@ -276,6 +271,9 @@ impl MusicCard {
             panel,
             hover,
             cover,
+            cover_shape: rounded,
+            thumb: thumb.clone(),
+            thumb_color,
             content,
             bar,
             track,
@@ -298,8 +296,37 @@ impl MusicCard {
             small_glyph: gfx.icon_format(14.0)?,
             big_glyph: gfx.icon_format(20.0)?,
         };
+        card.set_theme(accent)?;
         card.place(gfx, l.card)?;
         Ok(card)
+    }
+
+    /// The active theme changed: panel, hover, cover corners and the seek
+    /// bar's colors. Call `refresh` afterwards (it places and repaints).
+    pub fn set_theme(&self, accent: Rgb) -> Result<()> {
+        let t = gfx::theme();
+        let p = t.palette;
+        self.panel.set_fill(gfx::paint(p.card))?;
+        self.panel.set_stroke(gfx::paint(p.card_border))?;
+        self.panel.set_radius(t.shape.card_radius);
+        self.hover.set_fill(gfx::paint(p.hover))?;
+        let r = t.shape.cover_radius;
+        self.cover_shape.SetCornerRadius(Vector2 { X: r, Y: r })?;
+        self.track
+            .Brush()?
+            .cast::<CompositionColorBrush>()?
+            .SetColor(gfx::paint(p.track))?;
+        self.thumb_color.SetColor(gfx::color(text_primary(), 1.0))?;
+        self.thumb.SetIsVisible(!t.terminal)?;
+        self.set_accent(accent)
+    }
+
+    fn track_height() -> f32 {
+        if gfx::theme().terminal {
+            BLOCK_TRACK_HEIGHT
+        } else {
+            TRACK_HEIGHT
+        }
     }
 
     /// The content canvas always has room for the source row.
@@ -389,7 +416,8 @@ impl MusicCard {
             X: p.track.w,
             Y: row.h,
         })?;
-        let track_y = (row.h - TRACK_HEIGHT) / 2.0;
+        let track_h = Self::track_height();
+        let track_y = (row.h - track_h) / 2.0;
         for v in [&self.track, &self.fill] {
             v.SetOffset(Vector3 {
                 X: 0.0,
@@ -398,7 +426,7 @@ impl MusicCard {
             })?;
             v.SetSize(Vector2 {
                 X: p.track.w,
-                Y: TRACK_HEIGHT,
+                Y: track_h,
             })?;
         }
         // The thumb follows by itself (its expression); never set it here.
@@ -438,12 +466,13 @@ impl MusicCard {
         self.view.borrow().clone()
     }
 
-    /// A new accent color (config reload): the seek bar's fill.
+    /// A new accent color (config reload): the seek bar's fill (unless
+    /// the theme has its own progress color).
     pub fn set_accent(&self, accent: Rgb) -> Result<()> {
         self.fill
             .Brush()?
             .cast::<CompositionColorBrush>()?
-            .SetColor(gfx::color(accent, 1.0))
+            .SetColor(gfx::color(gfx::theme().progress(accent), 1.0))
     }
 
     pub fn is_playing(&self) -> bool {
@@ -505,7 +534,8 @@ impl MusicCard {
         let icon = self.source_icon.borrow().clone();
         self.content.draw(gfx, |ctx| {
             if painted.sources {
-                let brush = gfx::brush(ctx, Rgb::new(255, 255, 255), PILL_ALPHA)?;
+                let chip = gfx::theme().palette.chip;
+                let brush = gfx::brush(ctx, chip.color, chip.alpha)?;
                 let radius = p.pill.h / 2.0;
                 // SAFETY: plain drawing call with a local struct.
                 unsafe {
@@ -519,13 +549,42 @@ impl MusicCard {
                     )
                 };
             }
+            let theme = gfx::theme();
+            // A filled circle behind play/pause (catppuccin's mauve).
+            let play_fill = theme.palette.play.filter(|_| !theme.terminal);
+            if let Some(fill) = play_fill {
+                let b = p.buttons[1];
+                let alpha = if painted.enabled[1] { 1.0 } else { DIM_ALPHA };
+                let circle = Rect::new(
+                    b.x + (b.w - PLAY_CIRCLE) / 2.0,
+                    b.y + (b.h - PLAY_CIRCLE) / 2.0,
+                    PLAY_CIRCLE,
+                    PLAY_CIRCLE,
+                );
+                gfx::round_rect(ctx, circle, PLAY_CIRCLE / 2.0, Some((fill, alpha)), None)?;
+            }
             gfx::with_glow(ctx, |ctx| {
                 let lead = DWRITE_TEXT_ALIGNMENT_LEADING;
                 let center = DWRITE_TEXT_ALIGNMENT_CENTER;
+                // Terminal: "Title — Artist" above "now playing".
+                let (line1, line2, color2) = if theme.terminal {
+                    let both = if painted.artist.is_empty() {
+                        painted.title.clone()
+                    } else {
+                        format!("{} \u{2014} {}", painted.title, painted.artist)
+                    };
+                    (both, "now playing".to_string(), theme.palette.prompt)
+                } else {
+                    (
+                        painted.title.clone(),
+                        painted.artist.clone(),
+                        text_secondary(),
+                    )
+                };
                 draw_text(
                     ctx,
                     gfx,
-                    &painted.title,
+                    &line1,
                     &self.title_format,
                     p.title,
                     lead,
@@ -534,24 +593,41 @@ impl MusicCard {
                 draw_text(
                     ctx,
                     gfx,
-                    &painted.artist,
+                    &line2,
                     &self.artist_format,
                     p.artist,
                     lead,
-                    (text_secondary(), 1.0),
+                    (color2, 1.0),
                 )?;
-                let play = if painted.playing {
-                    PAUSE_GLYPH
+                let glyphs = if theme.terminal {
+                    let play = if painted.playing {
+                        TEXT_PAUSE
+                    } else {
+                        TEXT_PLAY
+                    };
+                    [
+                        (TEXT_PREVIOUS, &self.title_format),
+                        (play, &self.title_format),
+                        (TEXT_NEXT, &self.title_format),
+                    ]
                 } else {
-                    PLAY_GLYPH
+                    let play = if painted.playing {
+                        PAUSE_GLYPH
+                    } else {
+                        PLAY_GLYPH
+                    };
+                    [
+                        (PREVIOUS_GLYPH, &self.small_glyph),
+                        (play, &self.big_glyph),
+                        (NEXT_GLYPH, &self.small_glyph),
+                    ]
                 };
-                let glyphs = [
-                    (PREVIOUS_GLYPH, &self.small_glyph),
-                    (play, &self.big_glyph),
-                    (NEXT_GLYPH, &self.small_glyph),
-                ];
                 for (i, (glyph, format)) in glyphs.into_iter().enumerate() {
                     let alpha = if painted.enabled[i] { 1.0 } else { DIM_ALPHA };
+                    let color = match play_fill {
+                        Some(fill) if i == 1 => gfx::on_fill(fill),
+                        _ => text_primary(),
+                    };
                     draw_text(
                         ctx,
                         gfx,
@@ -559,7 +635,7 @@ impl MusicCard {
                         format,
                         p.buttons[i],
                         center,
-                        (text_primary(), alpha),
+                        (color, alpha),
                     )?;
                 }
                 if painted.sources {
@@ -635,7 +711,8 @@ impl MusicCard {
                 return Ok(());
             }
             // No cover: a music note on a soft square.
-            let bg = gfx::brush(ctx, Rgb::new(255, 255, 255), 0.10)?;
+            let chip = gfx::theme().palette.chip;
+            let bg = gfx::brush(ctx, chip.color, chip.alpha)?;
             // SAFETY: plain drawing call with a local rect.
             unsafe { ctx.FillRectangle(&gfx::d2d_rect(full), &bg) };
             draw_text(
@@ -824,7 +901,7 @@ impl MusicCard {
     pub fn part_radius(&self, part: CardPart) -> f32 {
         match part {
             CardPart::Source => self.parts().pill.h / 2.0,
-            _ => BUTTON_RADIUS,
+            _ => gfx::theme().shape.button_radius,
         }
     }
 

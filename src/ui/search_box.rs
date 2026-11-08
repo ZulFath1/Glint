@@ -417,9 +417,31 @@ const TEXT_LEFT: f32 = 40.0;
 const TEXT_RIGHT_PAD: f32 = 12.0;
 const CARET_WIDTH: f32 = 1.5;
 const CARET_HEIGHT: f32 = 18.0;
-const FILL_ALPHA: f32 = 0.35;
-const BORDER_ALPHA: f32 = 0.14;
 const SELECTION_ALPHA: f32 = 0.35;
+/// Terminal themes: a `❯` prompt instead of the magnifier, the text a bit
+/// closer to it, and a block caret one character wide.
+const PROMPT: &str = "\u{276F}";
+const TERMINAL_TEXT_LEFT: f32 = 34.0;
+const BLOCK_CARET_WIDTH: f32 = 8.4;
+const BLOCK_CARET_ALPHA: f32 = 0.75;
+
+/// Where the text starts inside the box, for the active theme.
+fn text_left() -> f32 {
+    if gfx::theme().terminal {
+        TERMINAL_TEXT_LEFT
+    } else {
+        TEXT_LEFT
+    }
+}
+
+/// The caret's width for the active theme.
+fn caret_width() -> f32 {
+    if gfx::theme().terminal {
+        BLOCK_CARET_WIDTH
+    } else {
+        CARET_WIDTH
+    }
+}
 
 pub struct SearchBox {
     rect: Cell<Rect>,
@@ -449,7 +471,6 @@ impl SearchBox {
         accent: Rgb,
     ) -> Result<Self> {
         let frame = RoundRect::new(c, 10.0, 1.0)?;
-        frame.set_fill(gfx::color(Rgb::new(0, 0, 0), FILL_ALPHA))?;
         let icon = Canvas::new(c, gfx, Vector2 { X: 20.0, Y: rect.h })?;
         let text = Canvas::new(c, gfx, text_size(rect))?;
         let caret_brush = c.CreateColorBrushWithColor(gfx::color(accent, 1.0))?;
@@ -481,8 +502,34 @@ impl SearchBox {
             caret_x: Cell::new(0.0),
             layout: RefCell::new(None),
         };
-        s.set_focused(true)?;
+        s.set_theme()?;
         Ok(s)
+    }
+
+    /// The active theme changed: fill, border, corner radius and caret.
+    /// Call `set_rect` afterwards (it repaints).
+    pub fn set_theme(&self) -> Result<()> {
+        let t = gfx::theme();
+        self.frame.set_stroke_width(t.shape.search_border)?;
+        self.frame.set_fill(gfx::paint(t.palette.field))?;
+        self.caret.SetSize(Vector2 {
+            X: caret_width(),
+            Y: CARET_HEIGHT,
+        })?;
+        self.set_focused(self.focused.get())?;
+        self.set_caret_color()
+    }
+
+    fn set_caret_color(&self) -> Result<()> {
+        let alpha = if gfx::theme().terminal {
+            BLOCK_CARET_ALPHA
+        } else {
+            1.0
+        };
+        self.caret
+            .Brush()?
+            .cast::<windows::UI::Composition::CompositionColorBrush>()?
+            .SetColor(gfx::color(self.accent.get(), alpha))
     }
 
     pub fn rect(&self) -> Rect {
@@ -496,10 +543,7 @@ impl SearchBox {
     /// A new accent color (config reload): caret, focused border, selection.
     pub fn set_accent(&self, gfx: &Gfx, accent: Rgb) -> Result<()> {
         self.accent.set(accent);
-        self.caret
-            .Brush()?
-            .cast::<windows::UI::Composition::CompositionColorBrush>()?
-            .SetColor(gfx::color(accent, 1.0))?;
+        self.set_caret_color()?;
         self.set_focused(self.focused.get())?;
         self.redraw_text(gfx)
     }
@@ -510,7 +554,7 @@ impl SearchBox {
         let border = if focused {
             gfx::color(self.accent.get(), 0.9)
         } else {
-            gfx::color(Rgb::new(255, 255, 255), BORDER_ALPHA)
+            gfx::paint(gfx::theme().palette.field_border)
         };
         self.frame.set_stroke(border)?;
         self.caret.SetIsVisible(focused)
@@ -519,26 +563,27 @@ impl SearchBox {
     /// Positions everything (after a layout or DPI change) and repaints.
     pub fn set_rect(&self, gfx: &Gfx, rect: Rect) -> Result<()> {
         self.rect.set(rect);
+        self.frame.set_radius(gfx::theme().search_radius(rect.h));
         self.frame.set_rect(rect)?;
         self.icon.resize(gfx, Vector2 { X: 20.0, Y: rect.h })?;
         self.icon.set_offset(gfx, rect.x + 12.0, rect.y)?;
         self.text.resize(gfx, text_size(rect))?;
-        self.text.set_offset(gfx, rect.x + TEXT_LEFT, rect.y)?;
+        self.text.set_offset(gfx, rect.x + text_left(), rect.y)?;
         self.redraw(gfx)
     }
 
     pub fn redraw(&self, gfx: &Gfx) -> Result<()> {
         let size = self.icon.size();
-        let format = &self.icon_format;
+        let terminal = gfx::theme().terminal;
+        let (glyph, format, color, alpha) = if terminal {
+            (PROMPT, &self.format, gfx::theme().palette.prompt, 1.0)
+        } else {
+            (MAGNIFIER, &self.icon_format, text_secondary(), 0.9)
+        };
         self.icon.draw(gfx, |ctx| {
-            let layout = gfx.text_layout(
-                MAGNIFIER,
-                format,
-                size,
-                DWRITE_TEXT_ALIGNMENT_LEADING,
-                false,
-            )?;
-            let brush = gfx::brush(ctx, text_secondary(), 0.9)?;
+            let layout =
+                gfx.text_layout(glyph, format, size, DWRITE_TEXT_ALIGNMENT_LEADING, false)?;
+            let brush = gfx::brush(ctx, color, alpha)?;
             // SAFETY: draws a live text layout with a live brush.
             unsafe { ctx.DrawTextLayout(Vector2::zero(), &layout, &brush, gfx::TEXT_OPTIONS) };
             Ok(())
@@ -552,7 +597,12 @@ impl SearchBox {
         let size = self.text.size();
         let view = size.X;
         let empty = d.text.is_empty();
-        let shown = if empty { PLACEHOLDER } else { &d.text };
+        let placeholder = if gfx::theme().terminal {
+            "search apps"
+        } else {
+            PLACEHOLDER
+        };
+        let shown = if empty { placeholder } else { &d.text };
         let layout = gfx.text_layout(
             shown,
             &self.format,
@@ -627,7 +677,7 @@ impl SearchBox {
         let r = self.rect.get();
         let s = gfx.scale();
         self.caret.SetOffset(Vector3 {
-            X: gfx::snap(r.x + TEXT_LEFT + caret_x - scroll, s),
+            X: gfx::snap(r.x + text_left() + caret_x - scroll, s),
             Y: gfx::snap(r.y + (r.h - CARET_HEIGHT) / 2.0, s),
             Z: 0.0,
         })
@@ -640,7 +690,7 @@ impl SearchBox {
             return Some(0);
         };
         let r = self.rect.get();
-        let x = p.X - r.x - TEXT_LEFT + self.scroll.get();
+        let x = p.X - r.x - text_left() + self.scroll.get();
         let mut trailing = windows::core::BOOL::default();
         let mut inside = windows::core::BOOL::default();
         let mut m = DWRITE_HIT_TEST_METRICS::default();
@@ -653,9 +703,9 @@ impl SearchBox {
     pub fn caret_rect(&self) -> Rect {
         let r = self.rect.get();
         Rect::new(
-            r.x + TEXT_LEFT + self.caret_x.get() - self.scroll.get(),
+            r.x + text_left() + self.caret_x.get() - self.scroll.get(),
             r.y + (r.h - CARET_HEIGHT) / 2.0,
-            CARET_WIDTH,
+            caret_width(),
             CARET_HEIGHT,
         )
     }
@@ -663,7 +713,7 @@ impl SearchBox {
 
 fn text_size(rect: Rect) -> Vector2 {
     Vector2 {
-        X: (rect.w - TEXT_LEFT - TEXT_RIGHT_PAD).max(1.0),
+        X: (rect.w - text_left() - TEXT_RIGHT_PAD).max(1.0),
         Y: rect.h,
     }
 }

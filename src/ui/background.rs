@@ -29,17 +29,18 @@ use super::anim::{Kind, ms};
 
 /// The album tint cross-fades this long.
 const ALBUM_FADE_MS: u32 = 400;
+/// A theme switch cross-fades the colors this long (IMPROVE.md 9.4).
+pub const THEME_FADE_MS: u32 = 250;
 use crate::config::{self, Rgb};
+use crate::theme::{GLINT, Theme};
 
-/// Primary text color (#f4f4f5) that must stay readable on the background.
+/// Glint's primary text color (#f4f4f5), for the tests.
+#[cfg(test)]
 pub const TEXT: Rgb = Rgb::new(0xf4, 0xf4, 0xf5);
 const MIN_CONTRAST: f32 = 4.5;
 const GUARD_STEP: f32 = 0.05;
 const GUARD_MAX: f32 = 0.9;
 
-/// Plain border for the non-glass modes: rgba(255,255,255,0.10), 1 px.
-const BORDER_ALPHA: f32 = 0.10;
-const BORDER_WIDTH: f32 = 1.0;
 /// High contrast border: thicker, so the menu's edge is easy to see.
 const HC_BORDER_WIDTH: f32 = 2.0;
 /// Glass rim: thicker, with light catching the corners.
@@ -82,7 +83,7 @@ pub struct Applied {
 pub struct Background {
     compositor: Compositor,
     size: Cell<Vector2>,
-    corner_radius: f32,
+    corner_radius: Cell<f32>,
     backdrop: SpriteVisual,
     tint: SpriteVisual,
     overlay: SpriteVisual,
@@ -103,8 +104,10 @@ pub struct Background {
     host_backdrop_failed: Cell<bool>,
     /// The album tint: the cover's color, replacing the first color.
     album: Cell<Option<Rgb>>,
-    /// The last settings applied, to apply them again with a new album color.
-    last: RefCell<Option<(config::Background, SystemEffects)>>,
+    /// The last settings applied, to apply them again with a new album
+    /// color or theme.
+    last: RefCell<Option<(config::Background, config::ThemeId, SystemEffects)>>,
+    theme: Cell<&'static Theme>,
 }
 
 fn white(alpha: f32) -> Color {
@@ -167,7 +170,7 @@ impl Background {
                 &compositor.CreateColorGradientStopWithOffsetAndColor(offset, white(alpha))?,
             )?;
         }
-        let border_color = compositor.CreateColorBrushWithColor(white(BORDER_ALPHA))?;
+        let border_color = compositor.CreateColorBrushWithColor(paint(GLINT.palette.border))?;
         let border_geometry = compositor.CreateRoundedRectangleGeometry()?;
         let border = compositor.CreateSpriteShapeWithGeometry(&border_geometry)?;
         let border_visual = compositor.CreateShapeVisual()?;
@@ -178,14 +181,14 @@ impl Background {
         Ok(Self {
             compositor: compositor.clone(),
             size: Cell::new(size),
-            corner_radius,
+            corner_radius: Cell::new(corner_radius),
             backdrop,
             tint,
             overlay,
             sheen,
             sheen_brush,
             border_visual,
-            border_width: Cell::new(BORDER_WIDTH),
+            border_width: Cell::new(GLINT.shape.menu_border),
             angle: Cell::new(0.0),
             tint_color,
             gradient,
@@ -198,13 +201,28 @@ impl Background {
             host_backdrop_failed: Cell::new(false),
             album: Cell::new(None),
             last: RefCell::new(None),
+            theme: Cell::new(&GLINT),
         })
     }
 
-    /// Applies the background settings. Safe to call again at any time
-    /// (settings changed, transparency toggled, battery saver...).
-    pub fn apply(&self, cfg: &config::Background, effects: SystemEffects) -> Result<Applied> {
-        self.apply_with(cfg, effects, false)
+    /// Applies the background settings with `theme`'s colors. Safe to call
+    /// again at any time (settings changed, transparency toggled, battery
+    /// saver...). A different theme than last time cross-fades (250 ms) when
+    /// `animate` is true.
+    pub fn apply(
+        &self,
+        cfg: &config::Background,
+        theme: config::ThemeId,
+        effects: SystemEffects,
+        animate: bool,
+    ) -> Result<Applied> {
+        let new_theme = self.theme.get().id != theme;
+        let fade = if new_theme && animate {
+            Fade::All(THEME_FADE_MS)
+        } else {
+            Fade::None
+        };
+        self.apply_with(cfg, theme, effects, fade)
     }
 
     /// The album tint (CLAUDE.md section 6): `Some(cover color)` replaces
@@ -216,26 +234,28 @@ impl Background {
         }
         let last = self.last.borrow().clone();
         match last {
-            Some((cfg, effects)) => self.apply_with(&cfg, effects, true).map(|_| ()),
+            Some((cfg, theme, effects)) => self
+                .apply_with(&cfg, theme, effects, Fade::First(ALBUM_FADE_MS))
+                .map(|_| ()),
             None => Ok(()),
         }
     }
 
-    /// Sets a brush's or gradient stop's `Color`: at once, or (`fade`)
+    /// Sets a brush's or gradient stop's `Color`: at once, or (`fade_ms`)
     /// cross-fading from the current color.
     fn set_color(
         &self,
         target: &CompositionObject,
         to: Color,
-        fade: bool,
+        fade_ms: Option<u32>,
         set: impl FnOnce(Color) -> Result<()>,
     ) -> Result<()> {
-        if fade {
+        if let Some(duration) = fade_ms {
             let a = self.compositor.CreateColorKeyFrameAnimation()?;
             a.SetInterpolationColorSpace(CompositionColorSpace::Rgb)?;
             a.InsertExpressionKeyFrame(0.0, h!("this.StartingValue"))?;
             a.InsertKeyFrame(1.0, to)?;
-            a.SetDuration(ms(ALBUM_FADE_MS))?;
+            a.SetDuration(ms(duration))?;
             return target.StartAnimation(h!("Color"), &a);
         }
         target.StopAnimation(h!("Color"))?;
@@ -245,16 +265,23 @@ impl Background {
     fn apply_with(
         &self,
         cfg: &config::Background,
+        theme_id: config::ThemeId,
         effects: SystemEffects,
-        fade: bool,
+        fade: Fade,
     ) -> Result<Applied> {
-        *self.last.borrow_mut() = Some((cfg.clone(), effects));
+        *self.last.borrow_mut() = Some((cfg.clone(), theme_id, effects));
+        let theme = theme_id.theme();
+        let new_theme = self.theme.replace(theme).id != theme_id;
+        if new_theme {
+            self.corner_radius.set(theme.shape.menu_radius);
+        }
         if let Some(hc) = effects.high_contrast {
             return self.apply_high_contrast(hc);
         }
-        let mut colors = cfg.resolved_colors();
+        let text = theme.palette.text;
+        let mut colors = cfg.resolved_colors(theme_id);
         if let Some(album) = self.album.get() {
-            colors[0] = album_tint(album, cfg.overlay);
+            colors[0] = album_tint(album, cfg.overlay, text);
         }
 
         let wants_glass =
@@ -284,17 +311,19 @@ impl Background {
             for (i, &c) in colors.iter().enumerate() {
                 let stop = stops.GetAt(i as u32)?;
                 stop.SetOffset(i as f32 / last)?;
-                let fade_this = fade && i == 0;
-                self.set_color(&stop.cast()?, to_color(c, alpha), fade_this, |c| {
+                self.set_color(&stop.cast()?, to_color(c, alpha), fade.for_stop(i), |c| {
                     stop.SetColor(c)
                 })?;
             }
             self.tint.SetBrush(&self.gradient)?;
         } else {
             let brush = &self.tint_color;
-            self.set_color(&brush.cast()?, to_color(colors[0], alpha), fade, |c| {
-                brush.SetColor(c)
-            })?;
+            self.set_color(
+                &brush.cast()?,
+                to_color(colors[0], alpha),
+                fade.for_stop(0),
+                |c| brush.SetColor(c),
+            )?;
             self.tint.SetBrush(&self.tint_color)?;
         }
 
@@ -307,7 +336,7 @@ impl Background {
         } else {
             &colors[..1]
         };
-        let overlay = guard_overlay(shown, cfg.overlay);
+        let overlay = guard_overlay(shown, cfg.overlay, text);
         if overlay > cfg.overlay + f32::EPSILON {
             log_info!(
                 "contrast guard raised the overlay from {:.2} to {overlay:.2}",
@@ -325,9 +354,15 @@ impl Background {
             self.set_border(RIM_WIDTH)?;
             self.border.SetStrokeBrush(&self.rim)?;
         } else {
-            self.set_border(BORDER_WIDTH)?;
+            self.set_border(theme.shape.menu_border)?;
             self.border.SetStrokeBrush(&self.border_color)?;
-            self.border_color.SetColor(white(BORDER_ALPHA))?;
+            let border = &self.border_color;
+            self.set_color(
+                &border.cast()?,
+                paint(theme.palette.border),
+                fade.for_stop(1),
+                |c| border.SetColor(c),
+            )?;
         }
 
         if wants_glass && !glass {
@@ -404,7 +439,7 @@ impl Background {
             X: size.X - width,
             Y: size.Y - width,
         })?;
-        let r = self.corner_radius - inset;
+        let r = (self.corner_radius.get() - inset).max(0.0);
         self.border_geometry
             .SetCornerRadius(Vector2 { X: r, Y: r })?;
         self.border.SetStrokeThickness(width)
@@ -432,6 +467,31 @@ impl Background {
         }
         Ok(true)
     }
+}
+
+/// Which colors cross-fade in `apply_with`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fade {
+    None,
+    /// Only the first color (the album tint), over this many ms.
+    First(u32),
+    /// Every color (a theme switch).
+    All(u32),
+}
+
+impl Fade {
+    /// The fade time for color `i` (the border counts as color 1).
+    fn for_stop(self, i: usize) -> Option<u32> {
+        match self {
+            Self::None => None,
+            Self::First(ms) => (i == 0).then_some(ms),
+            Self::All(ms) => Some(ms),
+        }
+    }
+}
+
+fn paint(p: crate::theme::Paint) -> Color {
+    to_color(p.color, p.alpha)
 }
 
 fn alpha_byte(a: f32) -> u8 {
@@ -492,22 +552,23 @@ pub fn darken(c: Rgb, alpha: f32) -> Rgb {
     Rgb::new(f(c.r), f(c.g), f(c.b))
 }
 
-/// The album color made dark enough: darkened in 5% steps until `TEXT` has
+/// The album color made dark enough: darkened in 5% steps until `text` has
 /// 4.5:1 contrast on it (with the user's overlay on top).
-pub fn album_tint(c: Rgb, overlay: f32) -> Rgb {
+pub fn album_tint(c: Rgb, overlay: f32, text: Rgb) -> Rgb {
     (0..=20)
         .map(|step| darken(c, step as f32 * GUARD_STEP))
-        .find(|&candidate| contrast(TEXT, darken(candidate, overlay)) >= MIN_CONTRAST)
+        .find(|&candidate| contrast(text, darken(candidate, overlay)) >= MIN_CONTRAST)
         .unwrap_or(Rgb::new(0, 0, 0))
 }
 
-/// Raises the overlay in 0.05 steps until `TEXT` has 4.5:1 contrast on every
-/// color. Never returns less than the user's overlay.
-pub fn guard_overlay(colors: &[Rgb], user_overlay: f32) -> f32 {
+/// Raises the overlay in 0.05 steps until `text` (the theme's text color)
+/// has 4.5:1 contrast on every color. Never returns less than the user's
+/// overlay.
+pub fn guard_overlay(colors: &[Rgb], user_overlay: f32, text: Rgb) -> f32 {
     let passes = |o: f32| {
         colors
             .iter()
-            .all(|&c| contrast(TEXT, darken(c, o)) >= MIN_CONTRAST)
+            .all(|&c| contrast(text, darken(c, o)) >= MIN_CONTRAST)
     };
     let mut steps = 0u32;
     loop {
@@ -542,41 +603,41 @@ mod tests {
     fn dark_presets_need_no_extra_overlay() {
         for preset in Preset::BUILT_IN {
             let colors = preset.colors().unwrap();
-            assert!(close(guard_overlay(colors, 0.2), 0.2), "{preset:?}");
+            assert!(close(guard_overlay(colors, 0.2, TEXT), 0.2), "{preset:?}");
         }
     }
 
     #[test]
     fn bright_colors_get_more_overlay_but_never_less() {
         let bright = [Rgb::new(0xf0, 0xa0, 0x40), Rgb::new(0x40, 0xd0, 0xf0)];
-        let o = guard_overlay(&bright, 0.1);
+        let o = guard_overlay(&bright, 0.1, TEXT);
         assert!(o > 0.1);
         for c in bright {
             assert!(contrast(TEXT, darken(c, o)) >= MIN_CONTRAST);
         }
         // The user's overlay is kept when it is already high enough.
-        assert!(close(guard_overlay(&bright, 0.6), 0.6));
+        assert!(close(guard_overlay(&bright, 0.6, TEXT), 0.6));
     }
 
     #[test]
     fn album_colors_are_darkened_until_text_is_readable() {
         // A bright yellow cover gets much darker...
         let yellow = Rgb::new(0xf5, 0xd0, 0x20);
-        let tint = album_tint(yellow, 0.2);
+        let tint = album_tint(yellow, 0.2, TEXT);
         assert!(contrast(TEXT, darken(tint, 0.2)) >= MIN_CONTRAST);
         assert!(luminance(tint) < luminance(yellow));
         // ...and keeps its hue (red stays the biggest channel).
         assert!(tint.r >= tint.b);
         // A dark cover color is used as it is.
         let navy = Rgb::new(0x10, 0x20, 0x50);
-        assert_eq!(album_tint(navy, 0.2), navy);
+        assert_eq!(album_tint(navy, 0.2, TEXT), navy);
         // So the readability guard never has to step in for it.
-        assert!(close(guard_overlay(&[tint], 0.2), 0.2));
+        assert!(close(guard_overlay(&[tint], 0.2, TEXT), 0.2));
     }
 
     #[test]
     fn colorless_glass_keeps_the_user_overlay() {
-        assert!(close(guard_overlay(&[], 0.2), 0.2));
+        assert!(close(guard_overlay(&[], 0.2, TEXT), 0.2));
     }
 
     #[test]

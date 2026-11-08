@@ -47,7 +47,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{Interface, Result, w};
 use windows_numerics::{Vector2, Vector3};
 
-use crate::config::{Accent, Config, Hotkey, Preset, Rgb};
+use crate::config::{Accent, Config, Hotkey, Preset, Rgb, ThemeId};
 use crate::ui::background::{Background, SystemEffects};
 use crate::ui::gfx::{self, Canvas, Gfx};
 use crate::ui::layout::Rect;
@@ -424,6 +424,12 @@ impl SettingsWindow {
         logged("repaint", self.paint_page(gfx));
     }
 
+    /// The theme changed: every text color and the font may differ, so the
+    /// whole window is painted again.
+    pub fn theme_changed(&self, gfx: &Gfx) {
+        logged("repaint", self.paint_all(gfx));
+    }
+
     /// The accent color in use changed (config, or the Windows accent).
     pub fn set_accent(&self, gfx: &Gfx, accent: Rgb) {
         if self.accent.replace(accent) == accent {
@@ -443,7 +449,7 @@ impl SettingsWindow {
         logged(
             "background",
             self.background
-                .apply(&config.background, effects)
+                .apply(&config.background, config.theme, effects, false)
                 .map(|_| ()),
         );
     }
@@ -785,6 +791,17 @@ impl SettingsWindow {
             return Action::None;
         };
         match item {
+            // A theme brings its own colors: the background and accent go
+            // back to "the theme's" (they can be changed again afterwards).
+            Item::ThemeCard => match ThemeId::ALL.get(p) {
+                Some(&id) => self.change(gfx, |c| {
+                    c.theme = id;
+                    c.background.preset = Preset::Theme;
+                    c.accent = Accent::Theme;
+                }),
+                None => Action::None,
+            },
+            Item::IconTint => self.change(gfx, |c| c.icon_tint = !c.icon_tint),
             Item::Mode => match page::MODES.get(p) {
                 Some(&(mode, _)) => self.change(gfx, |c| c.background.mode = mode),
                 None => Action::None,
@@ -820,7 +837,7 @@ impl SettingsWindow {
                 self.change(gfx, |c| {
                     c.accent = match c.accent {
                         Accent::System => Accent::Color(shown),
-                        Accent::Color(_) => Accent::System,
+                        Accent::Theme | Accent::Color(_) => Accent::System,
                     }
                 })
             }

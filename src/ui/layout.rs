@@ -11,6 +11,8 @@
 
 use windows_numerics::Vector2;
 
+use crate::theme::{FooterStyle, Theme};
+
 /// Search bar: 16 from the top and the sides, 40 tall, 8 below.
 pub const SEARCH_PAD: f32 = 16.0;
 pub const SEARCH_HEIGHT: f32 = 40.0;
@@ -38,6 +40,24 @@ pub const POWER_BUTTON: f32 = 44.0;
 const FOOTER_INSET: f32 = 8.0;
 /// Between the Settings gear and the power button.
 const BUTTON_GAP: f32 = 4.0;
+
+/// Terminal themes: a title strip at the top ("user@glint: ~" + clock),
+/// and a "── pinned ──" label above the grid.
+pub const TITLE_HEIGHT: f32 = 30.0;
+const TITLE_BELOW: f32 = 10.0;
+pub const SECTION_HEIGHT: f32 = 18.0;
+const SECTION_BELOW: f32 = 6.0;
+
+/// Footer buttons (Lock / Restart / Shut down) of the Buttons style:
+/// 44 × 44 round squares, 6 apart.
+pub const QUICK_BUTTON: f32 = 44.0;
+const QUICK_GAP: f32 = 6.0;
+/// The Text style: `[ lock ]` `[ restart ]` `[ off ]`, 30 tall, as wide as
+/// their text in the monospace font (12 px: about 7.2 DIPs a character).
+pub const QUICK_LABELS: [&str; 3] = ["[ lock ]", "[ restart ]", "[ off ]"];
+const QUICK_TEXT_HEIGHT: f32 = 30.0;
+const MONO_CHAR: f32 = 7.2;
+const QUICK_TEXT_PAD: f32 = 8.0;
 
 /// The power strip: a row of 4 buttons above the footer
 /// (Lock, Sleep, Restart, Shut down; the owner never signs out, so that one
@@ -232,6 +252,10 @@ pub struct Layout {
     pub result_rows: Vec<Rect>,
     /// Where "No apps found" goes.
     pub no_results: Rect,
+    /// The title strip (terminal themes; empty otherwise).
+    pub title: Rect,
+    /// The "── pinned ──" label (terminal themes; empty otherwise).
+    pub section: Rect,
     pub footer: Rect,
     pub avatar: Rect,
     /// Where the display name may go (it is trimmed with "…" to fit).
@@ -241,15 +265,32 @@ pub struct Layout {
     /// The gear that opens the Settings window.
     pub settings: Rect,
     pub power: Rect,
+    /// Lock / Restart / Shut down as separate buttons (Buttons and Text
+    /// footer styles; empty with the power button).
+    pub quick: Vec<Rect>,
     pub strip: Rect,
 }
 
 /// The window has to fit the tallest menu, so it never has to move or grow
 /// while the menu is open: the grid with the biggest music card, or 8
 /// results, whichever is taller.
-pub fn max_size(pins: usize, max_columns: usize) -> Vector2 {
-    let grid = layout(pins, max_columns, Content::Grid, Music::CardWithSources).size;
-    let list = layout(pins, max_columns, Content::List(MAX_RESULTS), Music::Hidden).size;
+pub fn max_size(pins: usize, max_columns: usize, theme: &Theme) -> Vector2 {
+    let grid = layout(
+        pins,
+        max_columns,
+        Content::Grid,
+        Music::CardWithSources,
+        theme,
+    )
+    .size;
+    let list = layout(
+        pins,
+        max_columns,
+        Content::List(MAX_RESULTS),
+        Music::Hidden,
+        theme,
+    )
+    .size;
     Vector2 {
         X: grid.X.max(list.X),
         Y: grid.Y.max(list.Y),
@@ -258,8 +299,15 @@ pub fn max_size(pins: usize, max_columns: usize) -> Vector2 {
 
 /// The menu layout for `pins` pinned apps, showing `content`, with the music
 /// card as `music` says (the card only shows with the grid, never with search
-/// results).
-pub fn layout(pins: usize, max_columns: usize, content: Content, music: Music) -> Layout {
+/// results), for `theme` (a terminal theme adds a title strip and a section
+/// label; its footer style places the buttons).
+pub fn layout(
+    pins: usize,
+    max_columns: usize,
+    content: Content,
+    music: Music,
+    theme: &Theme,
+) -> Layout {
     let music = if content == Content::Grid {
         music
     } else {
@@ -271,17 +319,39 @@ pub fn layout(pins: usize, max_columns: usize, content: Content, music: Music) -
     } else {
         pins.div_ceil(columns)
     };
-    let width = MIN_WIDTH.max(columns as f32 * CELL_STEP + WIDTH_EXTRA);
+    let width = MIN_WIDTH
+        .max(columns as f32 * CELL_STEP + WIDTH_EXTRA)
+        .max(footer_min_width(theme.footer));
 
+    let (title, search_top) = if theme.terminal {
+        (
+            Rect::new(0.0, 0.0, width, TITLE_HEIGHT),
+            TITLE_HEIGHT + TITLE_BELOW,
+        )
+    } else {
+        (Rect::default(), SEARCH_PAD)
+    };
     let search = Rect::new(
         SEARCH_PAD,
-        SEARCH_PAD,
+        search_top,
         width - 2.0 * SEARCH_PAD,
         SEARCH_HEIGHT,
     );
 
+    // The section label sits between the search box and the grid.
+    let (section, grid_top) = if theme.terminal {
+        let section = Rect::new(
+            SEARCH_PAD,
+            search.bottom() + SEARCH_BELOW,
+            width - 2.0 * SEARCH_PAD,
+            SECTION_HEIGHT,
+        );
+        (section, section.bottom() + SECTION_BELOW)
+    } else {
+        (Rect::default(), search.bottom() + SEARCH_BELOW)
+    };
+
     // The grid is centered; its height is the rows minus the last gap.
-    let grid_top = search.bottom() + SEARCH_BELOW;
     let grid_width = columns as f32 * CELL_STEP - CELL_GAP;
     let grid_left = ((width - grid_width) / 2.0).round();
     let cells = (0..pins)
@@ -346,20 +416,30 @@ pub fn layout(pins: usize, max_columns: usize, content: Content, music: Music) -
         POWER_BUTTON,
         POWER_BUTTON,
     );
-    // The Settings gear, just left of the power button, same size.
+    let quick = quick_buttons(theme.footer, width, mid);
+    // The Settings gear, just left of the power button (or the first
+    // separate button), same size.
+    let gear_right = quick
+        .first()
+        .map_or(power.x - BUTTON_GAP, |q| q.x - QUICK_GAP);
     let settings = Rect::new(
-        power.x - BUTTON_GAP - POWER_BUTTON,
+        gear_right - POWER_BUTTON,
         power.y,
         POWER_BUTTON,
         POWER_BUTTON,
     );
     let avatar = Rect::new(16.0, mid - AVATAR / 2.0, AVATAR, AVATAR);
     let name_x = avatar.right() + 10.0;
-    let name = Rect::new(name_x, mid - 10.0, settings.x - 12.0 - name_x, 20.0);
+    let name = Rect::new(
+        name_x,
+        mid - 10.0,
+        (settings.x - 12.0 - name_x).max(0.0),
+        20.0,
+    );
     let profile = Rect::new(
         FOOTER_INSET,
         footer_top + FOOTER_INSET,
-        settings.x - 8.0 - FOOTER_INSET,
+        (settings.x - 8.0 - FOOTER_INSET).max(AVATAR + 16.0),
         FOOTER_HEIGHT - 2.0 * FOOTER_INSET,
     );
     let strip = Rect::new(
@@ -378,6 +458,8 @@ pub fn layout(pins: usize, max_columns: usize, content: Content, music: Music) -
             X: width,
             Y: footer.bottom(),
         },
+        title,
+        section,
         search,
         columns,
         rows,
@@ -390,8 +472,47 @@ pub fn layout(pins: usize, max_columns: usize, content: Content, music: Music) -
         profile,
         settings,
         power,
+        quick,
         strip,
     }
+}
+
+/// The narrowest menu whose footer still fits the avatar, a short name, the
+/// gear and the separate buttons (0 for the power-button style).
+fn footer_min_width(style: FooterStyle) -> f32 {
+    const NAME_X: f32 = 16.0 + AVATAR + 10.0;
+    const MIN_NAME: f32 = 80.0;
+    let buttons = quick_buttons(style, 0.0, 0.0);
+    if buttons.is_empty() {
+        return 0.0;
+    }
+    let quick: f32 = buttons.iter().map(|r| r.w + QUICK_GAP).sum();
+    (NAME_X + MIN_NAME + 12.0 + POWER_BUTTON + quick + FOOTER_INSET).ceil()
+}
+
+/// The separate Lock / Restart / Shut down buttons, right-aligned in the
+/// footer (vertical center `mid`). None for the power-button style.
+fn quick_buttons(style: FooterStyle, width: f32, mid: f32) -> Vec<Rect> {
+    let (widths, h): ([f32; 3], f32) = match style {
+        FooterStyle::Power => return Vec::new(),
+        FooterStyle::Buttons => ([QUICK_BUTTON; 3], QUICK_BUTTON),
+        FooterStyle::Text => (
+            QUICK_LABELS.map(|l| l.chars().count() as f32 * MONO_CHAR + QUICK_TEXT_PAD),
+            QUICK_TEXT_HEIGHT,
+        ),
+    };
+    let mut right = width - FOOTER_INSET;
+    let mut rects: Vec<Rect> = widths
+        .iter()
+        .rev()
+        .map(|&w| {
+            let r = Rect::new((right - w).round(), (mid - h / 2.0).round(), w.round(), h);
+            right = r.x - QUICK_GAP;
+            r
+        })
+        .collect();
+    rects.reverse();
+    rects
 }
 
 /// The 5 power buttons, relative to the strip's top-left corner.
@@ -420,10 +541,11 @@ pub fn confirm_buttons(strip: Rect) -> [Rect; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{CATPPUCCIN, GLINT, GRUVBOX};
 
     #[test]
     fn six_pins_make_a_4_by_2_grid() {
-        let l = layout(6, 4, Content::Grid, Music::Hidden);
+        let l = layout(6, 4, Content::Grid, Music::Hidden, &GLINT);
         assert_eq!((l.columns, l.rows), (4, 2));
         assert_eq!(l.size.X, 360.0); // 4 × 84 + 24
         assert_eq!(l.size.Y, 64.0 + 164.0 + 12.0 + 60.0);
@@ -434,10 +556,10 @@ mod tests {
     #[test]
     fn six_and_eight_columns() {
         // The new default: 6 pins in one row of 6, 6 × 84 + 24 = 528 wide.
-        let l = layout(6, 6, Content::Grid, Music::Hidden);
+        let l = layout(6, 6, Content::Grid, Music::Hidden, &GLINT);
         assert_eq!((l.columns, l.rows), (6, 1));
         assert_eq!(l.size.X, 528.0);
-        let l = layout(16, 8, Content::Grid, Music::Hidden);
+        let l = layout(16, 8, Content::Grid, Music::Hidden, &GLINT);
         assert_eq!((l.columns, l.rows), (8, 2));
         assert_eq!(l.size.X, 696.0);
         assert_eq!(l.cells[15].right(), 696.0 - 14.0);
@@ -446,7 +568,7 @@ mod tests {
     #[test]
     fn the_gear_sits_left_of_the_power_button() {
         for pins in [0, 3, 6, 16] {
-            let l = layout(pins, 6, Content::Grid, Music::Hidden);
+            let l = layout(pins, 6, Content::Grid, Music::Hidden, &GLINT);
             assert_eq!(l.settings.size(), l.power.size());
             assert_eq!(l.settings.y, l.power.y);
             assert_eq!(l.settings.right() + 4.0, l.power.x);
@@ -458,31 +580,37 @@ mod tests {
 
     #[test]
     fn few_pins_keep_the_minimum_width_and_center_the_grid() {
-        let l = layout(1, 4, Content::Grid, Music::Hidden);
+        let l = layout(1, 4, Content::Grid, Music::Hidden, &GLINT);
         assert_eq!((l.columns, l.rows), (1, 1));
         assert_eq!(l.size.X, 320.0);
         assert_eq!(l.cells[0].x, 120.0); // (320 - 80) / 2
-        let l3 = layout(3, 4, Content::Grid, Music::Hidden);
+        let l3 = layout(3, 4, Content::Grid, Music::Hidden, &GLINT);
         assert_eq!(l3.size.X, 320.0);
         // Fewer rows means a shorter menu.
         assert!(
-            layout(4, 4, Content::Grid, Music::Hidden).size.Y
-                < layout(5, 4, Content::Grid, Music::Hidden).size.Y
+            layout(4, 4, Content::Grid, Music::Hidden, &GLINT).size.Y
+                < layout(5, 4, Content::Grid, Music::Hidden, &GLINT).size.Y
         );
-        assert_eq!(layout(4, 4, Content::Grid, Music::Hidden).size.Y, l.size.Y);
+        assert_eq!(
+            layout(4, 4, Content::Grid, Music::Hidden, &GLINT).size.Y,
+            l.size.Y
+        );
     }
 
     #[test]
     fn many_pins_add_rows_not_columns() {
-        let l = layout(9, 4, Content::Grid, Music::Hidden);
+        let l = layout(9, 4, Content::Grid, Music::Hidden, &GLINT);
         assert_eq!((l.columns, l.rows), (4, 3));
         assert_eq!(l.size.X, 360.0);
-        assert_eq!(layout(9, 3, Content::Grid, Music::Hidden).columns, 3);
+        assert_eq!(
+            layout(9, 3, Content::Grid, Music::Hidden, &GLINT).columns,
+            3
+        );
     }
 
     #[test]
     fn no_pins_is_search_plus_footer() {
-        let l = layout(0, 4, Content::Grid, Music::Hidden);
+        let l = layout(0, 4, Content::Grid, Music::Hidden, &GLINT);
         assert_eq!((l.columns, l.rows), (0, 0));
         assert!(l.cells.is_empty());
         assert_eq!(
@@ -496,9 +624,9 @@ mod tests {
 
     #[test]
     fn search_results_keep_the_width_and_follow_the_row_count() {
-        let grid = layout(6, 4, Content::Grid, Music::Hidden);
-        let three = layout(6, 4, Content::List(3), Music::Hidden);
-        let eight = layout(6, 4, Content::List(8), Music::Hidden);
+        let grid = layout(6, 4, Content::Grid, Music::Hidden, &GLINT);
+        let three = layout(6, 4, Content::List(3), Music::Hidden, &GLINT);
+        let eight = layout(6, 4, Content::List(8), Music::Hidden, &GLINT);
         assert_eq!(three.size.X, grid.size.X);
         assert_eq!(three.result_rows.len(), 3);
         assert_eq!(three.result_rows[0], Rect::new(12.0, 64.0, 336.0, 40.0));
@@ -508,11 +636,11 @@ mod tests {
         assert_eq!(eight.size.Y, 64.0 + 320.0 + 12.0 + 60.0);
         // More than 8 is capped.
         assert_eq!(
-            layout(6, 4, Content::List(20), Music::Hidden).result_rows,
+            layout(6, 4, Content::List(20), Music::Hidden, &GLINT).result_rows,
             eight.result_rows
         );
         // No results: one row for the message.
-        let none = layout(6, 4, Content::List(0), Music::Hidden);
+        let none = layout(6, 4, Content::List(0), Music::Hidden, &GLINT);
         assert!(none.result_rows.is_empty());
         assert_eq!(none.size.Y, 64.0 + 40.0 + 12.0 + 60.0);
         assert_eq!(none.no_results, three.result_rows[0]);
@@ -524,27 +652,27 @@ mod tests {
     fn the_window_fits_the_tallest_menu() {
         // 2 rows of icons + the tallest card (434) < 8 results (456).
         assert_eq!(
-            max_size(6, 4),
-            layout(6, 4, Content::List(8), Music::Hidden).size
+            max_size(6, 4, &GLINT),
+            layout(6, 4, Content::List(8), Music::Hidden, &GLINT).size
         );
         // 5 rows of icons + the card are taller than 8 results.
         assert_eq!(
-            max_size(20, 4),
-            layout(20, 4, Content::Grid, Music::CardWithSources).size
+            max_size(20, 4, &GLINT),
+            layout(20, 4, Content::Grid, Music::CardWithSources, &GLINT).size
         );
         for pins in 0..13 {
-            let max = max_size(pins, 4);
+            let max = max_size(pins, 4, &GLINT);
             for music in [Music::Hidden, Music::Card, Music::CardWithSources] {
-                assert!(layout(pins, 4, Content::Grid, music).size.Y <= max.Y);
+                assert!(layout(pins, 4, Content::Grid, music, &GLINT).size.Y <= max.Y);
             }
         }
     }
 
     #[test]
     fn the_music_card_sits_between_the_grid_and_the_footer() {
-        let plain = layout(6, 4, Content::Grid, Music::Hidden);
-        let card = layout(6, 4, Content::Grid, Music::Card);
-        let full = layout(6, 4, Content::Grid, Music::CardWithSources);
+        let plain = layout(6, 4, Content::Grid, Music::Hidden, &GLINT);
+        let card = layout(6, 4, Content::Grid, Music::Card, &GLINT);
+        let full = layout(6, 4, Content::Grid, Music::CardWithSources, &GLINT);
         // 12 below the grid, 12 from the sides, 12 above the footer.
         assert_eq!(card.card, Rect::new(12.0, 64.0 + 164.0 + 12.0, 336.0, 88.0));
         assert_eq!(card.footer.y, card.card.bottom() + 12.0);
@@ -553,11 +681,11 @@ mod tests {
         // The grid doesn't move when the card appears.
         assert_eq!(card.cells, plain.cells);
         // Search results hide the card.
-        let list = layout(6, 4, Content::List(3), Music::Card);
+        let list = layout(6, 4, Content::List(3), Music::Card, &GLINT);
         assert_eq!(list.music, Music::Hidden);
         assert_eq!(
             list.size,
-            layout(6, 4, Content::List(3), Music::Hidden).size
+            layout(6, 4, Content::List(3), Music::Hidden, &GLINT).size
         );
     }
 
@@ -598,7 +726,7 @@ mod tests {
         ];
         for (content, music) in cases {
             for pins in 0..13 {
-                let l = layout(pins, 4, content, music);
+                let l = layout(pins, 4, content, music, &GLINT);
                 assert_eq!(l.footer.bottom(), l.size.Y);
                 assert!(l.power.right() <= l.size.X && l.power.bottom() <= l.size.Y);
                 assert!(l.strip.y >= 0.0, "{pins} pins");
@@ -611,5 +739,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn terminal_themes_add_a_title_strip_and_a_section_label() {
+        let plain = layout(6, 6, Content::Grid, Music::Hidden, &GLINT);
+        let term = layout(6, 6, Content::Grid, Music::Hidden, &GRUVBOX);
+        assert_eq!(plain.title, Rect::default());
+        assert_eq!(term.title, Rect::new(0.0, 0.0, 528.0, TITLE_HEIGHT));
+        assert_eq!(term.search.y, TITLE_HEIGHT + 10.0);
+        assert!(term.section.y >= term.search.bottom());
+        assert!(term.cells[0].y >= term.section.bottom());
+        // Search results start where the grid starts.
+        let list = layout(6, 6, Content::List(3), Music::Hidden, &GRUVBOX);
+        assert_eq!(list.result_rows[0].y, term.cells[0].y);
+        // Taller, so the window grows to fit.
+        assert!(max_size(6, 6, &GRUVBOX).Y > max_size(6, 6, &GLINT).Y);
+    }
+
+    #[test]
+    fn separate_footer_buttons_fit_right_of_the_name() {
+        for theme in [&CATPPUCCIN, &GRUVBOX] {
+            for pins in [0, 3, 6, 16] {
+                let l = layout(pins, 6, Content::Grid, Music::Hidden, theme);
+                assert_eq!(l.quick.len(), 3);
+                let last = l.quick[2];
+                assert!((l.size.X - last.right() - 8.0).abs() < 0.6, "{pins}");
+                for pair in l.quick.windows(2) {
+                    assert!(pair[0].right() < pair[1].x);
+                }
+                for q in &l.quick {
+                    assert!(q.y >= l.footer.y && q.bottom() <= l.footer.bottom());
+                    assert!(q.h >= 30.0 && q.w >= 44.0, "{q:?}");
+                }
+                assert!(l.settings.right() < l.quick[0].x);
+                assert!(l.name.right() <= l.settings.x);
+                assert!(l.profile.right() < l.settings.x);
+            }
+        }
+        // The default 6 columns leave room for a real name.
+        assert!(layout(6, 6, Content::Grid, Music::Hidden, &GRUVBOX).name.w > 150.0);
+        assert!(
+            layout(6, 6, Content::Grid, Music::Hidden, &GLINT)
+                .quick
+                .is_empty()
+        );
     }
 }

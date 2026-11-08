@@ -22,6 +22,7 @@ mod search;
 mod settings;
 mod settings_watch;
 mod stress;
+mod theme;
 mod tray;
 mod ui;
 mod window;
@@ -189,6 +190,7 @@ fn resolve_accent(config: &Config, settings: &SettingsWatch) -> Rgb {
     }
     match config.accent {
         Accent::Color(c) => c,
+        Accent::Theme => config.theme.theme().palette.accent,
         Accent::System => settings.accent().unwrap_or(config::DEFAULT_ACCENT),
     }
 }
@@ -503,11 +505,17 @@ impl App {
     fn apply_config(&self, new: Config, why: &str) {
         let old = self.config.replace(new.clone());
         let mut changed = Vec::new();
-        if old.background != new.background {
+        let new_theme = old.theme != new.theme;
+        if new_theme || old.icon_tint != new.icon_tint {
+            changed.push("theme");
+            self.apply_theme();
+        }
+        // A theme brings its own background colors and accent.
+        if old.background != new.background || new_theme {
             changed.push("background");
             self.apply_background();
         }
-        if old.accent != new.accent {
+        if old.accent != new.accent || new_theme {
             changed.push("accent");
             self.apply_accent();
         }
@@ -565,6 +573,32 @@ impl App {
             if let Some(s) = self.settings_window.borrow().as_ref() {
                 s.set_accent(self.ui.gfx(), accent);
             }
+        }
+    }
+
+    /// The theme or icon tint changed: repaint the menu in the new look.
+    /// The window may grow first, like for new pins.
+    fn apply_theme(&self) {
+        let (theme, tint) = {
+            let c = self.config.borrow();
+            (c.theme, c.icon_tint)
+        };
+        let shown = self.is_visible.get();
+        let result = self.ui.set_theme(theme, tint, |size| {
+            if !shown {
+                return None;
+            }
+            let p = self.placement_for(size);
+            if self.placement.get() == Some(p) {
+                return None;
+            }
+            self.show_window(&p);
+            self.placement.set(Some(p));
+            Some(p)
+        });
+        log_err("switching the theme", result);
+        if let Some(s) = self.settings_window.borrow().as_ref() {
+            s.theme_changed(self.ui.gfx());
         }
     }
 
@@ -1085,6 +1119,7 @@ Fix the file, then try again."
             stress::TIMER_STRESS => self.stress_close(),
             ui::TIMER_ICONS => self.ui.load_icons(),
             ui::TIMER_SEEK => log_err("music time", self.ui.music_tick()),
+            ui::TIMER_CLOCK => log_err("clock", self.ui.clock_tick()),
             _ => {}
         }
     }
@@ -1234,6 +1269,17 @@ Fix the file, then try again."
             return;
         };
         let (n, plan) = s.next();
+
+        // Theme: in memory only, like everything here.
+        if let Some((theme, tint)) = plan.theme {
+            {
+                let mut c = self.config.borrow_mut();
+                c.theme = theme;
+                c.icon_tint = tint;
+            }
+            self.apply_theme();
+            self.apply_accent();
+        }
 
         // Background mode: on the menu only (config.toml is never written).
         let mut look = self.config.borrow().clone();

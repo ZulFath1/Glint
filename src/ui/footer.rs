@@ -11,7 +11,7 @@ use windows::UI::Composition::{
 };
 use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ELLIPSE, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT, ID2D1DeviceContext,
+    D2D1_ELLIPSE, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, ID2D1DeviceContext,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT,
@@ -32,13 +32,19 @@ use super::layout::{self, AVATAR, Layout, POWER_BUTTON, Rect};
 use super::shape::RoundRect;
 use crate::config::Rgb;
 use crate::power::PowerAction;
+use crate::theme::FooterStyle;
 
 const NAME_SIZE: f32 = 13.0;
 const POWER_GLYPH: &str = "\u{E7E8}";
 const PERSON_GLYPH: &str = "\u{E77B}";
 const GEAR_GLYPH: &str = "\u{E713}";
-const FOOTER_FILL: f32 = 0.22;
-const DIVIDER_ALPHA: f32 = 0.08;
+/// The separate footer buttons (Buttons / Text styles), in order.
+pub const QUICK_ACTIONS: [PowerAction; 3] = [
+    PowerAction::Lock,
+    PowerAction::Restart,
+    PowerAction::ShutDown,
+];
+const QUICK_TEXT_SIZE: f32 = 12.0;
 
 // ---------------------------------------------------------------------------
 // Who is signed in
@@ -151,6 +157,9 @@ pub(super) fn draw_text(
 pub struct Footer {
     fill: SpriteVisual,
     divider: SpriteVisual,
+    /// Lock / Restart / Shut down (only shown with those footer styles).
+    quick: Vec<Canvas>,
+    quick_text: IDWriteTextFormat,
     avatar: Canvas,
     name: Canvas,
     power: Canvas,
@@ -175,12 +184,11 @@ impl Footer {
         front: &ContainerVisual,
         layout: &Layout,
     ) -> Result<Self> {
+        let p = gfx::theme().palette;
         let fill = c.CreateSpriteVisual()?;
-        fill.SetBrush(&c.CreateColorBrushWithColor(gfx::color(Rgb::new(0, 0, 0), FOOTER_FILL))?)?;
+        fill.SetBrush(&c.CreateColorBrushWithColor(gfx::paint(p.footer))?)?;
         let divider = c.CreateSpriteVisual()?;
-        divider.SetBrush(
-            &c.CreateColorBrushWithColor(gfx::color(Rgb::new(255, 255, 255), DIVIDER_ALPHA))?,
-        )?;
+        divider.SetBrush(&c.CreateColorBrushWithColor(gfx::paint(p.divider))?)?;
         back.Children()?.InsertAtTop(&fill)?;
         back.Children()?.InsertAtTop(&divider)?;
 
@@ -204,12 +212,21 @@ impl Footer {
         for v in [&avatar.visual, &name.visual, &power.visual, &gear.visual] {
             front.Children()?.InsertAtTop(v)?;
         }
+        let mut quick = Vec::with_capacity(QUICK_ACTIONS.len());
+        for _ in QUICK_ACTIONS {
+            let q = Canvas::new(c, gfx, Vector2 { X: 1.0, Y: 1.0 })?;
+            q.visual.SetIsVisible(false)?;
+            front.Children()?.InsertAtTop(&q.visual)?;
+            quick.push(q);
+        }
 
         let user_name = display_name();
         log_info!("profile: {user_name}");
         Ok(Self {
             fill,
             divider,
+            quick,
+            quick_text: gfx.text_format(QUICK_TEXT_SIZE, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
             avatar,
             name,
             power,
@@ -239,12 +256,39 @@ impl Footer {
         self.layout.borrow().settings
     }
 
+    /// The separate footer buttons (empty with the power-button style).
+    pub fn quick_rects(&self) -> Vec<Rect> {
+        self.layout.borrow().quick.clone()
+    }
+
+    /// The active theme changed: the fill and divider colors. Call
+    /// `refresh` afterwards (it repaints and places everything).
+    pub fn set_theme(&self) -> Result<()> {
+        let p = gfx::theme().palette;
+        for (v, paint) in [(&self.fill, p.footer), (&self.divider, p.divider)] {
+            v.Brush()?
+                .cast::<windows::UI::Composition::CompositionColorBrush>()?
+                .SetColor(gfx::paint(paint))?;
+        }
+        Ok(())
+    }
+
     /// Positions and paints everything (layout or DPI change).
     pub fn refresh(&self, gfx: &Gfx, layout: &Layout) -> Result<()> {
         self.avatar.resize(gfx, AVATAR_SIZE)?;
         self.name.resize(gfx, layout.name.size())?;
         self.power.resize(gfx, layout.power.size())?;
         self.gear.resize(gfx, layout.settings.size())?;
+        for (i, q) in self.quick.iter().enumerate() {
+            match layout.quick.get(i) {
+                Some(r) => {
+                    q.resize(gfx, r.size())?;
+                    q.visual.SetIsVisible(true)?;
+                }
+                None => q.visual.SetIsVisible(false)?,
+            }
+        }
+        self.power.visual.SetIsVisible(layout.quick.is_empty())?;
         self.move_to(gfx, layout)?;
         self.redraw(gfx)
     }
@@ -265,11 +309,17 @@ impl Footer {
             Y: gfx::snap(f.y, s),
             Z: 0.0,
         })?;
-        self.divider.SetSize(Vector2 { X: f.w, Y: 1.0 })?;
+        self.divider.SetSize(Vector2 {
+            X: f.w,
+            Y: gfx::theme().shape.divider,
+        })?;
         self.avatar
             .set_offset(gfx, layout.avatar.x, layout.avatar.y)?;
         self.name.set_offset(gfx, layout.name.x, layout.name.y)?;
         self.power.set_offset(gfx, layout.power.x, layout.power.y)?;
+        for (q, r) in self.quick.iter().zip(&layout.quick) {
+            q.set_offset(gfx, r.x, r.y)?;
+        }
         self.gear
             .set_offset(gfx, layout.settings.x, layout.settings.y)
     }
@@ -287,6 +337,9 @@ impl Footer {
             list.push((v.cast()?, Kind::Visual));
         }
         for c in [&self.avatar, &self.name, &self.power, &self.gear] {
+            list.push((c.visual.cast()?, Kind::Visual));
+        }
+        for c in &self.quick {
             list.push((c.visual.cast()?, Kind::Visual));
         }
         Ok(list)
@@ -315,7 +368,8 @@ impl Footer {
                     );
                     return Ok(());
                 }
-                let bg = gfx::brush(ctx, Rgb::new(255, 255, 255), 0.14)?;
+                let chip = gfx::theme().palette.chip;
+                let bg = gfx::brush(ctx, chip.color, (chip.alpha * 1.4).min(1.0))?;
                 let half = AVATAR / 2.0;
                 ctx.FillEllipse(
                     &D2D1_ELLIPSE {
@@ -373,6 +427,60 @@ impl Footer {
                 })
             })?;
         }
+        self.paint_quick(gfx)
+    }
+
+    /// Paints Lock / Restart / Shut down in the theme's footer style.
+    fn paint_quick(&self, gfx: &Gfx) -> Result<()> {
+        let theme = gfx::theme();
+        let p = theme.palette;
+        let radius = theme.shape.button_radius;
+        let rects = self.quick_rects();
+        for (i, ((canvas, action), rect)) in
+            self.quick.iter().zip(QUICK_ACTIONS).zip(&rects).enumerate()
+        {
+            let full = Rect::new(0.0, 0.0, rect.w, rect.h);
+            let danger = action == PowerAction::ShutDown;
+            canvas.draw(gfx, |ctx| {
+                if danger {
+                    gfx::round_rect(ctx, full, radius, Some((p.danger, 1.0)), None)?;
+                } else if theme.footer == FooterStyle::Buttons {
+                    let chip = (p.chip.color, p.chip.alpha);
+                    gfx::round_rect(ctx, full, radius, Some(chip), None)?;
+                }
+                match theme.footer {
+                    FooterStyle::Text => draw_text(
+                        ctx,
+                        gfx,
+                        layout::QUICK_LABELS[i],
+                        &self.quick_text,
+                        full,
+                        DWRITE_TEXT_ALIGNMENT_CENTER,
+                        if danger {
+                            gfx::on_fill(p.danger)
+                        } else {
+                            text_primary()
+                        },
+                    ),
+                    _ => {
+                        let color = match action {
+                            PowerAction::ShutDown => gfx::on_fill(p.danger),
+                            PowerAction::Lock => p.lock,
+                            _ => p.restart,
+                        };
+                        draw_text(
+                            ctx,
+                            gfx,
+                            action.glyph(),
+                            &self.glyph_format,
+                            full,
+                            DWRITE_TEXT_ALIGNMENT_CENTER,
+                            color,
+                        )
+                    }
+                }
+            })?;
+        }
         Ok(())
     }
 }
@@ -394,13 +502,8 @@ pub enum StripState {
     Confirm(PowerAction),
 }
 
-const STRIP_RADIUS: f32 = 14.0;
-const STRIP_FILL: Rgb = Rgb::new(28, 28, 34);
-const STRIP_FILL_ALPHA: f32 = 0.96;
 const STRIP_GLYPH_SIZE: f32 = 18.0;
 const STRIP_LABEL_SIZE: f32 = 11.0;
-/// The confirm button is red: it restarts or shuts the PC down.
-const DANGER: Rgb = Rgb::new(0xc4, 0x2b, 0x1c);
 
 pub struct PowerStrip {
     root: ContainerVisual,
@@ -420,18 +523,15 @@ impl PowerStrip {
         let root = c.CreateContainerVisual()?;
         root.SetOpacity(0.0)?;
         root.SetIsVisible(false)?;
-        let panel = RoundRect::new(c, STRIP_RADIUS, 1.0)?;
-        panel.set_fill(gfx::color(STRIP_FILL, STRIP_FILL_ALPHA))?;
-        panel.set_stroke(gfx::color(Rgb::new(255, 255, 255), 0.10))?;
+        let panel = RoundRect::new(c, 14.0, 1.0)?;
         let hover = RoundRect::new(c, 10.0, 0.0)?;
-        hover.set_fill(gfx::color(Rgb::new(255, 255, 255), 0.08))?;
         hover.show(false)?;
         let content = Canvas::new(c, gfx, rect.size())?;
         root.Children()?.InsertAtTop(&panel.visual)?;
         root.Children()?.InsertAtTop(&hover.visual)?;
         root.Children()?.InsertAtTop(&content.visual)?;
         parent.Children()?.InsertAtTop(&root)?;
-        Ok(Self {
+        let strip = Self {
             root,
             panel,
             hover,
@@ -441,7 +541,21 @@ impl PowerStrip {
             glyph_format: gfx.icon_format(STRIP_GLYPH_SIZE)?,
             label_format: gfx.text_format(STRIP_LABEL_SIZE, DWRITE_FONT_WEIGHT_NORMAL)?,
             question_format: gfx.text_format(13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
-        })
+        };
+        strip.set_theme()?;
+        Ok(strip)
+    }
+
+    /// The active theme's popup colors and corners. Call `refresh`
+    /// afterwards (it places and repaints).
+    pub fn set_theme(&self) -> Result<()> {
+        let t = gfx::theme();
+        self.panel.set_fill(gfx::paint(t.palette.popup))?;
+        self.panel.set_stroke(gfx::paint(t.palette.popup_border))?;
+        self.panel.set_radius(t.shape.popup_radius);
+        self.hover.set_fill(gfx::paint(t.palette.hover))?;
+        self.hover.set_radius(t.shape.button_radius);
+        Ok(())
     }
 
     pub fn state(&self) -> StripState {
@@ -532,22 +646,15 @@ impl PowerStrip {
                     DWRITE_TEXT_ALIGNMENT_LEADING,
                     text_primary(),
                 )?;
-                for (b, fill, alpha, label) in [
-                    (cancel, Rgb::new(255, 255, 255), 0.10, "Cancel"),
-                    (confirm, DANGER, 0.95, action.label()),
+                let t = gfx::theme();
+                let chip = t.palette.chip;
+                let danger = t.palette.danger;
+                let radius = t.shape.button_radius.min(8.0);
+                for (b, fill, alpha, label, color) in [
+                    (cancel, chip.color, chip.alpha, "Cancel", text_primary()),
+                    (confirm, danger, 0.95, action.label(), gfx::on_fill(danger)),
                 ] {
-                    let brush = gfx::brush(ctx, fill, alpha)?;
-                    // SAFETY: plain drawing call with a local struct.
-                    unsafe {
-                        ctx.FillRoundedRectangle(
-                            &D2D1_ROUNDED_RECT {
-                                rect: gfx::d2d_rect(b),
-                                radiusX: 8.0,
-                                radiusY: 8.0,
-                            },
-                            &brush,
-                        )
-                    };
+                    gfx::round_rect(ctx, b, radius, Some((fill, alpha)), None)?;
                     draw_text(
                         ctx,
                         gfx,
@@ -555,7 +662,7 @@ impl PowerStrip {
                         &self.label_format,
                         b,
                         DWRITE_TEXT_ALIGNMENT_CENTER,
-                        text_primary(),
+                        color,
                     )?;
                 }
                 Ok(())
@@ -593,8 +700,29 @@ impl PowerStrip {
     }
 
     pub fn open(&self, gfx: &Gfx, animator: &Animator, reduced_motion: bool) -> Result<()> {
+        self.open_in(gfx, animator, StripState::Buttons, reduced_motion)
+    }
+
+    /// Opens it straight into "Restart now?" (the separate footer buttons).
+    pub fn open_confirm(
+        &self,
+        gfx: &Gfx,
+        animator: &Animator,
+        action: PowerAction,
+        reduced_motion: bool,
+    ) -> Result<()> {
+        self.open_in(gfx, animator, StripState::Confirm(action), reduced_motion)
+    }
+
+    fn open_in(
+        &self,
+        gfx: &Gfx,
+        animator: &Animator,
+        state: StripState,
+        reduced_motion: bool,
+    ) -> Result<()> {
         let was_closed = !self.is_open();
-        self.state.set(StripState::Buttons);
+        self.state.set(state);
         self.redraw(gfx)?;
         self.set_hover(None)?;
         let v = self.visual()?;

@@ -4,7 +4,8 @@
 //! types in search, shows or hides a (fake) music card, and switches the
 //! background mode; every 25 cycles it changes the pins, every 50 it
 //! re-reads config.toml, and every 10 it opens and closes the Settings
-//! window (milestone 8). It compares memory at the end with memory after
+//! window (milestone 8), and every 5 it switches the theme (milestone 9:
+//! all 5 themes, icon tint on and off). It compares memory at the end with memory after
 //! cycle 10 (the rule in CLAUDE.md) and after cycle 100 ("warm", see
 //! `WARM_CYCLE`): the private working set (Task Manager's number) must not
 //! grow by 1 MB or more. Then Glint quits.
@@ -32,7 +33,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
-use crate::config::{BackgroundMode, Rgb};
+use crate::config::{BackgroundMode, Rgb, ThemeId};
 use crate::media::{Cover, Info, MusicView};
 
 /// Posted to the UI window: start the next cycle.
@@ -101,6 +102,8 @@ pub struct Plan {
     pub device_loss: bool,
     /// Open the Settings window before the menu, close it after.
     pub settings: bool,
+    /// Switch to this theme, with icon tint on or off.
+    pub theme: Option<(ThemeId, bool)>,
 }
 
 /// What happens in cycle `n` (1-based); `gpu` = `--stress-gpu`. Pure, so it
@@ -121,6 +124,15 @@ pub fn plan(n: u32, gpu: bool) -> Plan {
         device_loss: gpu,
         // 100 times in 1,000 cycles (IMPROVE.md 8.5).
         settings: n % 10 == 5,
+        // 200 times in 1,000 cycles: each theme 40 times, half of them with
+        // one-color icons.
+        theme: (n % 5 == 3).then(|| {
+            let k = (n / 5) as usize;
+            (
+                ThemeId::ALL[k % ThemeId::ALL.len()],
+                (k / ThemeId::ALL.len()) % 2 == 1,
+            )
+        }),
     }
 }
 
@@ -362,6 +374,15 @@ mod tests {
         assert!((1..=1000).all(|n| plan(n, true).device_loss));
         assert_eq!(plans.iter().filter(|p| p.reload_config).count(), 20);
         assert_eq!(plans.iter().filter(|p| p.settings).count(), 100);
+        assert_eq!(plans.iter().filter(|p| p.theme.is_some()).count(), 200);
+        for id in ThemeId::ALL {
+            for tint in [false, true] {
+                assert!(
+                    plans.iter().any(|p| p.theme == Some((id, tint))),
+                    "{id:?} {tint}"
+                );
+            }
+        }
         // Every pin taken away is put back before the end.
         assert_eq!(plan(975, false).pin, Some(true));
     }

@@ -18,7 +18,8 @@ pub struct RoundRect {
     fill: CompositionColorBrush,
     stroke: CompositionColorBrush,
     radius: std::cell::Cell<f32>,
-    stroke_width: f32,
+    stroke_width: std::cell::Cell<f32>,
+    shape: windows::UI::Composition::CompositionSpriteShape,
 }
 
 impl RoundRect {
@@ -41,7 +42,8 @@ impl RoundRect {
             fill,
             stroke,
             radius: std::cell::Cell::new(radius),
-            stroke_width,
+            stroke_width: std::cell::Cell::new(stroke_width),
+            shape,
         })
     }
 
@@ -61,17 +63,25 @@ impl RoundRect {
             Z: 0.0,
         })?;
         self.visual.SetSize(r.size())?;
-        let inset = self.stroke_width / 2.0;
+        let width = self.stroke_width.get();
+        let inset = width / 2.0;
         self.geometry.SetOffset(Vector2 { X: inset, Y: inset })?;
         self.geometry.SetSize(Vector2 {
-            X: (r.w - self.stroke_width).max(0.0),
-            Y: (r.h - self.stroke_width).max(0.0),
+            X: (r.w - width).max(0.0),
+            Y: (r.h - width).max(0.0),
         })?;
         let radius = (self.radius.get() - inset).max(0.0);
         self.geometry.SetCornerRadius(Vector2 {
             X: radius,
             Y: radius,
         })
+    }
+
+    /// Changes the outline width (takes effect on the next `set_rect`). Only
+    /// for shapes created with an outline.
+    pub fn set_stroke_width(&self, width: f32) -> Result<()> {
+        self.stroke_width.set(width);
+        self.shape.SetStrokeThickness(width)
     }
 
     /// Changes the corner radius (takes effect on the next `set_rect`).

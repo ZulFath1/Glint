@@ -10,9 +10,7 @@
 use std::cell::{Cell, RefCell};
 
 use windows::UI::Composition::{Compositor, ContainerVisual, Visual};
-use windows::Win32::Graphics::Direct2D::{
-    D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, ID2D1Bitmap1,
-};
+use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
     IDWriteTextFormat,
@@ -23,7 +21,6 @@ use windows_numerics::Vector2;
 use super::gfx::{self, Canvas, Gfx, text_primary, text_secondary};
 use super::layout::{Layout, MAX_RESULTS, ROW_HEIGHT, Rect};
 use super::shape::RoundRect;
-use crate::config::Rgb;
 
 /// Icon size and place inside a row (DIPs).
 pub const ICON: f32 = 24.0;
@@ -32,9 +29,6 @@ const TEXT_LEFT: f32 = ICON_LEFT + ICON + 12.0;
 const TEXT_RIGHT: f32 = 12.0;
 const NAME_SIZE: f32 = 14.0;
 const MESSAGE_SIZE: f32 = 13.0;
-pub const ROW_RADIUS: f32 = 10.0;
-/// The selected row: a bit brighter than the mouse hover (0.08).
-const SELECTED_ALPHA: f32 = 0.13;
 
 pub const NO_RESULTS: &str = "No apps found";
 /// The list container is this big (DIPs), so its clip only ever cuts at
@@ -59,6 +53,8 @@ pub struct Results {
     selected: Cell<Option<usize>>,
     name_format: IDWriteTextFormat,
     message_format: IDWriteTextFormat,
+    /// Icons in one color (`icon_tint`).
+    icon_tint: Cell<bool>,
 }
 
 impl Results {
@@ -90,8 +86,8 @@ impl Results {
         clip.StartAnimation(h!("BottomInset"), &cut)?;
         root.SetClip(&clip)?;
         parent.Children()?.InsertAtTop(&root)?;
-        let selection = RoundRect::new(c, ROW_RADIUS, 0.0)?;
-        selection.set_fill(gfx::color(Rgb::new(255, 255, 255), SELECTED_ALPHA))?;
+        let selection = RoundRect::new(c, row_radius(), 0.0)?;
+        selection.set_fill(gfx::paint(gfx::theme().palette.selected))?;
         selection.show(false)?;
         root.Children()?.InsertAtTop(&selection.visual)?;
         let size = l.no_results.size();
@@ -115,7 +111,19 @@ impl Results {
             selected: Cell::new(None),
             name_format: gfx.text_format(NAME_SIZE, DWRITE_FONT_WEIGHT_NORMAL)?,
             message_format: gfx.text_format(MESSAGE_SIZE, DWRITE_FONT_WEIGHT_NORMAL)?,
+            icon_tint: Cell::new(false),
         })
+    }
+
+    /// The active theme or `icon_tint` changed: the highlight's color and
+    /// shape. Every row is repainted by the next search (`forget`).
+    pub fn set_theme(&self, icon_tint: bool) -> Result<()> {
+        self.icon_tint.set(icon_tint);
+        self.selection
+            .set_fill(gfx::paint(gfx::theme().palette.selected))?;
+        self.selection.set_radius(row_radius());
+        self.forget();
+        self.set_selected(self.selected.get())
     }
 
     /// The container of everything (cross-faded with the grid).
@@ -220,23 +228,16 @@ impl Results {
             DWRITE_TEXT_ALIGNMENT_LEADING,
             true,
         )?;
+        let tint = self.icon_tint.get().then(text_primary);
         row.draw(gfx, |ctx| {
             let brush = gfx::brush(ctx, text_primary(), 1.0)?;
             gfx::with_glow(ctx, |ctx| {
                 let top = (ROW_HEIGHT - ICON) / 2.0;
-                let dest = gfx::d2d_rect(Rect::new(ICON_LEFT, top, ICON, ICON));
-                // SAFETY: drawing calls with live objects and local rects.
+                if let Some(icon) = icon {
+                    gfx::draw_icon(ctx, icon, Rect::new(ICON_LEFT, top, ICON, ICON), tint)?;
+                }
+                // SAFETY: draws a live text layout with a live brush.
                 unsafe {
-                    if let Some(icon) = icon {
-                        ctx.DrawBitmap(
-                            icon,
-                            Some(&dest),
-                            1.0,
-                            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-                            None,
-                            None,
-                        );
-                    }
                     ctx.DrawTextLayout(
                         Vector2 {
                             X: TEXT_LEFT,
@@ -258,4 +259,9 @@ impl Results {
         }
         Ok(())
     }
+}
+
+/// The corner radius of the result highlight and hover, for the theme.
+pub fn row_radius() -> f32 {
+    gfx::theme().shape.button_radius
 }

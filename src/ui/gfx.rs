@@ -39,9 +39,10 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT, DWRITE_TRIMMING,
-    DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory,
-    IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_FONT_WEIGHT, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
+    DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, IDXGIDevice};
@@ -60,6 +61,7 @@ use windows_numerics::{Matrix3x2, Vector2};
 
 use super::layout::Rect;
 use crate::config::Rgb;
+use crate::theme::{Family, Theme};
 
 /// Posted to the UI window when the GPU device was replaced: every surface
 /// has to be painted again.
@@ -68,14 +70,23 @@ pub const WM_APP_REDRAW: u32 = WM_APP + 5;
 /// How all text is drawn: with color fonts on, so emoji show in color.
 pub const TEXT_OPTIONS: D2D1_DRAW_TEXT_OPTIONS = D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT;
 
-/// Text colors (CLAUDE.md section 5).
-const TEXT_PRIMARY: Rgb = Rgb::new(0xf4, 0xf4, 0xf5);
-const TEXT_SECONDARY: Rgb = Rgb::new(0xd4, 0xd4, 0xd8);
-
 thread_local! {
     /// Windows high contrast is on: all text in this color, and no glow.
     /// (Only the UI thread paints, so a per-thread value is enough.)
     static HIGH_CONTRAST_TEXT: Cell<Option<Rgb>> = const { Cell::new(None) };
+    /// The theme everything is painted with (milestone 9).
+    static THEME: Cell<&'static Theme> = const { Cell::new(&crate::theme::GLINT) };
+}
+
+/// Switches the theme used for painting. Surfaces have to be repainted
+/// afterwards.
+pub fn set_theme(theme: &'static Theme) {
+    THEME.with(|t| t.set(theme));
+}
+
+/// The theme everything is painted with.
+pub fn theme() -> &'static Theme {
+    THEME.with(Cell::get)
 }
 
 /// Switches every text color to the high contrast one (`Some`), or back to
@@ -90,16 +101,37 @@ fn high_contrast_text() -> Option<Rgb> {
 
 /// Main text: names, titles, labels.
 pub fn text_primary() -> Rgb {
-    high_contrast_text().unwrap_or(TEXT_PRIMARY)
+    high_contrast_text().unwrap_or(theme().palette.text)
 }
 
 /// Quieter text: artist, times, placeholder. In high contrast, all text
 /// uses the one system text color.
 pub fn text_secondary() -> Rgb {
-    high_contrast_text().unwrap_or(TEXT_SECONDARY)
+    high_contrast_text().unwrap_or(theme().palette.subtext)
+}
+
+/// Text on a filled `fill` shape: the theme's text color or its dark
+/// "on accent" color, whichever reads better.
+pub fn on_fill(fill: Rgb) -> Rgb {
+    let t = theme().palette;
+    let c = super::background::contrast;
+    if c(text_primary(), fill) >= c(t.on_accent, fill) {
+        text_primary()
+    } else {
+        t.on_accent
+    }
+}
+
+/// A theme fill (a `Paint`) as a composition color. In high contrast,
+/// fills disappear (only the system background shows), borders stay.
+pub fn paint(p: crate::theme::Paint) -> Color {
+    color(p.color, p.alpha)
 }
 
 const TEXT_FONT: windows::core::PCWSTR = w!("Segoe UI Variable Text");
+/// The monospace font of terminal-style themes, and its fallback.
+const MONO_FONT: &str = "Cascadia Mono";
+const MONO_FALLBACK: &str = "Consolas";
 const ICON_FONT: windows::core::PCWSTR = w!("Segoe Fluent Icons");
 
 /// The soft text shadow ("glow") behind text and icons, so they stay
@@ -209,6 +241,9 @@ pub struct Gfx {
     pub wic: IWICImagingFactory,
     /// The DPI scale every surface is currently painted at.
     scale: Cell<f32>,
+    /// The monospace family found on this PC (looked up once, when a
+    /// terminal-style theme first paints).
+    mono: Cell<Option<&'static str>>,
 }
 
 impl Gfx {
@@ -252,6 +287,7 @@ impl Gfx {
             dwrite,
             wic,
             scale: Cell::new(scale),
+            mono: Cell::new(None),
         })
     }
 
@@ -457,6 +493,55 @@ impl Gfx {
         }
     }
 
+    /// The font family to use instead of `format`'s, for the active theme:
+    /// `None` keeps it (Segoe themes, and icon fonts always).
+    fn theme_family(&self, format: &IDWriteTextFormat) -> Option<&'static str> {
+        if theme().font != Family::Mono || high_contrast_text().is_some() {
+            return None;
+        }
+        // Only text formats change font; icons stay Segoe Fluent Icons.
+        let mut name = [0u16; 64];
+        // SAFETY: valid buffer with its length; DWrite writes a NUL-ended name.
+        unsafe { format.GetFontFamilyName(&mut name) }.ok()?;
+        let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        // SAFETY: TEXT_FONT is a valid NUL-terminated wide string literal.
+        let text = unsafe { TEXT_FONT.as_wide() };
+        if name[..len] != *text {
+            return None;
+        }
+        Some(self.mono_family())
+    }
+
+    /// Cascadia Mono if this PC has it (Windows 11 does), else Consolas.
+    fn mono_family(&self) -> &'static str {
+        if let Some(f) = self.mono.get() {
+            return f;
+        }
+        let has = |name: &str| -> bool {
+            let wide = windows::core::HSTRING::from(name);
+            let mut index = 0u32;
+            let mut exists = windows::core::BOOL::default();
+            // SAFETY: plain COM calls with valid out-pointers to locals.
+            unsafe {
+                let mut fonts = None;
+                self.dwrite
+                    .GetSystemFontCollection(&mut fonts, false)
+                    .is_ok()
+                    && fonts.is_some_and(|f| {
+                        f.FindFamilyName(&wide, &mut index, &mut exists).is_ok() && exists.as_bool()
+                    })
+            }
+        };
+        let family = if has(MONO_FONT) {
+            MONO_FONT
+        } else {
+            MONO_FALLBACK
+        };
+        log_info!("monospace font: {family}");
+        self.mono.set(Some(family));
+        family
+    }
+
     pub fn text_format(&self, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
         self.format(TEXT_FONT, size, weight)
     }
@@ -508,6 +593,13 @@ impl Gfx {
             let layout =
                 self.dwrite
                     .CreateTextLayout(&wide, format, size.X.max(0.0), size.Y.max(0.0))?;
+            if let Some(family) = self.theme_family(format) {
+                let all = DWRITE_TEXT_RANGE {
+                    startPosition: 0,
+                    length: u32::MAX,
+                };
+                layout.SetFontFamilyName(&windows::core::HSTRING::from(family), all)?;
+            }
             layout.SetTextAlignment(align)?;
             if ellipsis {
                 let sign = self.dwrite.CreateEllipsisTrimmingSign(format)?;
@@ -529,6 +621,73 @@ impl Drop for Gfx {
             .graphics
             .RemoveRenderingDeviceReplaced(self.replaced_token);
     }
+}
+
+/// Draws an app icon into `dest`. With `tint`, the icon is drawn in that one
+/// color (its shape only: the `icon_tint` setting).
+pub fn draw_icon(
+    ctx: &ID2D1DeviceContext,
+    icon: &ID2D1Bitmap1,
+    dest: Rect,
+    tint: Option<Rgb>,
+) -> Result<()> {
+    let d = d2d_rect(dest);
+    // SAFETY: drawing calls with a live bitmap, brush and local rects. The
+    // antialias mode is put back right after the mask is filled.
+    unsafe {
+        match tint {
+            None => ctx.DrawBitmap(
+                icon,
+                Some(&d),
+                1.0,
+                windows::Win32::Graphics::Direct2D::D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                None,
+                None,
+            ),
+            Some(c) => {
+                let b = brush(ctx, c, 1.0)?;
+                // FillOpacityMask needs aliased mode.
+                let mode = ctx.GetAntialiasMode();
+                ctx.SetAntialiasMode(
+                    windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_ALIASED,
+                );
+                ctx.FillOpacityMask(icon, &b, Some(&d), None);
+                ctx.SetAntialiasMode(mode);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fills (and, with `stroke`, outlines) a rounded rectangle.
+pub fn round_rect(
+    ctx: &ID2D1DeviceContext,
+    r: Rect,
+    radius: f32,
+    fill: Option<(Rgb, f32)>,
+    stroke: Option<(Rgb, f32, f32)>,
+) -> Result<()> {
+    let rr = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
+        rect: d2d_rect(r),
+        radiusX: radius,
+        radiusY: radius,
+    };
+    // SAFETY: plain drawing calls with live brushes and a local struct.
+    unsafe {
+        if let Some((c, a)) = fill {
+            ctx.FillRoundedRectangle(&rr, &brush(ctx, c, a)?);
+        }
+        if let Some((c, a, w)) = stroke {
+            let inset = w / 2.0;
+            let inner = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
+                rect: d2d_rect(Rect::new(r.x + inset, r.y + inset, r.w - w, r.h - w)),
+                radiusX: (radius - inset).max(0.0),
+                radiusY: (radius - inset).max(0.0),
+            };
+            ctx.DrawRoundedRectangle(&inner, &brush(ctx, c, a)?, w, None);
+        }
+    }
+    Ok(())
 }
 
 pub fn brush(ctx: &ID2D1DeviceContext, c: Rgb, alpha: f32) -> Result<ID2D1SolidColorBrush> {

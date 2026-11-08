@@ -19,6 +19,8 @@ use serde::Deserialize;
 use serde::de::{Deserializer, Error as _};
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
+pub use crate::theme::ThemeId;
+
 /// A plain sRGB color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb {
@@ -124,6 +126,8 @@ pub enum Preset {
     Ocean,
     Plain,
     Custom,
+    /// The active theme's own colors (milestone 9).
+    Theme,
 }
 
 impl Preset {
@@ -143,17 +147,19 @@ impl Preset {
             Self::Ocean => "ocean",
             Self::Plain => "plain",
             Self::Custom => "custom",
+            Self::Theme => "theme",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         Self::BUILT_IN
             .into_iter()
-            .chain([Self::Custom])
+            .chain([Self::Custom, Self::Theme])
             .find(|p| p.name() == s)
     }
 
-    /// The preset's colors (CLAUDE.md section 6). `None` for custom.
+    /// The preset's colors (CLAUDE.md section 6). `None` for custom and
+    /// theme (those come from elsewhere).
     pub fn colors(self) -> Option<&'static [Rgb]> {
         const MIDNIGHT: [Rgb; 2] = [Rgb::new(0x1e, 0x1b, 0x3a), Rgb::new(0x14, 0x21, 0x3d)];
         const AURORA: [Rgb; 3] = [
@@ -174,7 +180,7 @@ impl Preset {
             Self::Sunset => Some(&SUNSET),
             Self::Ocean => Some(&OCEAN),
             Self::Plain => Some(&PLAIN),
-            Self::Custom => None,
+            Self::Custom | Self::Theme => None,
         }
     }
 }
@@ -184,7 +190,7 @@ impl<'de> Deserialize<'de> for Preset {
         let s = String::deserialize(d)?;
         Self::parse(&s).ok_or_else(|| {
             D::Error::custom(format!(
-                "unknown preset \"{s}\"; use \"midnight\", \"aurora\", \"sunset\", \"ocean\", \"plain\" or \"custom\""
+                "unknown preset \"{s}\"; use \"theme\", \"midnight\", \"aurora\", \"sunset\", \"ocean\", \"plain\" or \"custom\""
             ))
         })
     }
@@ -195,18 +201,24 @@ impl<'de> Deserialize<'de> for Preset {
 pub enum Accent {
     /// Follow the Windows accent color.
     System,
+    /// The active theme's accent color (milestone 9).
+    Theme,
     Color(Rgb),
 }
 
 impl<'de> Deserialize<'de> for Accent {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        if s.trim().eq_ignore_ascii_case("system") {
+        let word = s.trim();
+        if word.eq_ignore_ascii_case("system") {
             return Ok(Self::System);
+        }
+        if word.eq_ignore_ascii_case("theme") {
+            return Ok(Self::Theme);
         }
         Rgb::parse(&s).map(Self::Color).ok_or_else(|| {
             D::Error::custom(format!(
-                "\"{s}\" is not a color; use \"#rrggbb\" or \"system\""
+                "\"{s}\" is not a color; use \"#rrggbb\", \"theme\" or \"system\""
             ))
         })
     }
@@ -456,7 +468,7 @@ impl Default for Background {
         Self {
             mode: BackgroundMode::GlassGradient,
             tint: 0.35,
-            preset: Preset::Aurora,
+            preset: Preset::Theme,
             colors: vec![
                 Rgb::new(0x2b, 0x1a, 0x4a),
                 Rgb::new(0x1a, 0x23, 0x47),
@@ -470,11 +482,12 @@ impl Default for Background {
 }
 
 impl Background {
-    /// The 1–3 colors actually in use (preset or custom).
-    pub fn resolved_colors(&self) -> Vec<Rgb> {
-        let colors = match self.preset.colors() {
-            Some(c) => c.to_vec(),
-            None => self.colors.iter().copied().take(3).collect(),
+    /// The 1–3 colors actually in use (the theme's, a preset's or custom).
+    pub fn resolved_colors(&self, theme: ThemeId) -> Vec<Rgb> {
+        let colors = match (self.preset, self.preset.colors()) {
+            (Preset::Theme, _) => theme.theme().palette.background.to_vec(),
+            (_, Some(c)) => c.to_vec(),
+            (_, None) => self.colors.iter().copied().take(3).collect(),
         };
         if colors.is_empty() {
             Preset::Plain.colors().unwrap_or_default().to_vec()
@@ -552,6 +565,10 @@ pub struct Config {
     /// Pinned apps, as AppUserModelIDs, in grid order.
     #[serde(deserialize_with = "pins")]
     pub pinned: Vec<String>,
+    /// Colors, shapes, font and layout (milestone 9).
+    pub theme: ThemeId,
+    /// Draw app icons in one color (the theme's text color).
+    pub icon_tint: bool,
     pub accent: Accent,
     /// Extra shortcut that toggles the menu (`None` = Win key only).
     #[serde(deserialize_with = "hotkey")]
@@ -573,7 +590,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             pinned: DEFAULT_PINS.map(String::from).to_vec(),
-            accent: Accent::Color(DEFAULT_ACCENT),
+            theme: ThemeId::Glint,
+            icon_tint: false,
+            accent: Accent::Theme,
             hotkey: None,
             max_columns: DEFAULT_COLUMNS,
             show_names: true,
@@ -600,10 +619,11 @@ impl Config {
 }
 
 impl Accent {
-    /// As written in config.toml: "system" or "#rrggbb".
+    /// As written in config.toml: "system", "theme" or "#rrggbb".
     pub fn text(self) -> String {
         match self {
             Self::System => "system".to_string(),
+            Self::Theme => "theme".to_string(),
             Self::Color(c) => c.hex(),
         }
     }
@@ -723,9 +743,17 @@ const TEMPLATE: &str = r##"# Glint settings.
 # "Pin to Glint" or "Unpin from Glint". Apps that aren't installed are skipped.
 pinned = [{PINS}]
 
+# The look: "glint", "catppuccin", "nord", "tokyo-night" or "gruvbox".
+# A theme brings its own colors, shapes and font; `accent = "theme"` and
+# `preset = "theme"` below use the theme's colors.
+theme = "glint"
+
+# Draw app icons in one color (the theme's text color).
+icon_tint = false
+
 # Color of the text caret, keyboard focus ring, search border and seek bar:
-# "#rrggbb", or "system" to follow your Windows accent color.
-accent = "#8fa8ff"
+# "theme", "#rrggbb", or "system" to follow your Windows accent color.
+accent = "theme"
 
 # An extra shortcut that opens the menu, like "Alt+Space" or "Ctrl+Shift+S"
 # (modifiers: Ctrl, Alt, Shift, Win). Empty = the Win key only.
@@ -744,9 +772,9 @@ autostart = false
 [background]
 # "solid", "gradient", "glass" (frosted glass) or "glass-gradient".
 mode = "glass-gradient"
-# Colors: "midnight", "aurora", "sunset", "ocean", "plain",
-# or "custom" to use `colors` below.
-preset = "aurora"
+# Colors: "theme" (the theme's own), "midnight", "aurora", "sunset",
+# "ocean", "plain", or "custom" to use `colors` below.
+preset = "theme"
 # Used when preset = "custom": 1 to 3 colors.
 colors = ["#2b1a4a", "#1a2347", "#0f2a3a"]
 # Gradient direction in degrees (0 = up, 90 = right).
@@ -999,6 +1027,18 @@ pub fn save_changes(doc: &mut DocumentMut, old: &Config, new: &Config) {
         }
     };
     put(
+        old.theme != new.theme,
+        None,
+        "theme",
+        Value::from(new.theme.name()),
+    );
+    put(
+        old.icon_tint != new.icon_tint,
+        None,
+        "icon_tint",
+        Value::from(new.icon_tint),
+    );
+    put(
         old.accent != new.accent,
         None,
         "accent",
@@ -1141,12 +1181,52 @@ mod tests {
 
     #[test]
     fn presets_and_custom_colors() {
+        let glint = ThemeId::Glint;
         let mut bg = Background::default();
-        assert_eq!(bg.resolved_colors().len(), 3); // aurora
+        // "theme" with glint = aurora, the look before themes existed.
+        assert_eq!(bg.resolved_colors(glint), Preset::Aurora.colors().unwrap());
+        assert_eq!(
+            bg.resolved_colors(ThemeId::Gruvbox),
+            crate::theme::GRUVBOX.palette.background
+        );
+        bg.preset = Preset::Sunset;
+        assert_eq!(
+            bg.resolved_colors(ThemeId::Nord),
+            Preset::Sunset.colors().unwrap()
+        );
         bg.preset = Preset::Custom;
-        assert_eq!(bg.resolved_colors()[0], Rgb::new(0x2b, 0x1a, 0x4a));
+        assert_eq!(bg.resolved_colors(glint)[0], Rgb::new(0x2b, 0x1a, 0x4a));
         bg.colors.clear();
-        assert_eq!(bg.resolved_colors(), [Rgb::new(0x1e, 0x20, 0x26)]);
+        assert_eq!(bg.resolved_colors(glint), [Rgb::new(0x1e, 0x20, 0x26)]);
+    }
+
+    #[test]
+    fn themes_and_theme_colors() {
+        let c = parse("theme = \"gruvbox\"\nicon_tint = true\naccent = \"theme\"\n[background]\npreset = \"theme\"").unwrap();
+        assert_eq!(c.theme, ThemeId::Gruvbox);
+        assert!(c.icon_tint);
+        assert_eq!(c.accent, Accent::Theme);
+        assert_eq!(c.background.preset, Preset::Theme);
+        // Old files (no theme line) are glint with their own colors.
+        let old = parse("accent = \"#8fa8ff\"\n[background]\npreset = \"aurora\"").unwrap();
+        assert_eq!(old.theme, ThemeId::Glint);
+        assert!(!old.icon_tint);
+        assert_eq!(old.accent, Accent::Color(DEFAULT_ACCENT));
+        let e = parse("theme = \"dracula\"").unwrap_err();
+        assert_eq!(e.line, Some(1));
+        assert!(e.message.contains("tokyo-night"), "{e}");
+        // Saving a theme change writes only those lines.
+        let text = default_text(&pins(&["a"]));
+        let old = parse(&text).unwrap();
+        let mut new = old.clone();
+        new.theme = ThemeId::TokyoNight;
+        new.icon_tint = true;
+        let mut doc: DocumentMut = text.parse().unwrap();
+        save_changes(&mut doc, &old, &new);
+        let out = doc.to_string();
+        assert!(out.contains("theme = \"tokyo-night\"\n"), "{out}");
+        assert!(out.contains("icon_tint = true\n"), "{out}");
+        assert_eq!(parse(&out).unwrap(), new);
     }
 
     #[test]

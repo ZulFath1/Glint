@@ -20,7 +20,9 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::core::{Interface, Result};
 use windows_numerics::Vector2;
 
-use crate::config::{self, Accent, BackgroundMode, Config, MAX_COLUMNS, MIN_COLUMNS, Preset, Rgb};
+use crate::config::{
+    self, Accent, BackgroundMode, Config, MAX_COLUMNS, MIN_COLUMNS, Preset, Rgb, ThemeId,
+};
 use crate::ui::background;
 use crate::ui::gfx::{self, Gfx, text_primary, text_secondary};
 use crate::ui::layout::Rect;
@@ -101,7 +103,7 @@ impl Section {
     pub fn items(self) -> &'static [Item] {
         use Item::*;
         match self {
-            Self::Theme => &[ThemeCard],
+            Self::Theme => &[ThemeCard, IconTint],
             Self::Appearance => &[
                 Mode,
                 Presets,
@@ -134,6 +136,7 @@ pub fn side_item(i: usize) -> Rect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Item {
     ThemeCard,
+    IconTint,
     Mode,
     Presets,
     CustomColors,
@@ -188,11 +191,17 @@ pub const MODES: [(BackgroundMode, &str); 4] = [
     (BackgroundMode::GlassGradient, "Glass + Gradient"),
 ];
 
-/// The preset swatches: the 5 built-in ones, then "Custom".
-pub fn presets() -> [Preset; 6] {
+/// The preset swatches: the theme's own colors, the 5 built-in ones,
+/// then "Custom".
+pub fn presets() -> [Preset; 7] {
     let [a, b, c, d, e] = Preset::BUILT_IN;
-    [a, b, c, d, e, Preset::Custom]
+    [Preset::Theme, a, b, c, d, e, Preset::Custom]
 }
+
+/// The theme cards: 3 per line, two lines.
+const THEME_CARD_H: f32 = 116.0;
+const THEME_CARD_GAP: f32 = 12.0;
+const THEME_COLUMNS: usize = 3;
 
 fn title_case(s: &str) -> String {
     let mut c = s.chars();
@@ -204,7 +213,9 @@ fn title_case(s: &str) -> String {
 impl Item {
     pub fn label(self) -> &'static str {
         match self {
-            Self::ThemeCard => "Theme",
+            // The page title already says "Theme"; the cards use the row.
+            Self::ThemeCard => "",
+            Self::IconTint => "Icon tint",
             Self::Mode => "Background",
             Self::Presets => "Colors",
             Self::CustomColors => "Custom colors",
@@ -232,7 +243,7 @@ impl Item {
 
     pub fn height(self) -> f32 {
         match self {
-            Self::ThemeCard => 152.0,
+            Self::ThemeCard => 2.0 * THEME_CARD_H + THEME_CARD_GAP + 24.0,
             // Swatches with their names under them.
             Self::Presets => 68.0,
             // The shortcut field with a hint line under it.
@@ -243,7 +254,7 @@ impl Item {
 
     pub fn kind(self) -> Kind {
         match self {
-            Self::Mode | Self::Presets => Kind::Radio,
+            Self::ThemeCard | Self::Mode | Self::Presets => Kind::Radio,
             Self::Angle
             | Self::Darkness
             | Self::GlassTint
@@ -251,10 +262,13 @@ impl Item {
             | Self::OpenSpeed
             | Self::Bounce
             | Self::IconDelay => Kind::Slider,
-            Self::ShowNames | Self::ShowMusic | Self::AlbumTint | Self::Autostart => Kind::Toggle,
+            Self::ShowNames
+            | Self::ShowMusic
+            | Self::AlbumTint
+            | Self::Autostart
+            | Self::IconTint => Kind::Toggle,
             Self::Version | Self::Ram => Kind::Text,
-            Self::ThemeCard
-            | Self::CustomColors
+            Self::CustomColors
             | Self::AccentColor
             | Self::Replay
             | Self::Hotkey
@@ -417,7 +431,7 @@ fn squares(c: Rect, n: usize, size: f32, gap: f32) -> Vec<Rect> {
         .collect()
 }
 
-const SWATCH_W: f32 = 46.0;
+const SWATCH_W: f32 = 40.0;
 const SWATCH_GAP: f32 = 6.0;
 const STOP_W: f32 = 36.0;
 const TOGGLE_W: f32 = 140.0;
@@ -427,7 +441,20 @@ const BUTTON_W: f32 = 180.0;
 pub fn parts(item: Item, row: Rect, v: &View) -> Vec<Rect> {
     let c = control(row);
     match item {
-        Item::ThemeCard => vec![Rect::new(c.x, row.y + 8.0, 220.0, 132.0)],
+        Item::ThemeCard => {
+            let w = (row.w - (THEME_COLUMNS - 1) as f32 * THEME_CARD_GAP) / THEME_COLUMNS as f32;
+            (0..ThemeId::ALL.len())
+                .map(|i| {
+                    let (col, line) = (i % THEME_COLUMNS, i / THEME_COLUMNS);
+                    Rect::new(
+                        row.x + col as f32 * (w + THEME_CARD_GAP),
+                        row.y + 4.0 + line as f32 * (THEME_CARD_H + THEME_CARD_GAP),
+                        w.floor(),
+                        THEME_CARD_H,
+                    )
+                })
+                .collect()
+        }
         Item::Mode => {
             // Each segment as wide as its name needs, sharing the row.
             let weight = |name: &str| name.chars().count() as f32 + 6.0;
@@ -507,6 +534,7 @@ pub fn chosen(item: Item, c: &Config) -> usize {
             .iter()
             .position(|p| *p == c.background.preset)
             .unwrap_or(0),
+        Item::ThemeCard => ThemeId::ALL.iter().position(|t| *t == c.theme).unwrap_or(0),
         _ => 0,
     }
 }
@@ -521,10 +549,154 @@ pub fn track(part: Rect) -> Rect {
     )
 }
 
+/// One theme card: a small drawing of the theme (its colors, search bar,
+/// icon tiles and layout) with its name under it.
+fn paint_theme_card(
+    pen: &Pen,
+    fonts: &Fonts,
+    r: Rect,
+    id: ThemeId,
+    selected: bool,
+    accent: Rgb,
+) -> Result<()> {
+    use crate::theme::{IconTile, LayoutKind};
+    let t = id.theme();
+    let p = t.palette;
+    let s = t.shape;
+    // Corners scaled down with the drawing (a 24 px menu is ~8 px here).
+    let small = |radius: f32| (radius / 3.0).clamp(1.0, 10.0);
+    pen.gradient(r, small(s.menu_radius).max(4.0), p.background)?;
+    let mini = Rect::new(r.x + 10.0, r.y + 10.0, r.w - 20.0, 72.0);
+    let fill = |x: Rect, radius: f32, paint: crate::theme::Paint| {
+        pen.fill(x, radius, paint.color, paint.alpha)
+    };
+    let tile_fill = |x: Rect, i: usize| -> Result<()> {
+        let radius = match t.tile {
+            IconTile::None | IconTile::Sharp => 1.0,
+            IconTile::Squircle => 5.0,
+            IconTile::Rounded | IconTile::Bordered => 3.0,
+        };
+        match t.tile {
+            IconTile::None => pen.fill(x, 3.0, p.text, 0.55),
+            _ => fill(x, radius, p.tile),
+        }?;
+        if let (IconTile::Bordered, false) = (t.tile, p.tile_borders.is_empty()) {
+            pen.stroke(
+                x,
+                radius,
+                p.tile_borders[i % p.tile_borders.len()],
+                1.0,
+                1.0,
+            )?;
+        }
+        // The "icon" itself: a dot in an accent-ish color.
+        let dot = Rect::new(x.x + x.w / 2.0 - 2.5, x.y + x.h / 2.0 - 2.5, 5.0, 5.0);
+        pen.fill(dot, 2.5, p.text, 0.9)
+    };
+    match t.layout {
+        LayoutKind::Grid | LayoutKind::List => {
+            let mut y = mini.y;
+            if t.terminal {
+                fill(Rect::new(mini.x, y, mini.w, 6.0), 0.0, p.footer)?;
+                y += 9.0;
+            }
+            let search = Rect::new(mini.x, y, mini.w, 12.0);
+            fill(search, small(s.search_radius).min(6.0), p.field)?;
+            pen.stroke(search, small(s.search_radius).min(6.0), p.accent, 0.8, 1.0)?;
+            y += 17.0;
+            if t.layout == LayoutKind::List {
+                // Rows, the first one selected (accent), then a pinned strip.
+                for row in 0..3 {
+                    let rr = Rect::new(mini.x, y + row as f32 * 10.0, mini.w, 8.0);
+                    if row == 0 {
+                        pen.fill(rr, 2.0, p.accent, 1.0)?;
+                    } else {
+                        pen.fill(
+                            Rect::new(rr.x + 4.0, rr.y + 2.0, rr.w * 0.6, 4.0),
+                            2.0,
+                            p.text,
+                            0.5,
+                        )?;
+                    }
+                }
+                for i in 0..5 {
+                    tile_fill(Rect::new(mini.x + i as f32 * 14.0, y + 32.0, 10.0, 10.0), i)?;
+                }
+            } else {
+                let size = 14.0;
+                let gap = ((mini.w - 5.0 * size) / 4.0).max(2.0);
+                for line in 0..2 {
+                    for col in 0..5 {
+                        let x = mini.x + col as f32 * (size + gap);
+                        let tile = Rect::new(x, y + line as f32 * (size + 5.0), size, size);
+                        tile_fill(tile, line * 5 + col)?;
+                    }
+                }
+            }
+            fill(
+                Rect::new(mini.x - 10.0, mini.bottom() - 6.0, r.w, 10.0),
+                0.0,
+                p.footer,
+            )?;
+        }
+        LayoutKind::Sidebar => {
+            let rail = Rect::new(r.x, r.y, 20.0, mini.bottom() + 4.0 - r.y);
+            pen.fill(
+                rail,
+                small(s.menu_radius),
+                p.background[p.background.len() - 1],
+                1.0,
+            )?;
+            for i in 0..3 {
+                pen.fill(
+                    Rect::new(r.x + 6.0, mini.y + i as f32 * 12.0, 8.0, 8.0),
+                    4.0,
+                    p.accent,
+                    0.8,
+                )?;
+            }
+            let x = r.x + 28.0;
+            let w = r.right() - 10.0 - x;
+            pen.fill(Rect::new(x, mini.y, w * 0.5, 4.0), 2.0, p.subtext, 0.7)?;
+            pen.fill(
+                Rect::new(x, mini.y + 8.0, w * 0.35, 10.0),
+                2.0,
+                p.text,
+                0.95,
+            )?;
+            let search = Rect::new(x, mini.y + 24.0, w, 10.0);
+            fill(search, small(s.search_radius), p.field)?;
+            for i in 0..4 {
+                let tile = Rect::new(x + i as f32 * 17.0, mini.y + 40.0, 13.0, 13.0);
+                tile_fill(tile, i)?;
+            }
+        }
+    }
+    // Name band.
+    let band = Rect::new(r.x, r.bottom() - 30.0, r.w, 30.0);
+    pen.fill(band, 0.0, Rgb::new(0, 0, 0), 0.30)?;
+    pen.text(
+        id.title(),
+        &fonts.strong,
+        Rect::new(r.x + 10.0, band.y, r.w - 20.0, band.h),
+        DWRITE_TEXT_ALIGNMENT_LEADING,
+        p.text,
+    )?;
+    if selected {
+        let ring = Rect::new(r.x - 3.0, r.y - 3.0, r.w + 6.0, r.h + 6.0);
+        pen.stroke(ring, 10.0, accent, 1.0, 2.0)
+    } else {
+        pen.stroke(r, 8.0, WHITE, 0.14, 1.0)
+    }
+}
+
+/// Light text on dark or colored fills (Glint's #f4f4f5).
+const LIGHT_TEXT: Rgb = Rgb::new(0xf4, 0xf4, 0xf5);
+
 /// Text on a filled accent shape: dark or light, whichever reads better.
 pub fn on_accent(accent: Rgb) -> Rgb {
     let dark = Rgb::new(0x1b, 0x1b, 0x1f);
-    let light = background::TEXT;
+    let light = LIGHT_TEXT;
     if background::contrast(dark, accent) >= background::contrast(light, accent) {
         dark
     } else {
@@ -793,30 +965,10 @@ pub fn paint_row(
 
     match item {
         Item::ThemeCard => {
-            let card = parts[0];
-            pen.fill(card, 12.0, WHITE, 0.06)?;
-            pen.stroke(card, 12.0, v.accent, 1.0, 2.0)?;
-            let preview = Rect::new(card.x + 12.0, card.y + 12.0, card.w - 24.0, 68.0);
-            pen.gradient(preview, 10.0, &c.background.resolved_colors())?;
-            // A tiny pinned grid on the preview.
-            for i in 0..6 {
-                let x = preview.x + 16.0 + i as f32 * 26.0;
-                pen.fill(Rect::new(x, preview.y + 26.0, 16.0, 16.0), 4.0, WHITE, 0.55)?;
+            let on = chosen(item, c);
+            for (i, (r, id)) in parts.iter().zip(ThemeId::ALL).enumerate() {
+                paint_theme_card(&pen, fonts, *r, id, i == on, v.accent)?;
             }
-            pen.text(
-                "Glint (default)",
-                &fonts.strong,
-                Rect::new(card.x + 12.0, card.y + 86.0, card.w - 24.0, 20.0),
-                left,
-                primary,
-            )?;
-            pen.text(
-                "Selected. More themes arrive in the next update.",
-                &fonts.small,
-                Rect::new(card.x + 12.0, card.y + 106.0, card.w - 24.0, 16.0),
-                left,
-                secondary,
-            )?;
         }
         Item::Mode => {
             let whole = Rect::new(ctrl.x, ctrl.y, parts.iter().map(|r| r.w).sum(), ctrl.h);
@@ -835,9 +987,10 @@ pub fn paint_row(
         Item::Presets => {
             let on = chosen(item, c);
             for (i, (r, preset)) in parts.iter().zip(presets()).enumerate() {
-                let colors = match preset.colors() {
-                    Some(colors) => colors.to_vec(),
-                    None => c.background.colors.clone(),
+                let colors = match (preset, preset.colors()) {
+                    (Preset::Theme, _) => c.theme.theme().palette.background.to_vec(),
+                    (_, Some(colors)) => colors.to_vec(),
+                    (_, None) => c.background.colors.clone(),
                 };
                 pen.gradient(*r, BUTTON_RADIUS, &colors)?;
                 pen.stroke(*r, BUTTON_RADIUS, WHITE, 0.18, 1.0)?;
@@ -910,7 +1063,7 @@ pub fn paint_row(
         Item::Reset if v.confirm_reset => {
             button(parts[0], "Cancel")?;
             pen.fill(parts[1], BUTTON_RADIUS, Rgb::new(0xc4, 0x2b, 0x1c), 1.0)?;
-            pen.text("Reset", &fonts.label, parts[1], center, background::TEXT)?;
+            pen.text("Reset", &fonts.label, parts[1], center, LIGHT_TEXT)?;
             let note = Rect::new(parts[1].right() + 12.0, ctrl.y, 160.0, ctrl.h);
             pen.text("Pins stay.", &fonts.small, note, left, secondary)?;
         }
@@ -933,6 +1086,7 @@ pub fn paint_row(
                     Item::ShowNames => c.show_names,
                     Item::ShowMusic => c.music.enabled,
                     Item::AlbumTint => c.background.tint_from_album,
+                    Item::IconTint => c.icon_tint,
                     Item::Autostart => c.autostart,
                     _ => false,
                 };

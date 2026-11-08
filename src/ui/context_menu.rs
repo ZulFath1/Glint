@@ -19,18 +19,13 @@ use super::footer::draw_text;
 use super::gfx::{self, Canvas, Gfx, text_primary};
 use super::layout::Rect;
 use super::shape::RoundRect;
-use crate::config::Rgb;
 
 const WIDTH: f32 = 184.0;
 const HEIGHT: f32 = 44.0;
 /// Space around the single row.
 const PAD: f32 = 4.0;
-const RADIUS: f32 = 12.0;
-const ROW_RADIUS: f32 = 8.0;
 /// Kept this far from the menu's edges.
 const MARGIN: f32 = 8.0;
-const FILL: Rgb = Rgb::new(28, 28, 34);
-const FILL_ALPHA: f32 = 0.96;
 const GLYPH_SIZE: f32 = 16.0;
 const LABEL_SIZE: f32 = 13.0;
 const PIN_GLYPH: &str = "\u{E718}";
@@ -61,6 +56,7 @@ pub fn place(at: Vector2, menu: Vector2) -> Rect {
 
 pub struct ContextMenu {
     root: ContainerVisual,
+    panel: RoundRect,
     hover: RoundRect,
     content: Canvas,
     /// Where it is, in menu coordinates.
@@ -80,28 +76,39 @@ impl ContextMenu {
         root.SetOpacity(0.0)?;
         root.SetIsVisible(false)?;
         root.SetSize(size)?;
-        let panel = RoundRect::new(c, RADIUS, 1.0)?;
-        panel.set_fill(gfx::color(FILL, FILL_ALPHA))?;
-        panel.set_stroke(gfx::color(Rgb::new(255, 255, 255), 0.10))?;
-        panel.set_rect(Rect::new(0.0, 0.0, WIDTH, HEIGHT))?;
-        let hover = RoundRect::new(c, ROW_RADIUS, 0.0)?;
-        hover.set_fill(gfx::color(Rgb::new(255, 255, 255), 0.08))?;
-        hover.set_rect(Self::row_local())?;
+        let panel = RoundRect::new(c, 12.0, 1.0)?;
+        let hover = RoundRect::new(c, 8.0, 0.0)?;
         hover.show(false)?;
         let content = Canvas::new(c, gfx, size)?;
         root.Children()?.InsertAtTop(&panel.visual)?;
         root.Children()?.InsertAtTop(&hover.visual)?;
         root.Children()?.InsertAtTop(&content.visual)?;
         parent.Children()?.InsertAtTop(&root)?;
-        Ok(Self {
+        let menu = Self {
             root,
+            panel,
             hover,
             content,
             rect: Cell::new(Rect::new(0.0, 0.0, WIDTH, HEIGHT)),
             target: RefCell::new(None),
             glyph_format: gfx.icon_format(GLYPH_SIZE)?,
             label_format: gfx.text_format(LABEL_SIZE, DWRITE_FONT_WEIGHT_NORMAL)?,
-        })
+        };
+        menu.set_theme()?;
+        Ok(menu)
+    }
+
+    /// The active theme's popup colors and corners.
+    pub fn set_theme(&self) -> Result<()> {
+        let t = gfx::theme();
+        self.panel.set_fill(gfx::paint(t.palette.popup))?;
+        self.panel.set_stroke(gfx::paint(t.palette.popup_border))?;
+        self.panel.set_radius(t.shape.popup_radius - 2.0);
+        self.panel.set_rect(Rect::new(0.0, 0.0, WIDTH, HEIGHT))?;
+        self.hover.set_fill(gfx::paint(t.palette.hover))?;
+        self.hover
+            .set_radius((t.shape.popup_radius - 6.0).max(t.shape.button_radius.min(8.0)));
+        self.hover.set_rect(Self::row_local())
     }
 
     /// The row, inside the panel.
