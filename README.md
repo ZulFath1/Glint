@@ -15,6 +15,9 @@ button, and nothing else: no ads, no web results, no "Recommended".
   one after another. Every animation is played by the Windows compositor at
   your monitor's refresh rate (60, 120, 144 Hz...). Closing halfway and
   reopening continues smoothly instead of jumping.
+- **Bottom or center.** The menu opens above the taskbar, or in the middle
+  of the screen growing out of its own center (Settings → Layout →
+  Position, or `position` in `config.toml`).
 - **Only as big as it needs to be.** The grid has 6 columns by default (3 to
   8, your choice), and the menu shrinks or grows with the number of pins.
 - **Instant app search.** Start typing to search all installed apps, both
@@ -203,6 +206,10 @@ theme = "tokyo-night"
 # Draw app icons in one color (the theme's text color).
 icon_tint = false
 
+# Where the menu opens: "bottom" (above the taskbar), "center" (the middle
+# of the screen), or "theme" (bottom; the nord theme likes center).
+position = "theme"
+
 # Color of the text caret, keyboard focus ring, search border and seek bar:
 # "theme", "#rrggbb", or "system" to follow your Windows accent color.
 accent = "theme"
@@ -304,7 +311,15 @@ cd Glint
 cargo build --release
 ```
 
-The exe is at `target\release\glint.exe`. To run the checks that CI runs:
+The exe is at `target\release\glint.exe`. The build puts the app icon
+(`assets/glint.ico`) into the exe with the Windows SDK's `rc.exe` (see
+`build.rs`). To change the icon, edit and run `tools\make-icon.ps1`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\make-icon.ps1
+```
+
+To run the checks that CI runs:
 
 ```powershell
 cargo fmt --check

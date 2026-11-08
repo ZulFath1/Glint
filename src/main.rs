@@ -287,10 +287,17 @@ impl App {
 
     /// Where a window for a `size` DIPs menu goes: above the taskbar, or,
     /// while Settings is open, beside the Settings window.
+    /// Does the menu open in the middle of the screen (`position`, or the
+    /// theme's default)?
+    fn centered(&self) -> bool {
+        let c = self.config.borrow();
+        c.position.centered(c.theme)
+    }
+
     fn placement_for(&self, size: windows_numerics::Vector2) -> Placement {
         match self.preview_anchor() {
-            Some((rect, _)) => window::placement_beside(size.X, size.Y, rect),
-            None => window::placement(size.X, size.Y),
+            Some((rect, _)) => window::placement_beside(size.X, size.Y, rect, self.centered()),
+            None => window::placement(size.X, size.Y, self.centered()),
         }
     }
 
@@ -510,6 +517,10 @@ impl App {
             changed.push("theme");
             self.apply_theme();
         }
+        if old.position != new.position {
+            changed.push("position");
+            self.apply_position();
+        }
         // A theme brings its own background colors and accent.
         if old.background != new.background || new_theme {
             changed.push("background");
@@ -578,6 +589,18 @@ impl App {
 
     /// The theme or icon tint changed: repaint the menu in the new look.
     /// The window may grow first, like for new pins.
+    /// `position` changed: an open menu moves to its new place at once (a
+    /// hidden one is placed fresh on the next open).
+    fn apply_position(&self) {
+        if !self.is_visible.get() {
+            return;
+        }
+        let p = self.placement_for(self.ui.max_size());
+        self.show_window(&p);
+        self.placement.set(Some(p));
+        log_err("moving the menu", self.ui.set_layout(&p));
+    }
+
     fn apply_theme(&self) {
         let (theme, tint) = {
             let c = self.config.borrow();
@@ -1746,7 +1769,7 @@ fn run() -> Result<()> {
     let accent = resolve_accent(&config, &settings);
     // Paint the content now, at the DPI of the monitor it will most likely
     // open on, so the first open is instant.
-    let scale = window::placement(1.0, 1.0).scale;
+    let scale = window::placement(1.0, 1.0, false).scale;
     let ui = ui::Ui::new(hwnd, &config, accent, scale)?;
     let config_watch = config_path
         .as_deref()

@@ -113,7 +113,7 @@ impl Section {
                 GlassTint,
                 AccentColor,
             ],
-            Self::Layout => &[Columns, ShowNames],
+            Self::Layout => &[Position, Columns, ShowNames],
             Self::Animation => &[OpenSpeed, Bounce, IconDelay, Replay],
             Self::Music => &[ShowMusic, AlbumTint],
             Self::General => &[Hotkey, Autostart, OpenConfig, Reset],
@@ -137,6 +137,7 @@ pub fn side_item(i: usize) -> Rect {
 pub enum Item {
     ThemeCard,
     IconTint,
+    Position,
     Mode,
     Presets,
     CustomColors,
@@ -183,6 +184,13 @@ pub enum ColorTarget {
     Accent,
 }
 
+/// The position buttons: where the menu opens.
+pub const POSITIONS: [(config::Position, &str); 3] = [
+    (config::Position::Theme, "Theme default"),
+    (config::Position::Bottom, "Bottom"),
+    (config::Position::Center, "Center"),
+];
+
 /// The mode buttons, in the order IMPROVE.md lists them.
 pub const MODES: [(BackgroundMode, &str); 4] = [
     (BackgroundMode::Solid, "Solid"),
@@ -216,6 +224,7 @@ impl Item {
             // The page title already says "Theme"; the cards use the row.
             Self::ThemeCard => "",
             Self::IconTint => "Icon tint",
+            Self::Position => "Position",
             Self::Mode => "Background",
             Self::Presets => "Colors",
             Self::CustomColors => "Custom colors",
@@ -254,7 +263,7 @@ impl Item {
 
     pub fn kind(self) -> Kind {
         match self {
-            Self::ThemeCard | Self::Mode | Self::Presets => Kind::Radio,
+            Self::ThemeCard | Self::Mode | Self::Presets | Self::Position => Kind::Radio,
             Self::Angle
             | Self::Darkness
             | Self::GlassTint
@@ -455,6 +464,12 @@ pub fn parts(item: Item, row: Rect, v: &View) -> Vec<Rect> {
                 })
                 .collect()
         }
+        Item::Position => {
+            let w = (c.w / POSITIONS.len() as f32).min(110.0);
+            (0..POSITIONS.len())
+                .map(|i| Rect::new(c.x + i as f32 * w, c.y, w, c.h))
+                .collect()
+        }
         Item::Mode => {
             // Each segment as wide as its name needs, sharing the row.
             let weight = |name: &str| name.chars().count() as f32 + 6.0;
@@ -526,6 +541,10 @@ pub fn stop_part(colors: usize, i: usize) -> Option<StopPart> {
 /// For radio rows: the part that is chosen now.
 pub fn chosen(item: Item, c: &Config) -> usize {
     match item {
+        Item::Position => POSITIONS
+            .iter()
+            .position(|(p, _)| *p == c.position)
+            .unwrap_or(0),
         Item::Mode => MODES
             .iter()
             .position(|(m, _)| *m == c.background.mode)
@@ -970,11 +989,16 @@ pub fn paint_row(
                 paint_theme_card(&pen, fonts, *r, id, i == on, v.accent)?;
             }
         }
-        Item::Mode => {
+        Item::Mode | Item::Position => {
             let whole = Rect::new(ctrl.x, ctrl.y, parts.iter().map(|r| r.w).sum(), ctrl.h);
             pen.fill(whole, BUTTON_RADIUS, WHITE, 0.08)?;
             let on = chosen(item, c);
-            for (i, (r, (_, name))) in parts.iter().zip(MODES).enumerate() {
+            let names: Vec<&str> = if item == Item::Mode {
+                MODES.iter().map(|(_, n)| *n).collect()
+            } else {
+                POSITIONS.iter().map(|(_, n)| *n).collect()
+            };
+            for (i, (r, name)) in parts.iter().zip(names).enumerate() {
                 let color = if i == on {
                     pen.fill(*r, BUTTON_RADIUS, v.accent, 1.0)?;
                     on_accent(v.accent)

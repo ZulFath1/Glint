@@ -233,6 +233,8 @@ pub struct Theme {
     /// with a block caret, lowercase labels, a `── pinned ──` divider and
     /// a text-style music row.
     pub terminal: bool,
+    /// Opens in the middle of the screen when `position = "theme"`.
+    pub centered: bool,
 }
 
 impl Theme {
@@ -302,6 +304,7 @@ pub const GLINT: Theme = Theme {
     tile: IconTile::None,
     footer: FooterStyle::Power,
     terminal: false,
+    centered: false,
 };
 
 /// Catppuccin Mocha: soft and cozy.
@@ -361,6 +364,7 @@ pub const CATPPUCCIN: Theme = {
         tile: IconTile::Squircle,
         footer: FooterStyle::Buttons,
         terminal: false,
+        centered: false,
     }
 };
 
@@ -420,6 +424,7 @@ pub const NORD: Theme = {
         tile: IconTile::Rounded,
         footer: FooterStyle::Power,
         terminal: false,
+        centered: true,
     }
 };
 
@@ -489,6 +494,7 @@ pub const TOKYO_NIGHT: Theme = {
         tile: IconTile::Bordered,
         footer: FooterStyle::Power,
         terminal: false,
+        centered: false,
     }
 };
 
@@ -549,6 +555,7 @@ pub const GRUVBOX: Theme = {
         tile: IconTile::Sharp,
         footer: FooterStyle::Text,
         terminal: true,
+        centered: false,
     }
 };
 

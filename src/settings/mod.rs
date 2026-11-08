@@ -39,10 +39,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetClientRect, GetWindowRect, IDC_ARROW, IDI_APPLICATION,
-    LoadCursorW, LoadIconW, MINMAXINFO, RegisterClassW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
-    SetForegroundWindow, ShowWindow, WM_APP, WNDCLASSW, WNDPROC, WS_EX_NOREDIRECTIONBITMAP,
-    WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DestroyWindow, GetClientRect, GetWindowRect, IDC_ARROW, LoadCursorW,
+    MINMAXINFO, RegisterClassW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SetForegroundWindow, ShowWindow,
+    WM_APP, WNDCLASSW, WNDPROC, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{Interface, Result, w};
 use windows_numerics::{Vector2, Vector3};
@@ -156,8 +155,8 @@ fn register_class(wndproc: WNDPROC) -> Result<()> {
             hInstance: instance.into(),
             lpszClassName: w!("GlintSettings"),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            // A shared system icon (never destroyed), as for the tray.
-            hIcon: LoadIconW(None, IDI_APPLICATION)?,
+            // Glint's own icon (shared, never destroyed), as for the tray.
+            hIcon: crate::window::app_icon(false),
             ..Default::default()
         };
         if RegisterClassW(&class) == 0 {
@@ -802,6 +801,10 @@ impl SettingsWindow {
                 None => Action::None,
             },
             Item::IconTint => self.change(gfx, |c| c.icon_tint = !c.icon_tint),
+            Item::Position => match page::POSITIONS.get(p) {
+                Some(&(position, _)) => self.change(gfx, |c| c.position = position),
+                None => Action::None,
+            },
             Item::Mode => match page::MODES.get(p) {
                 Some(&(mode, _)) => self.change(gfx, |c| c.background.mode = mode),
                 None => Action::None,

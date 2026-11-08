@@ -224,6 +224,60 @@ impl<'de> Deserialize<'de> for Accent {
     }
 }
 
+/// Where the menu opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Position {
+    /// What the theme wants (bottom, except nord: center).
+    #[default]
+    Theme,
+    /// Above the taskbar, growing out of its edge.
+    Bottom,
+    /// In the middle of the monitor, growing out of its own center.
+    Center,
+}
+
+impl Position {
+    pub const ALL: [Self; 3] = [Self::Theme, Self::Bottom, Self::Center];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Theme => "theme",
+            Self::Bottom => "bottom",
+            Self::Center => "center",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().to_ascii_lowercase();
+        let s = if s == "centre" {
+            "center".to_string()
+        } else {
+            s
+        };
+        Self::ALL.into_iter().find(|p| p.name() == s)
+    }
+
+    /// Centered for this theme? The user's "bottom" / "center" always win.
+    pub fn centered(self, theme: ThemeId) -> bool {
+        match self {
+            Self::Theme => theme.theme().centered,
+            Self::Bottom => false,
+            Self::Center => true,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Position {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::parse(&s).ok_or_else(|| {
+            D::Error::custom(format!(
+                r#"unknown position "{s}"; use "theme", "bottom" or "center""#
+            ))
+        })
+    }
+}
+
 /// An extra shortcut that toggles the menu, e.g. "Alt+Space".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hotkey {
@@ -572,6 +626,8 @@ pub struct Config {
     pub theme: ThemeId,
     /// Draw app icons in one color (the theme's text color).
     pub icon_tint: bool,
+    /// Where the menu opens: "theme", "bottom" or "center".
+    pub position: Position,
     pub accent: Accent,
     /// Extra shortcut that toggles the menu (`None` = Win key only).
     #[serde(deserialize_with = "hotkey")]
@@ -595,6 +651,7 @@ impl Default for Config {
             pinned: DEFAULT_PINS.map(String::from).to_vec(),
             theme: ThemeId::TokyoNight,
             icon_tint: false,
+            position: Position::Theme,
             accent: Accent::Theme,
             hotkey: None,
             max_columns: DEFAULT_COLUMNS,
@@ -753,6 +810,10 @@ theme = "tokyo-night"
 
 # Draw app icons in one color (the theme's text color).
 icon_tint = false
+
+# Where the menu opens: "bottom" (above the taskbar), "center" (the middle
+# of the screen), or "theme" (bottom; the nord theme likes center).
+position = "theme"
 
 # Color of the text caret, keyboard focus ring, search border and seek bar:
 # "theme", "#rrggbb", or "system" to follow your Windows accent color.
@@ -1042,6 +1103,12 @@ pub fn save_changes(doc: &mut DocumentMut, old: &Config, new: &Config) {
         Value::from(new.icon_tint),
     );
     put(
+        old.position != new.position,
+        None,
+        "position",
+        Value::from(new.position.name()),
+    );
+    put(
         old.accent != new.accent,
         None,
         "accent",
@@ -1201,6 +1268,30 @@ mod tests {
         assert_eq!(bg.resolved_colors(glint)[0], Rgb::new(0x2b, 0x1a, 0x4a));
         bg.colors.clear();
         assert_eq!(bg.resolved_colors(glint), [Rgb::new(0x1e, 0x20, 0x26)]);
+    }
+
+    #[test]
+    fn positions() {
+        let c = parse(r#"position = "center""#).unwrap();
+        assert_eq!(c.position, Position::Center);
+        assert_eq!(parse("").unwrap().position, Position::Theme);
+        let centre = parse(r#"position = "Centre""#).unwrap();
+        assert_eq!(centre.position, Position::Center);
+        assert!(parse(r#"position = "left""#).is_err());
+        // "theme": nord is centered, the others sit at the bottom; the
+        // user's choice always wins.
+        assert!(Position::Theme.centered(ThemeId::Nord));
+        assert!(!Position::Theme.centered(ThemeId::TokyoNight));
+        assert!(!Position::Bottom.centered(ThemeId::Nord));
+        assert!(Position::Center.centered(ThemeId::Glint));
+        let text = default_text(&pins(&["a"]));
+        let old = parse(&text).unwrap();
+        let mut new = old.clone();
+        new.position = Position::Bottom;
+        let mut doc: DocumentMut = text.parse().unwrap();
+        save_changes(&mut doc, &old, &new);
+        assert!(doc.to_string().contains("position = \"bottom\"\n"), "{doc}");
+        assert_eq!(parse(&doc.to_string()).unwrap(), new);
     }
 
     #[test]

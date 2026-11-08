@@ -546,6 +546,8 @@ impl Ui {
             Z: 0.0,
         })?;
         let (x, y) = match p.edge {
+            // Centered: grow out of the menu's own center.
+            _ if p.centered => (s.X / 2.0, s.Y / 2.0),
             Edge::Bottom => (s.X / 2.0, s.Y),
             Edge::Top => (s.X / 2.0, 0.0),
             // Vertical taskbars: grow from the corner next to Start.

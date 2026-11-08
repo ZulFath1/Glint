@@ -8,10 +8,9 @@ use windows::Win32::UI::Shell::{
     NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, IDI_APPLICATION, LoadIconW,
-    MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW, SetForegroundWindow,
-    SetMenuDefaultItem, TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, WM_APP, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, MF_CHECKED, MF_SEPARATOR, MF_STRING,
+    MF_UNCHECKED, PostMessageW, SetForegroundWindow, SetMenuDefaultItem, TPM_BOTTOMALIGN,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_NULL,
 };
 use windows::core::{Result, w};
 
@@ -76,9 +75,8 @@ impl Tray {
             uID: ICON_ID,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: WM_APP_TRAY,
-            // SAFETY: loads a shared system icon; shared icons must not be
-            // destroyed, so there is nothing to free.
-            hIcon: unsafe { LoadIconW(None, IDI_APPLICATION)? },
+            // Glint's own icon, shared (nothing to free).
+            hIcon: crate::window::app_icon(true),
             ..Default::default()
         };
         fill(&mut data.szTip, "Glint");

@@ -13,7 +13,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ShowWindow, WINDOW_EX_STYLE, WNDCLASSW, WNDPROC, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
-use windows::core::{Result, w};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, HICON, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, LoadIconW,
+    LoadImageW, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
+};
+use windows::core::{PCWSTR, Result, w};
 
 use crate::hook;
 
@@ -50,6 +54,9 @@ pub struct Placement {
     pub scale: f32,
     /// The open animation grows out of this edge.
     pub edge: Edge,
+    /// `position = "center"`: the menu sits in the middle of the monitor
+    /// and grows out of its own center (instead of the taskbar's edge).
+    pub centered: bool,
 }
 
 impl Placement {
@@ -58,6 +65,11 @@ impl Placement {
     /// bottom it is pushed down to the bottom of that space. Returns the
     /// top edge in window pixels.
     pub fn menu_top(&self, height: f32) -> i32 {
+        let h = (height * self.scale).round() as i32;
+        if self.centered {
+            // Centered: a shorter menu stays centered in the same space.
+            return self.menu_y + (self.menu_height - h) / 2;
+        }
         match self.edge {
             Edge::Bottom => self.menu_y + self.menu_height - (height * self.scale).round() as i32,
             _ => self.menu_y,
@@ -70,6 +82,35 @@ impl Placement {
         let top = self.menu_top(height);
         let bottom = top + (height * self.scale).round() as i32;
         (self.menu_x..self.menu_x + self.menu_width).contains(&x) && (top..bottom).contains(&y)
+    }
+}
+
+/// Glint's own icon (resource 1 in the exe, see build.rs), `small` = the
+/// size of tray and title-bar icons, else the normal size. Falls back to the
+/// generic application icon if the exe has none. Loaded as a shared icon:
+/// Windows keeps one copy, and it must never be destroyed.
+pub fn app_icon(small: bool) -> HICON {
+    let (wm, hm) = if small {
+        (SM_CXSMICON, SM_CYSMICON)
+    } else {
+        (SM_CXICON, SM_CYICON)
+    };
+    // SAFETY: loads resource 1 of our own module (MAKEINTRESOURCE(1)); the
+    // integer-as-pointer is how Win32 names resources by number.
+    unsafe {
+        let module = GetModuleHandleW(None).ok();
+        let loaded = LoadImageW(
+            module.map(Into::into),
+            PCWSTR(std::ptr::without_provenance(1)),
+            IMAGE_ICON,
+            GetSystemMetrics(wm),
+            GetSystemMetrics(hm),
+            LR_DEFAULTCOLOR | LR_SHARED,
+        );
+        match loaded {
+            Ok(h) => HICON(h.0),
+            Err(_) => LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+        }
     }
 }
 
@@ -133,23 +174,31 @@ fn allow_host_backdrop(hwnd: HWND) {
 }
 
 /// Works out where the menu goes: on the cursor's monitor, centered on the
-/// taskbar's edge, `TASKBAR_GAP` away from it.
-pub fn placement(menu_width: f32, menu_height: f32) -> Placement {
+/// taskbar's edge, `TASKBAR_GAP` away from it, or (`centered`) in the
+/// middle of the monitor.
+pub fn placement(menu_width: f32, menu_height: f32, centered: bool) -> Placement {
     let (monitor, work, scale) = cursor_monitor();
-    compute_placement(monitor, work, work, scale, menu_width, menu_height)
+    let size = (menu_width, menu_height);
+    compute_placement(monitor, work, work, scale, size, centered)
 }
 
 /// Like `placement`, but on the side of `avoid` (the Settings window, in
 /// screen pixels) with the most room, so the live preview sits next to
 /// Settings instead of under it. The menu still keeps to the taskbar's edge.
-pub fn placement_beside(menu_width: f32, menu_height: f32, avoid: RECT) -> Placement {
+pub fn placement_beside(
+    menu_width: f32,
+    menu_height: f32,
+    avoid: RECT,
+    centered: bool,
+) -> Placement {
     let center = POINT {
         x: avoid.left + (avoid.right - avoid.left) / 2,
         y: avoid.top + (avoid.bottom - avoid.top) / 2,
     };
     let (monitor, work, scale) = monitor_at(center);
     let area = beside(work, avoid, (TASKBAR_GAP * scale).round() as i32);
-    compute_placement(monitor, work, area, scale, menu_width, menu_height)
+    let size = (menu_width, menu_height);
+    compute_placement(monitor, work, area, scale, size, centered)
 }
 
 /// The part of `work` left or right of `avoid` (whichever is wider), minus
@@ -295,8 +344,8 @@ fn compute_placement(
     work: RECT,
     area: RECT,
     scale: f32,
-    menu_w: f32,
-    menu_h: f32,
+    (menu_w, menu_h): (f32, f32),
+    centered: bool,
 ) -> Placement {
     let px = |dip: f32| (dip * scale).round() as i32;
     let (mw, mh, margin, gap) = (px(menu_w), px(menu_h), px(MARGIN), px(TASKBAR_GAP));
@@ -323,6 +372,12 @@ fn compute_placement(
         Edge::Left => (work.left + gap, work.top + gap),
         Edge::Right => (work.right - gap - mw, work.top + gap),
     };
+    // Centered: the middle of the space, both ways.
+    let (menu_x, menu_y) = if centered {
+        (center_x, work.top + (work.bottom - work.top - mh) / 2)
+    } else {
+        (menu_x, menu_y)
+    };
 
     // Menu + margin, but never over the taskbar (so taskbar clicks
     // still work while the menu is open).
@@ -342,6 +397,7 @@ fn compute_placement(
         menu_height: mh,
         scale,
         edge,
+        centered,
     }
 }
 
@@ -504,8 +560,8 @@ mod tests {
             rect(0, 0, 1920, 1032),
             rect(0, 0, 1920, 1032),
             1.0,
-            360.0,
-            320.0,
+            (360.0, 320.0),
+            false,
         );
         assert_eq!(p.edge, Edge::Bottom);
         // Menu bottom = 1032 - 12 = 1020. The window stops at the taskbar.
@@ -528,8 +584,8 @@ mod tests {
             rect(0, 48, 1920, 1080),
             rect(0, 48, 1920, 1080),
             1.0,
-            360.0,
-            320.0,
+            (360.0, 320.0),
+            false,
         );
         assert_eq!(p.edge, Edge::Top);
         assert_eq!(p.menu_top(200.0), p.menu_top(320.0));
@@ -542,8 +598,8 @@ mod tests {
             rect(0, 0, 2880, 1548),
             rect(0, 0, 2880, 1548),
             1.5,
-            360.0,
-            320.0,
+            (360.0, 320.0),
+            false,
         );
         assert_eq!(p.width, 540 + 96);
         assert_eq!(p.y + p.menu_y + p.menu_height, 1548 - 18);
@@ -555,7 +611,7 @@ mod tests {
         // Auto-hide: Windows says the work area is the whole 1920x1200 screen.
         let m = rect(0, 0, 1920, 1200);
         let work = reserve_taskbar(m, Edge::Bottom, 48);
-        let p = compute_placement(m, work, work, 1.0, 360.0, 320.0);
+        let p = compute_placement(m, work, work, 1.0, (360.0, 320.0), false);
         assert_eq!(p.edge, Edge::Bottom);
         assert_eq!(p.y + p.menu_y + p.menu_height, 1200 - 48 - 12);
         assert_eq!(reserve_taskbar(m, Edge::Left, 60).left, 60);
@@ -570,8 +626,8 @@ mod tests {
                 rect(0, 48, 1920, 1080),
                 rect(0, 48, 1920, 1080),
                 1.0,
-                360.0,
-                320.0
+                (360.0, 320.0),
+                false
             )
             .edge,
             Edge::Top
@@ -581,8 +637,8 @@ mod tests {
             rect(60, 0, 1920, 1080),
             rect(60, 0, 1920, 1080),
             1.0,
-            360.0,
-            320.0,
+            (360.0, 320.0),
+            false,
         );
         assert_eq!(left.edge, Edge::Left);
         // The window never reaches into the taskbar on the left.
@@ -594,8 +650,8 @@ mod tests {
                 rect(0, 0, 1860, 1080),
                 rect(0, 0, 1860, 1080),
                 1.0,
-                360.0,
-                320.0
+                (360.0, 320.0),
+                false
             )
             .edge,
             Edge::Right
@@ -613,7 +669,7 @@ mod tests {
             let bar = px(48.0);
             for edge in [Edge::Bottom, Edge::Top, Edge::Left, Edge::Right] {
                 let work = reserve_taskbar(m, edge, bar);
-                let p = compute_placement(m, work, work, scale, 360.0, 420.0);
+                let p = compute_placement(m, work, work, scale, (360.0, 420.0), false);
                 assert_eq!(p.edge, edge, "{edge:?} at {scale}");
                 assert!(p.x >= work.left && p.y >= work.top, "{edge:?} at {scale}");
                 assert!(p.x + p.width <= work.right, "{edge:?} at {scale}");
@@ -637,7 +693,7 @@ mod tests {
         // A 125% monitor placed left of the main screen has negative x.
         let m = rect(-2400, 0, 0, 1350);
         let work = rect(-2400, 0, 0, 1290);
-        let p = compute_placement(m, work, work, 1.25, 360.0, 320.0);
+        let p = compute_placement(m, work, work, 1.25, (360.0, 320.0), false);
         assert_eq!(p.edge, Edge::Bottom);
         assert_eq!(p.x + p.width / 2, -1200);
         assert!(p.x >= -2400 && p.x + p.width <= 0);
@@ -652,7 +708,7 @@ mod tests {
         let settings = rect(100, 400, 820, 1000);
         let area = beside(work, settings, 12);
         assert_eq!(area, rect(832, 0, 1920, 1032));
-        let p = compute_placement(m, work, area, 1.0, 528.0, 400.0);
+        let p = compute_placement(m, work, area, 1.0, (528.0, 400.0), false);
         assert_eq!(p.edge, Edge::Bottom);
         let menu_left = p.x + p.menu_x;
         assert!(menu_left >= 832, "{menu_left}");
@@ -671,5 +727,27 @@ mod tests {
         assert_eq!(Edge::parse("RIGHT"), Some(Edge::Right));
         assert_eq!(Edge::parse("bottom"), Some(Edge::Bottom));
         assert_eq!(Edge::parse("middle"), None);
+    }
+
+    #[test]
+    fn centered_menus_sit_in_the_middle_and_shrink_evenly() {
+        let p = compute_placement(
+            rect(0, 0, 1920, 1080),
+            rect(0, 0, 1920, 1032),
+            rect(0, 0, 1920, 1032),
+            1.0,
+            (400.0, 300.0),
+            true,
+        );
+        assert!(p.centered);
+        let (mx, my) = (p.x + p.menu_x, p.y + p.menu_y);
+        assert_eq!(mx + 200, 960);
+        assert_eq!(my + 150, 516); // the middle of the work area
+        // Margin on every side (the window never touches the taskbar).
+        assert_eq!((p.menu_x, p.menu_y), (32, 32));
+        assert!(p.y + p.height <= 1032);
+        // A shorter menu stays centered: 100 px less = 50 px lower.
+        assert_eq!(p.menu_top(200.0), p.menu_top(300.0) + 50);
+        assert!(p.menu_contains(p.menu_x + 10, p.menu_top(200.0) + 10, 200.0));
     }
 }

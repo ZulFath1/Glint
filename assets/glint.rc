@@ -1,0 +1,4 @@
+// Windows resources linked into glint.exe (see build.rs).
+// Icon 1 is the app icon: Explorer, the taskbar, Alt+Tab, the tray and the
+// Settings window use it. Made by tools/make-icon.ps1.
+1 ICON "glint.ico"
