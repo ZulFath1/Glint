@@ -307,6 +307,9 @@ pub struct Ui {
     accent: Cell<Rgb>,
     /// (grid, rows) as last shown: what `sync_shown` fades in or out.
     shown: Cell<(bool, bool)>,
+    /// The sidebar's Apps button is on: the most-used apps show instead
+    /// of the pinned grid (while nothing is typed).
+    apps_view: Cell<bool>,
 }
 
 /// True if a key press or mouse click is waiting in our message queue.
@@ -460,6 +463,7 @@ impl Ui {
             icon_tint: Cell::new(config.icon_tint),
             accent: Cell::new(accent),
             shown: Cell::new((true, false)),
+            apps_view: Cell::new(false),
         };
         ui.refresh()?;
         // The list layout starts with its most-used apps.
@@ -641,6 +645,7 @@ impl Ui {
         }
         let theme = id.theme();
         gfx::set_theme(theme);
+        self.apps_view.set(false);
         self.icon_tint.set(icon_tint);
         self.grid.set_icon_tint(icon_tint);
 
@@ -903,6 +908,8 @@ impl Ui {
     pub fn reset_closed(&self) -> Result<()> {
         Animator::reset_closed(&self.menu)?;
         self.is_open.set(false);
+        // The sidebar opens on the pinned apps again.
+        self.apps_view.set(false);
         self.search.editor.borrow_mut().clear();
         self.search.redraw_text(&self.gfx)?;
         self.update_search(true)
@@ -1062,8 +1069,9 @@ impl Ui {
         *self.query.borrow_mut() = text;
         if q.is_empty() {
             self.search.set_count(&self.gfx, None)?;
-            if self.kind() == LayoutKind::List {
-                // Nothing typed: the list shows the most-used apps.
+            if self.kind() == LayoutKind::List || self.apps_view.get() {
+                // Nothing typed: the list layout (or the sidebar's Apps
+                // view) shows the most-used apps.
                 let hits = self.most_used();
                 let n = hits.len();
                 *self.hits.borrow_mut() = hits;
@@ -1773,6 +1781,10 @@ impl Ui {
                 self.set_focus(Focus::Search)?;
                 return Ok(Action::None);
             }
+            // The sidebar's Apps view: back to the pinned apps first.
+            if self.apps_view.get() {
+                return self.go_to_apps();
+            }
             return Ok(Action::Close);
         }
 
@@ -2023,13 +2035,16 @@ impl Ui {
             .unwrap_or(Focus::Settings)
     }
 
-    /// The rail's Apps button: back to the pinned apps, keyboard in the
-    /// (emptied) search box.
+    /// The rail's Apps button: switches between the most-used apps and the
+    /// pinned grid, with the keyboard in the (emptied) search box.
     fn go_to_apps(&self) -> Result<Action> {
+        // Shows the most-used apps, or (pressed again) the pinned apps.
+        self.apps_view.set(!self.apps_view.get());
         if !self.search.editor.borrow().is_empty() {
             self.search.editor.borrow_mut().clear();
-            self.after_edit()?;
+            self.search.redraw_text(&self.gfx)?;
         }
+        self.update_search(true)?;
         self.keyboard_nav.set(false);
         self.set_focus(Focus::Search)?;
         Ok(Action::None)

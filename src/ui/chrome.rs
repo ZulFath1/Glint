@@ -39,6 +39,8 @@ const GREETING_SIZE: f32 = 13.0;
 const CLOCK_SIZE: f32 = 36.0;
 const GREETING_H: f32 = 20.0;
 const CLOCK_H: f32 = 44.0;
+/// Room the clock and date take on the right of the header.
+const CLOCK_AREA_W: f32 = 150.0;
 
 fn now() -> SYSTEMTIME {
     // SAFETY: GetLocalTime only fills in a SYSTEMTIME it returns by value.
@@ -280,32 +282,46 @@ impl Chrome {
         let accent = gfx::theme().palette.accent;
         self.header.draw(gfx, |ctx| {
             gfx::with_glow(ctx, |ctx| {
-                let lead = DWRITE_TEXT_ALIGNMENT_LEADING;
-                let draw = |text: &str, format: &IDWriteTextFormat, r: Rect, color: Rgb| {
-                    super::footer::draw_text(ctx, gfx, text, format, r, lead, color)
-                };
-                draw(
-                    &hello,
-                    &self.greeting_format,
-                    Rect::new(0.0, 0.0, size.X, GREETING_H),
-                    text_secondary(),
-                )?;
-                draw(
+                // The clock and the date on the right (right-aligned); the
+                // greeting on the left, centered next to them.
+                let (lead, right) = (
+                    DWRITE_TEXT_ALIGNMENT_LEADING,
+                    DWRITE_TEXT_ALIGNMENT_TRAILING,
+                );
+                let top = ((size.Y - CLOCK_H - GREETING_H) / 2.0).max(0.0);
+                super::footer::draw_text(
+                    ctx,
+                    gfx,
                     &clock,
                     &self.clock_format,
-                    Rect::new(0.0, GREETING_H, size.X, CLOCK_H),
+                    Rect::new(0.0, top, size.X, CLOCK_H),
+                    right,
                     text_primary(),
                 )?;
-                draw(
+                super::footer::draw_text(
+                    ctx,
+                    gfx,
                     &date,
+                    &self.greeting_format,
+                    Rect::new(0.0, top + CLOCK_H, size.X, GREETING_H),
+                    right,
+                    accent,
+                )?;
+                // Left of the clock (about 120 DIPs wide at 36 px).
+                let block = CLOCK_H + GREETING_H;
+                super::footer::draw_text(
+                    ctx,
+                    gfx,
+                    &hello,
                     &self.greeting_format,
                     Rect::new(
                         0.0,
-                        GREETING_H + CLOCK_H,
-                        size.X,
-                        size.Y - GREETING_H - CLOCK_H,
+                        top + (block - GREETING_H) / 2.0,
+                        (size.X - CLOCK_AREA_W).max(0.0),
+                        GREETING_H,
                     ),
-                    accent,
+                    lead,
+                    text_secondary(),
                 )
             })
         })
