@@ -34,6 +34,7 @@ pub mod results;
 pub mod search_box;
 pub mod shape;
 pub mod shell;
+pub mod toast;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -57,7 +58,7 @@ use crate::config::{Config, Rgb, ThemeId};
 use crate::icons::IconCache;
 use crate::media::{self, MediaCommand, MusicView};
 use crate::power::PowerAction;
-use crate::search::{self, Query};
+use crate::search::{self, Hit, HitAction, HitIcon, NowPlaying, Provider};
 use crate::theme::LayoutKind;
 use crate::window::{Edge, Placement};
 use anim::{Animator, Kind, LayoutMotion};
@@ -67,11 +68,12 @@ use context_menu::{ContextMenu, MenuTarget};
 use footer::{Footer, PowerStrip, StripState};
 use gfx::Gfx;
 use grid::Grid;
-use layout::{Content, Layout, MAX_RESULTS, Music, Rect};
+use layout::{Content, Layout, Music, Rect, Rows};
 use music::{CardPart, MusicCard};
-use results::Results;
+use results::{Results, RowIcon, RowView};
 use search_box::SearchBox;
 use shape::RoundRect;
+use toast::Toast;
 
 /// The timer that fills in result icons a moment after typing (WM_TIMER id).
 pub const TIMER_ICONS: usize = 2;
@@ -105,6 +107,9 @@ pub enum Action {
     /// "Pin to Glint" / "Unpin from Glint" on this app ID (right-click).
     Pin(String),
     Unpin(String),
+    /// Enter (or a click) on a search result that isn't an app: copy,
+    /// open a Settings page, a system action... (super search).
+    Hit(HitAction),
 }
 
 /// Who has the keyboard.
@@ -279,10 +284,17 @@ pub struct Ui {
     catalog: RefCell<Catalog>,
     /// The search the results are for.
     query: RefCell<String>,
-    /// The results: indexes into `catalog.apps`, best first.
-    hits: RefCell<Vec<usize>>,
+    /// The results, best first, grouped by provider.
+    found: RefCell<search::Results>,
     /// The highlighted result.
     selected: Cell<usize>,
+    /// A dangerous result (restart, empty the bin...) got its first
+    /// Enter: the second one runs it. Any edit or move cancels.
+    confirming: RefCell<Option<HitAction>>,
+    /// The current music session, for "play" / "next" in the search.
+    now_playing: RefCell<Option<NowPlaying>>,
+    /// "Copied".
+    toast: Toast,
     /// Apps whose icon could not be loaded (not retried).
     failed_icons: RefCell<HashSet<String>>,
     stats: Cell<SearchStats>,
@@ -378,7 +390,7 @@ impl Ui {
         grid.set_icon_tint(config.icon_tint);
         let chrome = Chrome::new(&compositor, &gfx, &front, footer.user_name())?;
         let results = Results::new(&compositor, &gfx, &front, &layout, &footer.fill_visual()?)?;
-        results.set_theme(config.icon_tint)?;
+        results.set_theme(&gfx, config.icon_tint)?;
         let music = MusicCard::new(
             &compositor,
             &gfx,
@@ -393,6 +405,7 @@ impl Ui {
         ring.set_stroke(gfx::color(accent, 1.0))?;
         ring.show(false)?;
         top.Children()?.InsertAtTop(&ring.visual)?;
+        let toast = Toast::new(&compositor, &top);
 
         // Everything that moves or resizes when the menu height changes.
         for (object, kind) in shell
@@ -448,8 +461,11 @@ impl Ui {
             reduced_motion: Cell::new(false),
             catalog: RefCell::new(catalog),
             query: RefCell::new(String::new()),
-            hits: RefCell::new(Vec::new()),
+            found: RefCell::new(search::Results::default()),
             selected: Cell::new(0),
+            confirming: RefCell::new(None),
+            now_playing: RefCell::new(None),
+            toast,
             failed_icons: RefCell::new(HashSet::new()),
             stats: Cell::new(SearchStats::default()),
             music,
@@ -501,6 +517,7 @@ impl Ui {
             self.strip
                 .refresh(&self.gfx, l.strip, Self::strip_origin(&l))?;
             self.results.resize(&self.gfx, &l)?;
+            self.toast.forget(&self.gfx)?;
             self.music.refresh(&self.gfx, &l)?;
             self.context.refresh(&self.gfx)?;
             self.chrome.refresh(&self.gfx, &l)?;
@@ -520,8 +537,9 @@ impl Ui {
             .move_to(&self.gfx, l.strip, Self::strip_origin(&l))?;
         self.music.move_to(&self.gfx, &l)?;
         // Going back to the grid, the rows stay as they are while they fade.
-        if let Content::List(n) = l.content {
-            self.results.set_rows(&self.gfx, &l, n == 0)?;
+        if let Content::List(rows) = l.content {
+            self.results
+                .set_rows(&self.gfx, &l, rows.count == 0, &self.header_titles())?;
         }
         // The list layout's "PINNED" label and icon strip sit under the
         // rows, so they move when the number of rows changes.
@@ -670,7 +688,7 @@ impl Ui {
         self.strip.set_theme()?;
         self.context.set_theme()?;
         self.music.set_theme(self.accent.get())?;
-        self.results.set_theme(icon_tint)?;
+        self.results.set_theme(&self.gfx, icon_tint)?;
 
         if let Some(p) = fit_window(self.max_size()) {
             self.set_layout(&p)?;
@@ -912,9 +930,25 @@ impl Ui {
         self.is_open.set(false);
         // The sidebar opens on the pinned apps again.
         self.apps_view.set(false);
+        self.toast.hide()?;
         self.search.editor.borrow_mut().clear();
         self.search.redraw_text(&self.gfx)?;
         self.update_search(true)
+    }
+
+    /// The menu is hidden: result rows give their surface memory back
+    /// until the next search (the list layout keeps the most-used rows it
+    /// opens with). Measured: without this, idle RAM after searching was
+    /// about 5 MB higher.
+    pub fn park_results(&self) {
+        let keep = if self.kind() == LayoutKind::List {
+            layout::MOST_USED
+        } else {
+            0
+        };
+        if let Err(e) = self.results.park(&self.gfx, keep) {
+            log_warn!("parking result rows failed: {e}");
+        }
     }
 
     /// Is this point (window pixels) on the menu, rather than on the
@@ -1030,8 +1064,8 @@ impl Ui {
     }
 
     /// The list layout with nothing typed: the most-launched apps, then
-    /// the pinned ones, as indexes into `catalog.apps`.
-    fn most_used(&self) -> Vec<usize> {
+    /// the pinned ones, as result rows.
+    fn most_used(&self) -> Vec<Hit> {
         let catalog = self.catalog.borrow();
         let mut used: Vec<(usize, u32)> = catalog
             .items
@@ -1057,7 +1091,10 @@ impl Ui {
             }
         }
         list.truncate(layout::MOST_USED);
-        list
+        list.iter()
+            .filter_map(|&i| catalog.apps.get(i))
+            .map(|a| search::app_hit(a, catalog.is_pinned(&a.id), 0))
+            .collect()
     }
 
     /// Runs the search for the text in the box, unless it is the same as
@@ -1067,40 +1104,95 @@ impl Ui {
         if !force && *self.query.borrow() == text {
             return Ok(());
         }
-        let q = Query::new(&text);
-        *self.query.borrow_mut() = text;
-        if q.is_empty() {
+        *self.query.borrow_mut() = text.clone();
+        // Typing cancels a pending "Press Enter again".
+        self.confirming.borrow_mut().take();
+        if text.trim().is_empty() {
             self.search.set_count(&self.gfx, None)?;
             if self.kind() == LayoutKind::List || self.apps_view.get() {
                 // Nothing typed: the list layout (or the sidebar's Apps
                 // view) shows the most-used apps.
                 let hits = self.most_used();
-                let n = hits.len();
-                *self.hits.borrow_mut() = hits;
+                let rows = Rows::plain(hits.len());
+                *self.found.borrow_mut() = search::Results {
+                    headers: vec![false; hits.len()],
+                    hits,
+                    scope: None,
+                };
                 self.selected.set(0);
                 self.results
                     .set_message(&self.gfx, results::TYPE_TO_SEARCH)?;
-                self.set_content(Content::List(n))?;
+                self.set_content(Content::List(rows))?;
                 return self.paint_results();
             }
-            self.hits.borrow_mut().clear();
+            *self.found.borrow_mut() = search::Results::default();
             return self.set_content(Content::Grid);
         }
         self.results.set_message(&self.gfx, results::NO_RESULTS)?;
         let started = Instant::now();
-        let hits = search::rank(&self.catalog.borrow().items, &q, MAX_RESULTS);
+        let found = self.run_providers(&text);
         let took = started.elapsed();
         let mut stats = self.stats.get();
         stats.queries += 1;
         stats.slowest = stats.slowest.max(took);
         self.stats.set(stats);
 
-        let n = hits.len();
-        *self.hits.borrow_mut() = hits;
-        self.selected.set(0);
+        // Results don't jump around: a result the user moved the highlight
+        // to stays highlighted while it is still listed. Otherwise the
+        // best one is.
+        let selected = {
+            let old = self.found.borrow();
+            let keep = self.selected.get();
+            old.hits
+                .get(keep)
+                .filter(|_| keep > 0)
+                .and_then(|h| found.hits.iter().position(|n| n.same_target(h)))
+                .unwrap_or(0)
+        };
+        let rows = Rows::new(&found.headers);
+        let n = found.hits.len();
+        *self.found.borrow_mut() = found;
+        self.selected.set(selected);
         self.search.set_count(&self.gfx, Some(n))?;
-        self.set_content(Content::List(n))?;
+        self.set_content(Content::List(rows))?;
+        // Same row places, other sections: new header titles.
+        self.results.retitle(&self.gfx, &self.header_titles())?;
         self.paint_results()
+    }
+
+    /// Every provider's results for `text`, merged (SUPERSEARCH.md 2).
+    /// All of them are fast: this runs on the UI thread, per keystroke.
+    fn run_providers(&self, text: &str) -> search::Results {
+        let catalog = self.catalog.borrow();
+        let now = self.now_playing.borrow();
+        let apps = search::AppsProvider {
+            apps: &catalog.apps,
+            items: &catalog.items,
+        };
+        let music = search::MusicProvider { now: now.as_ref() };
+        // In tie-break order: on equal scores the earlier one goes first.
+        let providers: [&dyn Provider; 7] = [
+            &search::CalcProvider,
+            &search::UnitsProvider,
+            &apps,
+            &search::SystemProvider,
+            &search::SettingsProvider,
+            &music,
+            &search::GlintProvider,
+        ];
+        search::search(text, &providers)
+    }
+
+    /// The section headers' titles, top to bottom.
+    fn header_titles(&self) -> Vec<&'static str> {
+        let found = self.found.borrow();
+        found
+            .hits
+            .iter()
+            .zip(&found.headers)
+            .filter(|(_, h)| **h)
+            .map(|(hit, _)| hit.provider.title())
+            .collect()
     }
 
     /// Fades the grid, the rows and the section label in or out to match
@@ -1173,26 +1265,29 @@ impl Ui {
     /// Paints the result rows that changed. Rows never wait for an icon:
     /// missing ones are loaded a moment later (`load_icons`).
     fn paint_results(&self) -> Result<()> {
-        let hits = self.hits.borrow();
+        let found = self.found.borrow();
         let px = self.gfx.px(results::icon_size());
         let mut missing = false;
-        // First: the list layout paints the selected row differently.
-        let selected = (!hits.is_empty()).then(|| self.selected.get());
+        // First the highlight: the selected row is painted with the hint.
+        let selected = (!found.hits.is_empty()).then(|| self.selected.get());
         self.results.set_selected(selected)?;
         {
-            let catalog = self.catalog.borrow();
+            let confirming = self.confirming.borrow();
             let failed = self.failed_icons.borrow();
-            for (row, &i) in hits.iter().enumerate() {
-                let Some(app) = catalog.apps.get(i) else {
-                    continue;
+            for (row, hit) in found.hits.iter().enumerate() {
+                let icon = match &hit.icon {
+                    HitIcon::App(id) => {
+                        let icon = self.icons.peek(id, px);
+                        if icon.is_none() && !failed.contains(id) {
+                            missing = true;
+                        }
+                        icon
+                    }
+                    HitIcon::Glyph(_) => None,
                 };
-                let icon = self.icons.peek(&app.id, px);
-                if icon.is_none() && !failed.contains(&app.id) {
-                    missing = true;
-                }
-                if !self.results.shows(row, &app.id, icon.is_some()) {
-                    self.results
-                        .paint_row(&self.gfx, row, &app.id, &app.name, icon.as_ref())?;
+                let view = row_view(hit, icon.as_ref(), confirming.as_ref());
+                if !self.results.shows(row, &view) {
+                    self.results.paint_row(&self.gfx, row, &view)?;
                 }
             }
         }
@@ -1228,17 +1323,27 @@ impl Ui {
             if input_waiting() {
                 return Ok(true);
             }
-            // The first row still without its icon.
+            // The first row whose app icon is still missing.
             let next = {
                 let catalog = self.catalog.borrow();
                 let failed = self.failed_icons.borrow();
-                self.hits
+                self.found
                     .borrow()
+                    .hits
                     .iter()
                     .enumerate()
-                    .filter_map(|(row, &i)| catalog.apps.get(i).map(|a| (row, a)))
-                    .find(|(_, a)| !failed.contains(&a.id) && self.icons.peek(&a.id, px).is_none())
-                    .map(|(row, a)| (row, a.clone()))
+                    .filter_map(|(row, h)| match &h.icon {
+                        HitIcon::App(id) => Some((row, id)),
+                        HitIcon::Glyph(_) => None,
+                    })
+                    .filter(|(_, id)| !failed.contains(*id) && self.icons.peek(id, px).is_none())
+                    .find_map(|(row, id)| {
+                        catalog
+                            .apps
+                            .iter()
+                            .find(|a| a.id == *id)
+                            .map(|a| (row, a.clone()))
+                    })
             };
             let Some((row, app)) = next else {
                 return Ok(false);
@@ -1248,8 +1353,12 @@ impl Ui {
                 .and_then(|item| self.icons.get(&self.gfx, &app.id, &item, px));
             match icon {
                 Ok(icon) => {
-                    self.results
-                        .paint_row(&self.gfx, row, &app.id, &app.name, Some(&icon))?
+                    let found = self.found.borrow();
+                    let confirming = self.confirming.borrow();
+                    if let Some(hit) = found.hits.get(row) {
+                        let view = row_view(hit, Some(&icon), confirming.as_ref());
+                        self.results.paint_row(&self.gfx, row, &view)?;
+                    }
                 }
                 Err(e) => {
                     log_warn!("no icon for {}: {e}", app.id);
@@ -1262,31 +1371,57 @@ impl Ui {
         }
     }
 
-    /// The ID of result `row`, to launch it.
+    /// The app ID of result `row`, if it is an app (to pin or unpin it).
     fn result_id(&self, row: usize) -> Option<String> {
-        let i = *self.hits.borrow().get(row)?;
-        self.catalog.borrow().apps.get(i).map(|a| a.id.clone())
+        match &self.found.borrow().hits.get(row)?.action {
+            HitAction::Launch(id) => Some(id.clone()),
+            _ => None,
+        }
     }
 
-    fn launch_result(&self, row: usize) -> Action {
-        self.result_id(row).map_or(Action::None, Action::Launch)
+    /// Enter or a click on result `row`. A dangerous one (restart, empty
+    /// the Recycle Bin...) asks first: the first Enter turns its subtitle
+    /// into "Press Enter again to ...", the second one runs it.
+    fn activate_row(&self, row: usize) -> Result<Action> {
+        let Some(hit) = self.found.borrow().hits.get(row).cloned() else {
+            return Ok(Action::None);
+        };
+        let asked = self.confirming.borrow().as_ref() == Some(&hit.action);
+        if hit.confirm.is_some() && !asked {
+            self.selected.set(row);
+            *self.confirming.borrow_mut() = Some(hit.action);
+            self.paint_results()?;
+            return Ok(Action::None);
+        }
+        self.confirming.borrow_mut().take();
+        Ok(match hit.action {
+            HitAction::Launch(id) => Action::Launch(id),
+            other => Action::Hit(other),
+        })
     }
 
     fn launch_pin(&self, i: usize) -> Action {
         self.grid.aumid(i).map_or(Action::None, Action::Launch)
     }
 
-    /// Moves the result highlight (wrapping around).
+    /// Moves the result highlight (wrapping around). A pending "Press
+    /// Enter again" is cancelled.
     fn move_selection(&self, delta: isize) -> Result<()> {
-        let n = self.hits.borrow().len();
+        let n = self.found.borrow().hits.len();
         if n == 0 {
             return Ok(());
         }
+        self.confirming.borrow_mut().take();
         self.selected
             .set(search::step(self.selected.get(), n, delta));
-        // Repaints the rows that change look (list layout); else only the
-        // highlight moves.
+        // Repaints the rows that change look (the hint moves along).
         self.paint_results()
+    }
+
+    /// Shows a short message ("Copied") at the end of the search box.
+    pub fn show_toast(&self, text: &str) -> Result<()> {
+        let search = self.layout.borrow().search;
+        self.toast.show(&self.gfx, search, text, self.accent.get())
     }
 
     // -----------------------------------------------------------------------
@@ -1316,7 +1451,28 @@ impl Ui {
             Some(v) => self.source_app(&v.source_id),
             None => (String::new(), None),
         };
+        // What "play" / "next" in the search box know about the music.
+        let now = view.as_ref().map(|v| NowPlaying {
+            title: v.info.title.clone(),
+            artist: v.info.artist.clone(),
+            playing: v.playing,
+            can_play_pause: v.can_play_pause,
+            can_previous: v.can_previous,
+            can_next: v.can_next,
+        });
+        let now_changed = *self.now_playing.borrow() != now;
+        *self.now_playing.borrow_mut() = now;
         self.music.set_view(&self.gfx, view, name, icon)?;
+        // Music results on screen show the new track / Play or Pause.
+        let music_listed = self
+            .found
+            .borrow()
+            .hits
+            .iter()
+            .any(|h| h.provider == search::ProviderId::Music);
+        if now_changed && music_listed {
+            self.update_search(true)?;
+        }
         if self.music_mode.replace(mode) != mode {
             let content = self.layout.borrow().content;
             self.relayout(content, mode)?;
@@ -1834,7 +1990,7 @@ impl Ui {
             match vk {
                 VK_DOWN => return self.move_selection(1).map(|()| Action::None),
                 VK_UP => return self.move_selection(-1).map(|()| Action::None),
-                VK_RETURN => return Ok(self.launch_result(self.selected.get())),
+                VK_RETURN => return self.activate_row(self.selected.get()),
                 VK_TAB => {
                     self.keyboard_nav.set(true);
                     // The list layout's pinned strip comes next.
@@ -2303,7 +2459,7 @@ impl Ui {
         }
         match pressed {
             Target::Cell(i) => Ok(self.launch_pin(i)),
-            Target::Row(i) => Ok(self.launch_result(i)),
+            Target::Row(i) => self.activate_row(i),
             Target::Media(part) => Ok(self.press_card(part)),
             Target::Profile => Ok(Action::OpenAccountSettings),
             Target::Settings => Ok(Action::OpenSettings),
@@ -2321,5 +2477,26 @@ impl Ui {
             Target::Context => self.activate_context(),
             _ => Ok(Action::None),
         }
+    }
+}
+
+/// What result row `hit` paints: its app icon (`icon`, if loaded) or
+/// glyph, and the "Press Enter again" question if it is `confirming`.
+fn row_view<'a>(
+    hit: &'a Hit,
+    icon: Option<&'a ID2D1Bitmap1>,
+    confirming: Option<&HitAction>,
+) -> RowView<'a> {
+    let (key, icon) = match &hit.icon {
+        HitIcon::App(id) => (id.as_str(), RowIcon::App(icon)),
+        HitIcon::Glyph(c) => ("", RowIcon::Glyph(*c)),
+    };
+    RowView {
+        key,
+        title: &hit.title,
+        subtitle: &hit.subtitle,
+        icon,
+        verb: hit.action.verb(),
+        confirm: hit.confirm.filter(|_| confirming == Some(&hit.action)),
     }
 }

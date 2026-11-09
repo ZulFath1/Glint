@@ -1,4 +1,5 @@
-//! Finding apps by name as you type (CLAUDE.md section 9, "Search results").
+//! The apps provider: finding apps by name as you type (CLAUDE.md section
+//! 9, "Search results").
 //!
 //! Pure Rust, no Windows calls, so it is fully unit-tested.
 //!
@@ -18,6 +19,54 @@
 //! shorter name, then A–Z.
 
 use std::cmp::Ordering;
+
+use super::{Hit, HitAction, HitIcon, Provider, ProviderId, score as points};
+use crate::apps::AppInfo;
+
+/// The apps provider, borrowed for one search: `items[i]` is `apps[i]`
+/// prepared for matching.
+pub struct AppsProvider<'a> {
+    pub apps: &'a [AppInfo],
+    pub items: &'a [Item],
+}
+
+impl Provider for AppsProvider<'_> {
+    fn id(&self) -> ProviderId {
+        ProviderId::Apps
+    }
+
+    fn query(&self, q: &super::Query, out: &mut Vec<Hit>) {
+        let query = Query::new(q.text);
+        for (s, i) in rank_scored(self.items, &query, super::MAX_ROWS) {
+            let (Some(app), Some(item)) = (self.apps.get(i), self.items.get(i)) else {
+                continue;
+            };
+            let score = if item.chars[..] == query.chars[..] {
+                points::APP_EXACT
+            } else {
+                match s.tier {
+                    0 => points::APP_PREFIX,
+                    1 => points::APP_WORD,
+                    _ => points::APP_FUZZY,
+                }
+            };
+            out.push(app_hit(app, item.pinned, score));
+        }
+    }
+}
+
+/// The result row for `app`.
+pub fn app_hit(app: &AppInfo, pinned: bool, score: u16) -> Hit {
+    Hit {
+        provider: ProviderId::Apps,
+        title: app.name.clone(),
+        subtitle: if pinned { "Pinned app" } else { "App" }.to_string(),
+        icon: HitIcon::App(app.id.clone()),
+        action: HitAction::Launch(app.id.clone()),
+        score,
+        confirm: None,
+    }
+}
 
 /// One app, prepared for searching.
 #[derive(Debug, Clone)]
@@ -214,7 +263,16 @@ fn order(a: (Score, &Item), b: (Score, &Item)) -> Ordering {
 }
 
 /// The best `limit` matches for `q`, best first, as indexes into `items`.
+#[cfg(test)]
 pub fn rank(items: &[Item], q: &Query, limit: usize) -> Vec<usize> {
+    rank_scored(items, q, limit)
+        .into_iter()
+        .map(|(_, i)| i)
+        .collect()
+}
+
+/// The same, with each match's score.
+pub fn rank_scored(items: &[Item], q: &Query, limit: usize) -> Vec<(Score, usize)> {
     let mut hits: Vec<(Score, usize)> = items
         .iter()
         .enumerate()
@@ -229,7 +287,7 @@ pub fn rank(items: &[Item], q: &Query, limit: usize) -> Vec<usize> {
     }
     hits.sort_unstable_by(cmp);
     hits.truncate(limit);
-    hits.into_iter().map(|(_, i)| i).collect()
+    hits
 }
 
 /// Moves a highlight up (-1) or down (+1) through `len` rows, wrapping

@@ -1,5 +1,6 @@
 //! Lock, sleep, restart, shut down (CLAUDE.md section 9; the owner dropped
-//! "Sign out" because they never use it).
+//! "Sign out" from the power strip because they never use it). Sign out and
+//! emptying the Recycle Bin are only reachable from the search box.
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Security::{
@@ -8,10 +9,13 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Power::SetSuspendState;
 use windows::Win32::System::Shutdown::{
-    InitiateShutdownW, LockWorkStation, SHTDN_REASON_FLAG_PLANNED, SHTDN_REASON_MAJOR_OTHER,
-    SHUTDOWN_FLAGS, SHUTDOWN_HYBRID, SHUTDOWN_POWEROFF, SHUTDOWN_RESTART,
+    EWX_LOGOFF, ExitWindowsEx, InitiateShutdownW, LockWorkStation, SHTDN_REASON_FLAG_PLANNED,
+    SHTDN_REASON_MAJOR_OTHER, SHUTDOWN_FLAGS, SHUTDOWN_HYBRID, SHUTDOWN_POWEROFF, SHUTDOWN_RESTART,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::UI::Shell::{
+    SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW,
+};
 use windows::core::PCWSTR;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +87,37 @@ pub fn run(action: PowerAction) {
     };
     if let Err(e) = result {
         log_error!("power action {action:?} failed: {e}");
+    }
+}
+
+/// Signs out of Windows (from the search: "sign out", after a second
+/// Enter). Apps get the usual chance to save.
+pub fn sign_out() {
+    log_info!("power: sign out");
+    // SAFETY: a plain Win32 call without pointers.
+    let result = unsafe { ExitWindowsEx(EWX_LOGOFF, SHTDN_REASON_MAJOR_OTHER) };
+    if let Err(e) = result {
+        log_error!("signing out failed: {e}");
+    }
+}
+
+/// Empties the Recycle Bin, without Windows' own "Are you sure?" (the
+/// search already asked) and without the progress window. A full bin can
+/// take a while, so it runs on a short-lived thread.
+pub fn empty_recycle_bin() {
+    let spawned = std::thread::Builder::new()
+        .name("glint-recycle".into())
+        .spawn(|| {
+            let flags = SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND;
+            // SAFETY: no window, all drives (null root path).
+            match unsafe { SHEmptyRecycleBinW(None, PCWSTR::null(), flags) } {
+                Ok(()) => log_info!("Recycle Bin emptied"),
+                // Also what an already empty bin returns.
+                Err(e) => log_info!("emptying the Recycle Bin: {e}"),
+            }
+        });
+    if let Err(e) = spawned {
+        log_error!("could not start the Recycle Bin thread: {e}");
     }
 }
 

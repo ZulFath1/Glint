@@ -28,9 +28,10 @@ const WIDTH_EXTRA: f32 = 24.0;
 /// Space between the grid and the footer.
 const GRID_BELOW: f32 = 12.0;
 
-/// Search results: rows 40 tall, at most 8, 12 in from the menu's sides.
-pub const ROW_HEIGHT: f32 = 40.0;
-pub const MAX_RESULTS: usize = 8;
+/// Search results: rows 48 tall (a title and a subtitle), at most 10, 12 in
+/// from the menu's sides. A section header ("APPS") is half a row.
+pub const ROW_HEIGHT: f32 = 48.0;
+pub const MAX_RESULTS: usize = crate::search::MAX_ROWS;
 const LIST_SIDE: f32 = 12.0;
 
 pub const FOOTER_HEIGHT: f32 = 60.0;
@@ -149,8 +150,67 @@ impl Rect {
 pub enum Content {
     /// The pinned apps (the search box is empty).
     Grid,
-    /// Search results: this many rows (0 = the "No apps found" row).
-    List(usize),
+    /// Search results (no rows = the "No results" row).
+    List(Rows),
+}
+
+impl Content {
+    /// `n` result rows without section headers.
+    pub const fn list(n: usize) -> Self {
+        Self::List(Rows::plain(n))
+    }
+}
+
+/// How many result rows there are, and which have a section header above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rows {
+    pub count: usize,
+    /// Bit `i` set = a header goes above row `i`.
+    pub headers: u32,
+}
+
+impl Rows {
+    pub const fn plain(count: usize) -> Self {
+        Self { count, headers: 0 }
+    }
+
+    /// From `headers[i]` = "a header above row `i`".
+    pub fn new(headers: &[bool]) -> Self {
+        let mask = headers
+            .iter()
+            .enumerate()
+            .filter(|&(i, &h)| h && i < 32)
+            .fold(0, |m, (i, _)| m | (1 << i));
+        Self {
+            count: headers.len(),
+            headers: mask,
+        }
+    }
+
+    fn has_header(self, i: usize) -> bool {
+        i < 32 && self.headers & (1 << i) != 0
+    }
+}
+
+/// The result rows (at most `MAX_RESULTS`) and their section headers,
+/// starting at (`x`, `top`), `w` wide, rows `row_h` tall and headers half
+/// that. Returns (rows, headers, height); no rows still take one row's
+/// height, for the message.
+fn list_rows(x: f32, top: f32, w: f32, row_h: f32, rows: Rows) -> (Vec<Rect>, Vec<Rect>, f32) {
+    let header_h = row_h / 2.0;
+    let mut y = top;
+    let mut row_rects = Vec::new();
+    let mut header_rects = Vec::new();
+    for i in 0..rows.count.min(MAX_RESULTS) {
+        if rows.has_header(i) {
+            header_rects.push(Rect::new(x, y, w, header_h));
+            y += header_h;
+        }
+        row_rects.push(Rect::new(x, y, w, row_h));
+        y += row_h;
+    }
+    let height = (y - top).max(row_h);
+    (row_rects, header_rects, height)
 }
 
 /// Whether the music card shows, and how tall it is.
@@ -291,6 +351,8 @@ pub struct Layout {
     pub cells: Vec<Rect>,
     /// One rectangle per search result row (empty for the grid).
     pub result_rows: Vec<Rect>,
+    /// The section headers between the rows ("APPS", "SETTINGS").
+    pub result_headers: Vec<Rect>,
     /// Where "No apps found" goes.
     pub no_results: Rect,
     /// The title strip (terminal themes; empty otherwise).
@@ -326,11 +388,12 @@ impl Layout {
 }
 
 /// The window has to fit the tallest menu, so it never has to move or grow
-/// while the menu is open: the grid with the biggest music card, or 8
-/// results, whichever is taller.
+/// while the menu is open: the grid with the biggest music card, or 10
+/// results, whichever is taller. (Rows with headers are never taller: the
+/// search keeps rows + headers within 10 rows' height.)
 pub fn max_size(pins: usize, max_columns: usize, theme: &Theme) -> Vector2 {
     let mut max = Vector2 { X: 0.0, Y: 0.0 };
-    for content in [Content::Grid, Content::List(MAX_RESULTS)] {
+    for content in [Content::Grid, Content::list(MAX_RESULTS)] {
         let s = layout(pins, max_columns, content, Music::CardWithSources, theme).size;
         max.X = max.X.max(s.X);
         max.Y = max.Y.max(s.Y);
@@ -546,22 +609,23 @@ fn grid_layout(
     let grid_height = cells_height(rows, CELL, CELL_STEP);
 
     // The results list starts where the grid starts.
-    let row = |i: usize| {
-        Rect::new(
+    let list = |rows| {
+        list_rows(
             LIST_SIDE,
-            grid_top + i as f32 * ROW_HEIGHT,
+            grid_top,
             width - 2.0 * LIST_SIDE,
             ROW_HEIGHT,
+            rows,
         )
     };
-    let (middle_height, result_rows) = match content {
-        Content::Grid => (grid_height, Vec::new()),
-        Content::List(n) => {
-            let n = n.min(MAX_RESULTS);
-            // No results still takes one row, for the message.
-            (n.max(1) as f32 * ROW_HEIGHT, (0..n).map(row).collect())
+    let (middle_height, result_rows, result_headers) = match content {
+        Content::Grid => (grid_height, Vec::new(), Vec::new()),
+        Content::List(rows) => {
+            let (rows, headers, h) = list(rows);
+            (h, rows, headers)
         }
     };
+    let no_results = Rect::new(LIST_SIDE, grid_top, width - 2.0 * LIST_SIDE, ROW_HEIGHT);
 
     let below_middle = grid_top + middle_height + GRID_BELOW;
     let (card, card_parts) = card_at(CARD_MARGIN, below_middle, width - 2.0 * CARD_MARGIN, music);
@@ -594,7 +658,8 @@ fn grid_layout(
         rows,
         cells,
         result_rows,
-        no_results: row(0),
+        result_headers,
+        no_results,
         footer,
         avatar: f.avatar,
         name: f.name,
@@ -626,19 +691,19 @@ fn list_layout(
 
     // The rows: search results, or the most-used apps (always a list here).
     let rows_top = search.bottom() + SEARCH_BELOW;
-    let row = |i: usize| {
-        Rect::new(
-            LIST_SIDE,
-            rows_top + i as f32 * LIST_ROW,
-            width - 2.0 * LIST_SIDE,
-            LIST_ROW,
-        )
+    let shape = match content {
+        Content::Grid => Rows::default(),
+        Content::List(rows) => rows,
     };
-    let n = match content {
-        Content::Grid => 0,
-        Content::List(n) => n.min(MAX_RESULTS),
-    };
-    let rows_bottom = rows_top + n.max(1) as f32 * LIST_ROW;
+    let (result_rows, result_headers, rows_height) = list_rows(
+        LIST_SIDE,
+        rows_top,
+        width - 2.0 * LIST_SIDE,
+        LIST_ROW,
+        shape,
+    );
+    let no_results = Rect::new(LIST_SIDE, rows_top, width - 2.0 * LIST_SIDE, LIST_ROW);
+    let rows_bottom = rows_top + rows_height;
 
     // "PINNED" and the icon strip, under the rows.
     let (section, strip_bottom, cells) = if pins == 0 {
@@ -702,8 +767,9 @@ fn list_layout(
         columns,
         rows,
         cells,
-        result_rows: (0..n).map(row).collect(),
-        no_results: row(0),
+        result_rows,
+        result_headers,
+        no_results,
         footer,
         avatar: f.avatar,
         name: f.name,
@@ -749,21 +815,15 @@ fn sidebar_layout(pins: usize, max_columns: usize, content: Content, music: Musi
         top: grid_top,
     };
     let cells = cells(pins, &block);
-    let row = |i: usize| {
-        Rect::new(
-            x0 + LIST_SIDE,
-            grid_top + i as f32 * ROW_HEIGHT,
-            side - 2.0 * LIST_SIDE,
-            ROW_HEIGHT,
-        )
-    };
-    let (middle_height, result_rows) = match content {
-        Content::Grid => (cells_height(rows, CELL, CELL_STEP), Vec::new()),
-        Content::List(n) => {
-            let n = n.min(MAX_RESULTS);
-            (n.max(1) as f32 * ROW_HEIGHT, (0..n).map(row).collect())
+    let (list_x, list_w) = (x0 + LIST_SIDE, side - 2.0 * LIST_SIDE);
+    let (middle_height, result_rows, result_headers) = match content {
+        Content::Grid => (cells_height(rows, CELL, CELL_STEP), Vec::new(), Vec::new()),
+        Content::List(shape) => {
+            let (r, h, height) = list_rows(list_x, grid_top, list_w, ROW_HEIGHT, shape);
+            (height, r, h)
         }
     };
+    let no_results = Rect::new(list_x, grid_top, list_w, ROW_HEIGHT);
     let below_middle = grid_top + middle_height + GRID_BELOW;
     let (card, card_parts) = card_at(
         x0 + CARD_MARGIN,
@@ -808,7 +868,8 @@ fn sidebar_layout(pins: usize, max_columns: usize, content: Content, music: Musi
         rows,
         cells,
         result_rows,
-        no_results: row(0),
+        result_headers,
+        no_results,
         // No footer bar: an empty one at the bottom edge (results and the
         // card are cut off at its top, which is the menu's bottom here).
         footer: Rect::new(x0, height, side, 0.0),
@@ -970,37 +1031,63 @@ mod tests {
     #[test]
     fn search_results_keep_the_width_and_follow_the_row_count() {
         let grid = layout(6, 4, Content::Grid, Music::Hidden, &GLINT);
-        let three = layout(6, 4, Content::List(3), Music::Hidden, &GLINT);
-        let eight = layout(6, 4, Content::List(8), Music::Hidden, &GLINT);
+        let three = layout(6, 4, Content::list(3), Music::Hidden, &GLINT);
+        let ten = layout(6, 4, Content::list(10), Music::Hidden, &GLINT);
         assert_eq!(three.size.X, grid.size.X);
         assert_eq!(three.result_rows.len(), 3);
-        assert_eq!(three.result_rows[0], Rect::new(12.0, 64.0, 336.0, 40.0));
-        assert_eq!(three.result_rows[2].y, 64.0 + 80.0);
-        assert_eq!(three.size.Y, 64.0 + 120.0 + 12.0 + 60.0);
-        // 8 rows (320) are taller than 2 rows of icons (164).
-        assert_eq!(eight.size.Y, 64.0 + 320.0 + 12.0 + 60.0);
-        // More than 8 is capped.
+        assert_eq!(three.result_rows[0], Rect::new(12.0, 64.0, 336.0, 48.0));
+        assert_eq!(three.result_rows[2].y, 64.0 + 96.0);
+        assert_eq!(three.size.Y, 64.0 + 144.0 + 12.0 + 60.0);
+        // 10 rows (480) are taller than 2 rows of icons (164).
+        assert_eq!(ten.size.Y, 64.0 + 480.0 + 12.0 + 60.0);
+        // More than 10 is capped.
         assert_eq!(
-            layout(6, 4, Content::List(20), Music::Hidden, &GLINT).result_rows,
-            eight.result_rows
+            layout(6, 4, Content::list(20), Music::Hidden, &GLINT).result_rows,
+            ten.result_rows
         );
         // No results: one row for the message.
-        let none = layout(6, 4, Content::List(0), Music::Hidden, &GLINT);
+        let none = layout(6, 4, Content::list(0), Music::Hidden, &GLINT);
         assert!(none.result_rows.is_empty());
-        assert_eq!(none.size.Y, 64.0 + 40.0 + 12.0 + 60.0);
+        assert_eq!(none.size.Y, 64.0 + 48.0 + 12.0 + 60.0);
         assert_eq!(none.no_results, three.result_rows[0]);
         // The pinned grid stays where it was (it's only faded out).
         assert_eq!(three.cells, grid.cells);
     }
 
     #[test]
+    fn section_headers_take_half_a_row() {
+        // Rows 0 and 2 start a section: "SYSTEM", 2 rows, "APPS", 1 row.
+        let rows = Rows::new(&[true, false, true]);
+        let l = layout(6, 4, Content::List(rows), Music::Hidden, &GLINT);
+        assert_eq!(l.result_headers.len(), 2);
+        assert_eq!(l.result_headers[0], Rect::new(12.0, 64.0, 336.0, 24.0));
+        assert_eq!(l.result_rows[0].y, 64.0 + 24.0);
+        assert_eq!(l.result_rows[1].y, l.result_rows[0].bottom());
+        assert_eq!(l.result_headers[1].y, l.result_rows[1].bottom());
+        assert_eq!(l.result_rows[2].y, l.result_headers[1].bottom());
+        assert_eq!(l.size.Y, 64.0 + 48.0 + 3.0 * 48.0 + 12.0 + 60.0);
+        // 8 rows + 4 headers fit in the room of 10 rows.
+        let mut h = [false; 8];
+        h[0] = true;
+        h[2] = true;
+        h[4] = true;
+        h[6] = true;
+        let full = layout(6, 4, Content::List(Rows::new(&h)), Music::Hidden, &GLINT);
+        assert!(full.size.Y <= max_size(6, 4, &GLINT).Y);
+        // The list layout too.
+        let nord = layout(6, 6, Content::List(rows), Music::Hidden, &NORD);
+        assert_eq!(nord.result_headers.len(), 2);
+        assert!(nord.section.y >= nord.result_rows[2].bottom());
+    }
+
+    #[test]
     fn the_window_fits_the_tallest_menu() {
-        // 2 rows of icons + the tallest card (434) < 8 results (456).
+        // 2 rows of icons + the tallest card (434) < 10 results (616).
         assert_eq!(
             max_size(6, 4, &GLINT),
-            layout(6, 4, Content::List(8), Music::Hidden, &GLINT).size
+            layout(6, 4, Content::list(10), Music::Hidden, &GLINT).size
         );
-        // 5 rows of icons + the card are taller than 8 results.
+        // 5 rows of icons + the card are taller than 10 results.
         assert_eq!(
             max_size(20, 4, &GLINT),
             layout(20, 4, Content::Grid, Music::CardWithSources, &GLINT).size
@@ -1026,11 +1113,11 @@ mod tests {
         // The grid doesn't move when the card appears.
         assert_eq!(card.cells, plain.cells);
         // Search results hide the card.
-        let list = layout(6, 4, Content::List(3), Music::Card, &GLINT);
+        let list = layout(6, 4, Content::list(3), Music::Card, &GLINT);
         assert_eq!(list.music, Music::Hidden);
         assert_eq!(
             list.size,
-            layout(6, 4, Content::List(3), Music::Hidden, &GLINT).size
+            layout(6, 4, Content::list(3), Music::Hidden, &GLINT).size
         );
     }
 
@@ -1066,8 +1153,8 @@ mod tests {
         let cases = [
             (Content::Grid, Music::Hidden),
             (Content::Grid, Music::CardWithSources),
-            (Content::List(0), Music::Hidden),
-            (Content::List(8), Music::Card),
+            (Content::list(0), Music::Hidden),
+            (Content::list(8), Music::Card),
         ];
         for (content, music) in cases {
             for pins in 0..13 {
@@ -1096,7 +1183,7 @@ mod tests {
         assert!(term.section.y >= term.search.bottom());
         assert!(term.cells[0].y >= term.section.bottom());
         // Search results start where the grid starts.
-        let list = layout(6, 6, Content::List(3), Music::Hidden, &GRUVBOX);
+        let list = layout(6, 6, Content::list(3), Music::Hidden, &GRUVBOX);
         assert_eq!(list.result_rows[0].y, term.cells[0].y);
         // Taller, so the window grows to fit.
         assert!(max_size(6, 6, &GRUVBOX).Y > max_size(6, 6, &GLINT).Y);
@@ -1151,7 +1238,7 @@ mod tests {
 
     #[test]
     fn the_list_layout_has_rows_a_pinned_strip_and_a_bottom_bar() {
-        let l = layout(7, 7, Content::List(5), Music::Hidden, &NORD);
+        let l = layout(7, 7, Content::list(5), Music::Hidden, &NORD);
         assert_eq!(l.kind, LayoutKind::List);
         assert_eq!(l.result_rows.len(), 5);
         assert_eq!(l.result_rows[0].h, LIST_ROW);
@@ -1164,19 +1251,22 @@ mod tests {
         assert_eq!(l.size.Y, l.footer.bottom());
         inside(&l);
         // The music row sits in the bottom bar, instead of the profile.
-        let m = layout(7, 7, Content::List(5), Music::Card, &NORD);
+        let m = layout(7, 7, Content::list(5), Music::Card, &NORD);
         assert_eq!(m.size, l.size);
         assert!(m.card_compact && m.card.y > m.footer.y && m.card.bottom() < m.footer.bottom());
         assert!(m.card.right() < m.settings.x);
         assert_eq!(m.profile, Rect::default());
         assert!(l.profile.w > 0.0);
         // Typing changes only the rows; the strip moves down with them.
-        let eight = layout(7, 7, Content::List(8), Music::Hidden, &NORD);
+        let eight = layout(7, 7, Content::list(8), Music::Hidden, &NORD);
         assert_eq!(eight.size.X, l.size.X);
         assert_eq!(eight.size.Y - l.size.Y, 3.0 * LIST_ROW);
-        assert_eq!(max_size(7, 7, &NORD), eight.size);
+        assert_eq!(
+            max_size(7, 7, &NORD),
+            layout(7, 7, Content::list(10), Music::Hidden, &NORD).size
+        );
         // No pins: no label, no strip.
-        let none = layout(0, 7, Content::List(0), Music::Hidden, &NORD);
+        let none = layout(0, 7, Content::list(0), Music::Hidden, &NORD);
         assert_eq!(none.section, Rect::default());
         inside(&none);
     }
@@ -1202,7 +1292,7 @@ mod tests {
         assert!(small.settings.bottom() < small.quick[0].y);
         inside(&small);
         // Results replace the grid and hide the card, like the grid layout.
-        let list = layout(6, 6, Content::List(3), Music::Card, &TOKYO_NIGHT);
+        let list = layout(6, 6, Content::list(3), Music::Card, &TOKYO_NIGHT);
         assert_eq!(list.music, Music::Hidden);
         assert_eq!(list.result_rows[0].y, l.cells[0].y);
         let card = layout(6, 6, Content::Grid, Music::CardWithSources, &TOKYO_NIGHT);

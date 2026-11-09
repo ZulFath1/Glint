@@ -409,18 +409,8 @@ impl App {
                 self.close();
                 power::run(power_action);
             }
-            Action::Launch(id) => {
-                // Close first (the close animation runs in DWM, so it stays
-                // smooth), then start the app on a helper thread.
-                self.close();
-                self.ui.record_launch(&id);
-                apps::launch(id);
-                // Saved to config.toml a few seconds after the last launch.
-                self.stats_dirty.set(true);
-                // SAFETY: a one-shot timer on our own window (killed when it
-                // fires); setting it again restarts the wait.
-                unsafe { SetTimer(Some(self.hwnd), TIMER_SAVE_STATS, SAVE_STATS_MS, None) };
-            }
+            Action::Launch(id) => self.launch(id),
+            Action::Hit(hit) => self.run_hit(hit),
             Action::Pin(id) => self.change_pin(id, true),
             Action::Unpin(id) => self.change_pin(id, false),
             Action::Media(command) => {
@@ -429,6 +419,70 @@ impl App {
                 // buttons come back as playback events.
                 if command == media::MediaCommand::SwitchSource {
                     self.push_music();
+                }
+            }
+        }
+    }
+
+    /// Starts an app (by its AppsFolder ID).
+    fn launch(&self, id: String) {
+        // Close first (the close animation runs in DWM, so it stays
+        // smooth), then start the app on a helper thread.
+        self.close();
+        self.ui.record_launch(&id);
+        apps::launch(id);
+        // Saved to config.toml a few seconds after the last launch.
+        self.stats_dirty.set(true);
+        // SAFETY: a one-shot timer on our own window (killed when it
+        // fires); setting it again restarts the wait.
+        unsafe { SetTimer(Some(self.hwnd), TIMER_SAVE_STATS, SAVE_STATS_MS, None) };
+    }
+
+    /// Enter on a super search result (SUPERSEARCH.md 3). Copying and the
+    /// music controls keep the menu open; the rest close it first.
+    fn run_hit(&self, hit: search::HitAction) {
+        use search::{GlintCommand, HitAction as H};
+        log_info!("search action: {hit:?}");
+        match hit {
+            H::Launch(id) => self.launch(id),
+            H::Copy(text) => {
+                ui::search_box::set_clipboard_text(self.hwnd, &text);
+                log_err("copied toast", self.ui.show_toast("Copied"));
+            }
+            H::Open { target, args } => {
+                self.close();
+                apps::shell_open(target, args);
+            }
+            H::Power(action) => {
+                self.close();
+                power::run(action);
+            }
+            H::SignOut => {
+                self.close();
+                power::sign_out();
+            }
+            H::EmptyRecycleBin => {
+                self.close();
+                power::empty_recycle_bin();
+            }
+            H::Media(command) => self.run(Ok(Action::Media(command))),
+            H::Glint(GlintCommand::OpenSettings) => self.open_settings(true),
+            H::Glint(GlintCommand::ReloadConfig) => {
+                self.close();
+                self.reload_config(true);
+            }
+            H::Glint(GlintCommand::Quit) => {
+                self.save_stats();
+                // SAFETY: posts WM_QUIT to this (the UI) thread.
+                unsafe { PostQuitMessage(0) };
+            }
+            // Switched live (the menu stays open to show it) and saved to
+            // config.toml, like a change made in Settings.
+            H::Glint(GlintCommand::Theme(theme)) => {
+                let mut new = self.config.borrow().clone();
+                if new.theme != theme {
+                    new.theme = theme;
+                    self.apply_from_settings(new);
                 }
             }
         }
@@ -1214,6 +1268,7 @@ Fix the file, then try again."
         self.close_batch.borrow_mut().take();
         self.is_visible.set(false);
         window::hide(self.hwnd);
+        self.ui.park_results();
         self.ui.release_caches();
         if self.trim_after_close.replace(false) {
             trim_memory();

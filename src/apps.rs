@@ -26,7 +26,9 @@ use windows::Win32::UI::Shell::{
     SHCreateItemFromParsingName, SHGetIDListFromObject, SHGetKnownFolderIDList,
     SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING, ShellExecuteW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SW_SHOWNORMAL, WM_APP};
+use windows::Win32::UI::WindowsAndMessaging::{
+    ASFW_ANY, AllowSetForegroundWindow, PostMessageW, SW_SHOWNORMAL, WM_APP,
+};
 use windows::core::{HSTRING, Result, w};
 
 /// Posted to the UI window by the scan thread when a new list is ready.
@@ -226,21 +228,44 @@ pub fn scan_in_background(hwnd: HWND, tx: Sender<Vec<AppInfo>>) {
 /// Starts an app by its AppsFolder ID, on a short-lived thread, so a slow
 /// start can never freeze the menu. Failures are logged.
 pub fn launch(id: String) {
+    shell_open(format!("shell:AppsFolder\\{id}"), String::new());
+}
+
+/// Opens `target` (a program, `.msc` console, `ms-settings:` page or other
+/// URI) with `args` through the shell, on a short-lived thread (the shell
+/// may take a moment and must never block the menu).
+pub fn shell_open(target: String, args: String) {
+    // We still have the foreground (the menu just had the keyboard), so we
+    // may pass that right on. Without this, an app that is already running
+    // (VS Code, a browser) only hands the job to its open window, and
+    // Windows refuses to bring that window to the front: the app seemed not
+    // to open at all.
+    // SAFETY: a plain Win32 call without pointers.
+    if let Err(e) = unsafe { AllowSetForegroundWindow(ASFW_ANY) } {
+        log_warn!("could not pass the foreground on: {e}");
+    }
     let spawned = std::thread::Builder::new()
         .name("glint-launch".into())
         .spawn(move || {
             let _com = ComGuard::new();
-            let target = HSTRING::from(format!("shell:AppsFolder\\{id}"));
-            // SAFETY: `target` lives across the call; no window, no pointers
-            // kept by the shell.
+            let file = HSTRING::from(target.as_str());
+            let wide = HSTRING::from(args.as_str());
+            let params = if args.is_empty() {
+                windows::core::PCWSTR::null()
+            } else {
+                windows::core::PCWSTR(wide.as_ptr())
+            };
+            // SAFETY: `file` and `wide` (which `params` points into, ending
+            // in a 0) live across the call; no window, no pointers kept by
+            // the shell.
             let result =
-                unsafe { ShellExecuteW(None, w!("open"), &target, None, None, SW_SHOWNORMAL) };
+                unsafe { ShellExecuteW(None, w!("open"), &file, params, None, SW_SHOWNORMAL) };
             // ShellExecute returns a value > 32 on success.
             let code = result.0 as isize;
             if code <= 32 {
-                log_error!("launching {id} failed (ShellExecute returned {code})");
+                log_error!("opening {target} {args} failed (ShellExecute returned {code})");
             } else {
-                log_info!("launched {id}");
+                log_info!("opened {target} {args}");
             }
         });
     if let Err(e) = spawned {
